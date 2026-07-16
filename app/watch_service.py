@@ -21,6 +21,7 @@ from app.models import (
     QinsiPurchaseExportJob,
     QinsiPurchaseExportLine,
 )
+from app.qinsi_inventory import ProductInventoryView, PurchaseAssistance, latest_inventory_for_product, purchase_assistance
 
 
 FREQUENCY_HOURS = {"low": 24, "normal": 12, "high": 6, "urgent": 3}
@@ -52,6 +53,8 @@ class ProductWatchRow:
     enrichment_task_id: int | None
     recommended_target_price: int | None
     recommended_price_source: str | None
+    inventory: ProductInventoryView
+    purchase_assistance: PurchaseAssistance
 
 
 def _positive_int(value: int | str | None) -> int | None:
@@ -359,9 +362,11 @@ def _row(session: Session, product: Product, config=None, recommendation=None) -
         recommended_price_source = config.recommended_price_source
     else:
         recommended_target_price, recommended_price_source, _ = calculate_recommended_target(session, product.id)
+    inventory = latest_inventory_for_product(session, product.id)
+    assistance = purchase_assistance(session, product, inventory=inventory)
     return ProductWatchRow(
         product, config, recommendation, latest, minimum, online_price, online_at,
-        enrichment_task_id, recommended_target_price, recommended_price_source,
+        enrichment_task_id, recommended_target_price, recommended_price_source, inventory, assistance,
     )
 
 

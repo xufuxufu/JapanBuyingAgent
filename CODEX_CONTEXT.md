@@ -7,7 +7,7 @@
 - 开发端口：`8020`
 - 定位：日本实体采购辅助系统；秦丝负责销售与实时可售库存。
 - 数据：项目独立 SQLite；Excel 仅用于导入、导出和字段参考。
-- 当前 migration head：`20260716_0016`
+- 当前 migration head：`20260716_0017`
 
 ## 核心业务流程
 
@@ -51,6 +51,7 @@
 - 商品丰富化：`app/product_enrichment.py`
 - 关注商品：`app/watch_service.py`
 - 价格监控与通知：`app/monitor_service.py`、`app/monitor_scheduler.py`
+- 秦丝库存快照与采购辅助：`app/qinsi_inventory.py`
 - 页面与样式：`app/templates/`、`app/static/app.css`
 - migration：`migrations/versions/`
 - 测试：`tests/`
@@ -61,6 +62,15 @@
 - Core：`scripts\verify_core.bat`
 - Full：`scripts\verify_full.bat`
 - 低风险文档、CSS、普通排序或简单展示默认使用 Quick，不自动运行 Full。
+
+## 秦丝库存快照配置
+
+- `JBA_QINSI_SNAPSHOT_STALE_HOURS`：快照过期小时数，默认 `72`。
+- `JBA_QINSI_DEFAULT_LOW_STOCK_THRESHOLD`：默认低库存阈值，默认 `3`。
+- `JBA_QINSI_SNAPSHOT_MAX_UPLOAD_MB`：上传上限，默认/最大 `20` MB。
+- `JBA_QINSI_SNAPSHOT_EXTENSIONS`：允许扩展名，默认 `.xlsx`。
+- `JBA_QINSI_REUSE_DUPLICATE_FILE`：重复哈希复用原快照，默认启用。
+- `JBA_PURCHASE_ASSISTANCE_ENABLED`：采购辅助提示，默认启用。
 
 ## 禁止修改范围
 

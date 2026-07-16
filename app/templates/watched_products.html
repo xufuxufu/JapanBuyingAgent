@@ -16,6 +16,9 @@
     <span><strong>{{ row.config.user_target_price if row.config and row.config.user_target_price is not none else '—' }}</strong>用户目标价</span>
     <span><strong>{{ row.config.effective_target_price if row.config and row.config.effective_target_price is not none else '—' }}</strong>生效目标价</span>
     {% if row.config %}<span><strong>{{ row.config.current_lowest_price if row.config.current_lowest_price is not none else '—' }}</strong>当前监控最低价</span><span><strong>{{ row.config.historical_online_lowest_price if row.config.historical_online_lowest_price is not none else '—' }}</strong>历史在线最低价</span><span><strong>{{ row.config.last_check_status or '未检查' }}</strong>最近监控状态</span>{% endif %}
+    <span><strong>{{ row.inventory.total_quantity if row.inventory.total_quantity is not none else '—' }}</strong>秦丝最近快照数量<small>{{ row.inventory.data_time|tokyo_datetime if row.inventory.data_time else '暂无快照' }}</small></span>
+    <span><strong>{{ '已过期' if row.inventory.is_stale else ('有效' if row.inventory.snapshot else '无快照') }}</strong>快照新鲜度</span>
+    <span><strong>{{ row.purchase_assistance.message }}</strong>采购辅助提示</span>
   </div>
   {% if row.config %}<p class="muted">最近检查：{{ row.config.last_check_at|tokyo_datetime if row.config.last_check_at else '尚未检查' }} · 下次检查：{{ row.config.next_check_at|tokyo_datetime if row.config.next_check_at else '等待调度' }}</p>{% endif %}
   <p><strong>推荐原因：</strong>{{ reason_labels.get(row.recommendation.reason, '—') if row.recommendation else '—' }}</p>

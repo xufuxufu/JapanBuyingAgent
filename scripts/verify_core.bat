@@ -14,11 +14,12 @@ echo [verify_core] Compiling key Python files...
   app\product_identity.py app\product_matching.py app\purchase_service.py ^
   app\location_service.py app\qinsi_import.py app\qinsi_export.py ^
   app\price_providers.py app\price_service.py app\product_enrichment.py app\store_service.py ^
-  app\watch_service.py app\monitor_service.py app\monitor_scheduler.py migrations\env.py ^
+  app\watch_service.py app\monitor_service.py app\monitor_scheduler.py app\qinsi_inventory.py migrations\env.py ^
   migrations\versions\20260716_0013_store_traceability.py ^
   migrations\versions\20260716_0014_product_enrichment.py ^
   migrations\versions\20260716_0015_product_watch_mvp.py ^
-  migrations\versions\20260716_0016_price_monitor_notifications.py || exit /b 1
+  migrations\versions\20260716_0016_price_monitor_notifications.py ^
+  migrations\versions\20260716_0017_qinsi_inventory_snapshots.py || exit /b 1
 
 echo [verify_core] Checking Alembic current revision and heads...
 "%PYTHON%" -m alembic heads || exit /b 1
@@ -30,7 +31,8 @@ echo [verify_core] Running core regression tests...
   tests\test_products_and_health.py ^
   tests\test_product_import_matching_tracking.py ^
   tests\test_purchase_batches.py ^
-  tests\test_qinsi_purchase_exports.py || exit /b 1
+  tests\test_qinsi_purchase_exports.py ^
+  tests\test_qinsi_inventory_snapshots.py || exit /b 1
 
 echo [verify_core] Restarting 8020 with the existing project script...
 start "" /b cmd /c call "%CD%\restart_dev_8020_py314.bat"

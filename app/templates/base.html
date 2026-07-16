@@ -7,7 +7,7 @@
   <link rel="stylesheet" href="/static/app.css">
 </head>
 <body>
-  <header><a href="/">Japan Buying Agent</a><nav><a href="/price-check">扫码查价</a><a href="/receipts/upload">上传</a><a href="/receipts">历史</a><a href="/gpt-jobs">GPT识别任务</a><a href="/products">商品</a><a href="/watched-products">关注商品</a>{% set unread_count = nav_unread_count() %}<a href="/notifications">通知{% if unread_count %}<span class="nav-count">{{ unread_count }}</span>{% endif %}</a><a href="/monitor-status">监控状态</a><a href="/product-enrichment">新品异常</a><a href="/stores">门店</a><a href="/purchase-batches">采购批次</a><a href="/qinsi-exports">秦丝导出</a><a href="/products/import">导入商品</a><a href="/locations">位置管理</a></nav></header>
+  <header><a href="/">Japan Buying Agent</a><nav><a href="/price-check">扫码查价</a><a href="/receipts/upload">上传</a><a href="/receipts">历史</a><a href="/gpt-jobs">GPT识别任务</a><a href="/products">商品</a><a href="/watched-products">关注商品</a>{% set unread_count = nav_unread_count() %}<a href="/notifications">通知{% if unread_count %}<span class="nav-count">{{ unread_count }}</span>{% endif %}</a><a href="/monitor-status">监控状态</a><a href="/product-enrichment">新品异常</a><a href="/stores">门店</a><a href="/purchase-batches">采购批次</a><a href="/qinsi-exports">秦丝导出</a><a href="/qinsi-inventory-snapshots">秦丝库存快照</a><a href="/products/import">导入商品</a><a href="/locations">位置管理</a></nav></header>
 <main>{% block content %}{% endblock %}</main>
 <div id="imageViewer" class="image-viewer" hidden aria-modal="true" role="dialog" aria-label="图片查看器">
   <div class="viewer-toolbar">

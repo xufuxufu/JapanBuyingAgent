@@ -1,0 +1,7 @@
+{% extends "base.html" %}
+{% block title %}上传秦丝库存快照{% endblock %}
+{% block content %}
+<div class="section-head"><div><h1>上传秦丝库存快照</h1><p class="muted">兼容现有秦丝“商品导入”工作表，按表头读取货号、条码、盘点数量和仓库列。</p></div><a class="button secondary" href="/qinsi-inventory-snapshots">返回列表</a></div>
+{% if error %}<div class="warning"><strong>导入失败：</strong>{{ error }}</div>{% endif %}
+<section class="card"><form class="form-grid" method="post" enctype="multipart/form-data"><label class="full">秦丝 Excel<input type="file" name="file" accept="{{ settings.allowed_extensions|join(',') }}" required></label><label>数据对应时间（可空）<input type="datetime-local" name="data_at"></label><button class="full" type="submit">导入不可覆盖快照</button></form><p class="muted">最大 {{ settings.max_upload_bytes // 1024 // 1024 }}MB；同一文件哈希默认复用已有快照，不重复创建。</p></section>
+{% endblock %}

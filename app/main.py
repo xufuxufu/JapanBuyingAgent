@@ -39,6 +39,14 @@ from app.qinsi_export import (
     list_qinsi_export_jobs, purchase_item_export_states, retry_failed_qinsi_lines,
 )
 from app.qinsi_import import confirm_import, create_import_preview
+from app.qinsi_inventory import (
+    INVENTORY_STATUS_LABELS, MATCH_METHOD_LABELS, MATCH_STATUS_LABELS,
+    available_qinsi_warehouses, create_inventory_snapshot, get_inventory_snapshot,
+    ignore_snapshot_lines, inventory_settings, latest_inventory_for_product,
+    latest_snapshot_statistics, list_inventory_snapshots, manual_match_line,
+    map_line_warehouse, purchase_assistance, retry_snapshot_matching,
+    update_product_low_stock_threshold, watched_inventory_status_distribution,
+)
 from app.schemas import LocationOutput, PriceLookupInput, ProductCreateInput, ProductOutput, ProductUpdateInput, PurchaseBatchOutput, PurchaseConfirmationInput, QinsiExportConfirmationInput, ReceiptDraftInput, ReceiptItemDraftInput, StoreBrandCreateInput, StoreCreateInput
 from app.store_service import confirm_receipt_store, create_store, create_store_brand, product_store_summaries, product_trend_points, purchase_facts, store_product_summaries
 from app.watch_service import (
@@ -72,6 +80,7 @@ PURCHASE_STATUS_CN = {"confirmed": "已确认", "pending_qinsi_submission": "待
 QINSI_EXPORT_STATUS_CN = {"generated": "已导出待确认", "imported": "全部导入成功", "partially_failed": "部分失败", "failed": "全部失败", "cancelled": "已取消"}
 QINSI_EXPORT_TYPE_CN = {"new_product": "新商品导入", "restock": "已有商品补货"}
 QINSI_LINE_STATUS_CN = {"generated": "待确认", "imported": "已提交秦丝", "failed": "失败待重试", "cancelled": "已取消"}
+QINSI_SNAPSHOT_STATUS_CN = {"completed": "导入完成", "completed_with_issues": "导入完成（需处理）", "failed": "导入失败"}
 PURCHASE_EXPORT_STATE_CN = {"pending": "待导出", "awaiting_confirmation": "已导出待确认", "failed_retry": "失败待重试", "submitted": "已提交秦丝"}
 PRICE_PROVIDER_STATUS_CN = {
     "success": "查询成功", "empty": "未找到结果", "timeout": "查询超时", "error": "查询失败",
@@ -1214,6 +1223,141 @@ async def qinsi_export_retry(export_job_id: int, request: Request, db: Session =
     return RedirectResponse(f"/qinsi-exports/{retry_job.id}", status_code=303)
 
 
+@app.get("/qinsi-inventory-snapshots", response_class=HTMLResponse)
+def qinsi_inventory_snapshot_list(request: Request, db: Session = Depends(get_db)):
+    latest, warehouse_stats = latest_snapshot_statistics(db)
+    return templates.TemplateResponse(request, "qinsi_inventory_snapshots.html", {
+        "snapshots": list_inventory_snapshots(db),
+        "status_labels": QINSI_SNAPSHOT_STATUS_CN,
+        "latest": latest,
+        "warehouse_stats": warehouse_stats,
+        "watch_status_stats": watched_inventory_status_distribution(db),
+        "inventory_status_labels": INVENTORY_STATUS_LABELS,
+        "message": request.query_params.get("message"),
+    })
+
+
+@app.get("/qinsi-inventory-snapshots/upload", response_class=HTMLResponse)
+def qinsi_inventory_snapshot_upload_page(request: Request):
+    return templates.TemplateResponse(request, "qinsi_inventory_snapshot_upload.html", {
+        "settings": inventory_settings(), "error": None,
+    })
+
+
+@app.post("/qinsi-inventory-snapshots/upload", response_class=HTMLResponse)
+async def qinsi_inventory_snapshot_upload(
+    request: Request,
+    file: UploadFile = File(...),
+    data_at: str = Form(""),
+    db: Session = Depends(get_db),
+):
+    try:
+        parsed_data_at = datetime.fromisoformat(data_at) if data_at.strip() else None
+        if parsed_data_at is not None and parsed_data_at.tzinfo is None:
+            parsed_data_at = parsed_data_at.replace(tzinfo=TOKYO).astimezone(timezone.utc)
+        snapshot, reused = create_inventory_snapshot(
+            db, file.filename or "inventory.xlsx", await file.read(), data_at=parsed_data_at,
+        )
+    except ValueError as exc:
+        db.rollback()
+        return templates.TemplateResponse(request, "qinsi_inventory_snapshot_upload.html", {
+            "settings": inventory_settings(), "error": str(exc),
+        }, status_code=422)
+    message = "重复文件，已返回原快照" if reused else "库存快照导入完成"
+    return RedirectResponse(f"/qinsi-inventory-snapshots/{snapshot.id}?message={quote(message)}", status_code=303)
+
+
+def _qinsi_inventory_snapshot_or_404(db: Session, snapshot_id: int):
+    snapshot = get_inventory_snapshot(db, snapshot_id)
+    if snapshot is None:
+        raise HTTPException(404, "库存快照不存在")
+    return snapshot
+
+
+@app.get("/qinsi-inventory-snapshots/{snapshot_id}", response_class=HTMLResponse)
+def qinsi_inventory_snapshot_detail(snapshot_id: int, request: Request, db: Session = Depends(get_db)):
+    snapshot = _qinsi_inventory_snapshot_or_404(db, snapshot_id)
+    warehouse_distribution: dict[str, int] = {}
+    for line in snapshot.lines:
+        name = line.warehouse.display_name if line.warehouse else (line.raw_warehouse_name or "未知仓库")
+        warehouse_distribution[name] = warehouse_distribution.get(name, 0) + (line.quantity or 0)
+    return templates.TemplateResponse(request, "qinsi_inventory_snapshot_detail.html", {
+        "snapshot": snapshot,
+        "status_labels": QINSI_SNAPSHOT_STATUS_CN,
+        "match_status_labels": MATCH_STATUS_LABELS,
+        "match_method_labels": MATCH_METHOD_LABELS,
+        "warehouse_distribution": warehouse_distribution,
+        "message": request.query_params.get("message"),
+    })
+
+
+@app.get("/qinsi-inventory-snapshots/{snapshot_id}/review", response_class=HTMLResponse)
+def qinsi_inventory_snapshot_review(snapshot_id: int, request: Request, db: Session = Depends(get_db)):
+    snapshot = _qinsi_inventory_snapshot_or_404(db, snapshot_id)
+    products = list(db.scalars(select(Product).where(Product.status == "active").order_by(Product.internal_sku)))
+    return templates.TemplateResponse(request, "qinsi_inventory_snapshot_review.html", {
+        "snapshot": snapshot, "products": products,
+        "warehouses": available_qinsi_warehouses(db),
+        "match_status_labels": MATCH_STATUS_LABELS,
+        "match_method_labels": MATCH_METHOD_LABELS,
+        "message": request.query_params.get("message"),
+    })
+
+
+@app.get("/qinsi-inventory-snapshots/{snapshot_id}/download")
+def qinsi_inventory_snapshot_download(snapshot_id: int, db: Session = Depends(get_db)):
+    snapshot = _qinsi_inventory_snapshot_or_404(db, snapshot_id)
+    return StreamingResponse(
+        io.BytesIO(snapshot.file_content),
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": f"attachment; filename*=UTF-8''{quote(snapshot.original_filename)}"},
+    )
+
+
+@app.post("/qinsi-inventory-snapshot-lines/{line_id}/match")
+def qinsi_inventory_snapshot_line_match(
+    line_id: int, product_id: int = Form(...), db: Session = Depends(get_db),
+):
+    try:
+        line = manual_match_line(db, line_id, product_id)
+    except LookupError as exc:
+        raise HTTPException(404, str(exc)) from exc
+    return RedirectResponse(f"/qinsi-inventory-snapshots/{line.snapshot_id}/review?message={quote('人工匹配已保存')}", status_code=303)
+
+
+@app.post("/qinsi-inventory-snapshot-lines/{line_id}/warehouse")
+def qinsi_inventory_snapshot_line_warehouse(
+    line_id: int, warehouse_id: int = Form(...), db: Session = Depends(get_db),
+):
+    try:
+        line = map_line_warehouse(db, line_id, warehouse_id)
+    except LookupError as exc:
+        raise HTTPException(404, str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(409, str(exc)) from exc
+    return RedirectResponse(f"/qinsi-inventory-snapshots/{line.snapshot_id}/review?message={quote('仓库映射已保存')}", status_code=303)
+
+
+@app.post("/qinsi-inventory-snapshots/{snapshot_id}/retry-matching")
+def qinsi_inventory_snapshot_retry(snapshot_id: int, db: Session = Depends(get_db)):
+    try:
+        count = retry_snapshot_matching(db, snapshot_id)
+    except LookupError as exc:
+        raise HTTPException(404, str(exc)) from exc
+    return RedirectResponse(f"/qinsi-inventory-snapshots/{snapshot_id}/review?message={quote(f'重新匹配成功{count}行')}", status_code=303)
+
+
+@app.post("/qinsi-inventory-snapshots/{snapshot_id}/ignore-lines")
+async def qinsi_inventory_snapshot_ignore(snapshot_id: int, request: Request, db: Session = Depends(get_db)):
+    form = await request.form()
+    ids = {int(value) for value in form.getlist("line_ids") if str(value).isdigit()}
+    try:
+        count = ignore_snapshot_lines(db, snapshot_id, ids)
+    except LookupError as exc:
+        raise HTTPException(404, str(exc)) from exc
+    return RedirectResponse(f"/qinsi-inventory-snapshots/{snapshot_id}/review?message={quote(f'已忽略{count}行')}", status_code=303)
+
+
 @app.get("/api/purchase-batches", response_model=list[PurchaseBatchOutput])
 def api_purchase_batches(db: Session = Depends(get_db)):
     return list_purchase_batches(db)
@@ -1439,11 +1583,16 @@ def product_detail(product_id: int, request: Request, db: Session = Depends(get_
         )
         .order_by(PurchaseBatchItem.id.desc())
     ))
+    inventory = latest_inventory_for_product(db, product_id)
     return templates.TemplateResponse(request, "product_detail.html", {
         "product": product, "rows": rows, "stats": stats, "purchase_details": purchase_details,
         "store_summaries": product_store_summaries(db, product_id),
         "trend_points": product_trend_points(facts), "purchase_facts": facts,
         "watch": get_watch(db, product_id),
+        "inventory": inventory,
+        "purchase_assistance": purchase_assistance(db, product, inventory=inventory),
+        "inventory_status_labels": INVENTORY_STATUS_LABELS,
+        "inventory_settings": inventory_settings(),
         "saved": request.query_params.get("saved"), "error": request.query_params.get("error"),
     })
 
@@ -1470,6 +1619,19 @@ def update_product_page(
     except IntegrityError:
         db.rollback()
         return RedirectResponse(f"/products/{product_id}?error={quote('JAN或秦丝商品编码已存在，不能重复保存')}", status_code=303)
+    return RedirectResponse(f"/products/{product_id}?saved=1", status_code=303)
+
+
+@app.post("/products/{product_id}/inventory-settings")
+def update_product_inventory_settings(
+    product_id: int, low_stock_threshold: str = Form(""), db: Session = Depends(get_db),
+):
+    try:
+        update_product_low_stock_threshold(db, product_id, low_stock_threshold)
+    except LookupError as exc:
+        raise HTTPException(404, str(exc)) from exc
+    except ValueError as exc:
+        return RedirectResponse(f"/products/{product_id}?error={quote(str(exc))}", status_code=303)
     return RedirectResponse(f"/products/{product_id}?saved=1", status_code=303)
 
 

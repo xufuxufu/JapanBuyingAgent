@@ -250,6 +250,7 @@ class Product(Base):
     status: Mapped[str] = mapped_column(String(20), default="active", nullable=False)
     source: Mapped[str] = mapped_column(String(50), default="manual", nullable=False)
     product_origin: Mapped[str] = mapped_column(String(20), default="manual", nullable=False)
+    low_stock_threshold: Mapped[int | None] = mapped_column(Integer)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow, nullable=False)
     purchase_details: Mapped[list[PurchaseBatchItem]] = relationship(back_populates="product")
@@ -258,6 +259,8 @@ class Product(Base):
     watch_recommendations: Mapped[list[ProductWatchRecommendation]] = relationship(back_populates="product")
     watch_snapshots: Mapped[list[ProductWatchSnapshot]] = relationship(back_populates="product")
     watch_notifications: Mapped[list[ProductWatchNotification]] = relationship(back_populates="product")
+    qinsi_inventory_lines: Mapped[list[QinsiInventorySnapshotLine]] = relationship(back_populates="product")
+    qinsi_product_mappings: Mapped[list[QinsiProductMapping]] = relationship(back_populates="product")
 
 
 class ProductAlias(Base):
@@ -352,6 +355,7 @@ class Location(Base):
     sort_order: Mapped[int] = mapped_column(Integer, default=100, nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow, nullable=False)
+    qinsi_inventory_lines: Mapped[list[QinsiInventorySnapshotLine]] = relationship(back_populates="warehouse")
 
 
 class PurchaseBatch(Base):
@@ -494,6 +498,88 @@ class QinsiPurchaseExportLineSource(Base):
     is_active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
     export_line: Mapped[QinsiPurchaseExportLine] = relationship(back_populates="source")
+
+
+class QinsiInventorySnapshot(Base):
+    __tablename__ = "qinsi_inventory_snapshots"
+    __table_args__ = (
+        CheckConstraint(
+            "status IN ('completed','completed_with_issues','failed')",
+            name="ck_qinsi_inventory_snapshots_status",
+        ),
+        Index("uq_qinsi_inventory_snapshots_file_hash", "file_hash", unique=True),
+        Index("ix_qinsi_inventory_snapshots_data_time", "data_at", "imported_at"),
+    )
+    id: Mapped[int] = mapped_column(primary_key=True)
+    batch_no: Mapped[str] = mapped_column(String(64), unique=True, nullable=False)
+    original_filename: Mapped[str] = mapped_column(String(255), nullable=False)
+    file_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    file_content: Mapped[bytes] = mapped_column(LargeBinary, nullable=False)
+    imported_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
+    data_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    total_rows: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    success_rows: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    unmatched_rows: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    exception_rows: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    status: Mapped[str] = mapped_column(String(30), nullable=False)
+    error_summary: Mapped[str | None] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
+    lines: Mapped[list[QinsiInventorySnapshotLine]] = relationship(
+        back_populates="snapshot", cascade="all, delete-orphan", order_by="QinsiInventorySnapshotLine.id",
+    )
+
+
+class QinsiInventorySnapshotLine(Base):
+    __tablename__ = "qinsi_inventory_snapshot_lines"
+    __table_args__ = (
+        CheckConstraint(
+            "matching_status IN ('matched','unmatched','conflict','ignored')",
+            name="ck_qinsi_inventory_snapshot_lines_matching_status",
+        ),
+        Index("ix_qinsi_inventory_snapshot_lines_product_snapshot", "product_id", "snapshot_id"),
+        Index("ix_qinsi_inventory_snapshot_lines_warehouse_snapshot", "warehouse_id", "snapshot_id"),
+        Index("ix_qinsi_inventory_snapshot_lines_status", "snapshot_id", "matching_status"),
+    )
+    id: Mapped[int] = mapped_column(primary_key=True)
+    snapshot_id: Mapped[int] = mapped_column(ForeignKey("qinsi_inventory_snapshots.id", ondelete="CASCADE"), nullable=False)
+    original_row_no: Mapped[int] = mapped_column(Integer, nullable=False)
+    raw_product_name: Mapped[str | None] = mapped_column(String(255))
+    jan: Mapped[str | None] = mapped_column(String(32))
+    qinsi_product_code: Mapped[str | None] = mapped_column(String(100))
+    internal_sku: Mapped[str | None] = mapped_column(String(32))
+    raw_warehouse_name: Mapped[str | None] = mapped_column(String(255))
+    quantity: Mapped[int | None] = mapped_column(Integer)
+    raw_summary_json: Mapped[str] = mapped_column(Text, nullable=False)
+    product_id: Mapped[int | None] = mapped_column(ForeignKey("products.id", ondelete="SET NULL"))
+    warehouse_id: Mapped[int | None] = mapped_column(ForeignKey("locations.id", ondelete="SET NULL"))
+    matching_method: Mapped[str | None] = mapped_column(String(40))
+    matching_status: Mapped[str] = mapped_column(String(20), nullable=False, index=True)
+    warehouse_status: Mapped[str] = mapped_column(String(20), default="matched", nullable=False)
+    error_message: Mapped[str | None] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow, nullable=False)
+    snapshot: Mapped[QinsiInventorySnapshot] = relationship(back_populates="lines")
+    product: Mapped[Product | None] = relationship(back_populates="qinsi_inventory_lines")
+    warehouse: Mapped[Location | None] = relationship(back_populates="qinsi_inventory_lines")
+
+
+class QinsiProductMapping(Base):
+    __tablename__ = "qinsi_product_mappings"
+    __table_args__ = (
+        Index("uq_qinsi_product_mappings_code", "qinsi_product_code", unique=True),
+        Index("ix_qinsi_product_mappings_product", "product_id"),
+    )
+    id: Mapped[int] = mapped_column(primary_key=True)
+    qinsi_product_code: Mapped[str] = mapped_column(String(100), nullable=False)
+    product_id: Mapped[int] = mapped_column(ForeignKey("products.id", ondelete="CASCADE"), nullable=False)
+    source_snapshot_line_id: Mapped[int | None] = mapped_column(
+        ForeignKey("qinsi_inventory_snapshot_lines.id", ondelete="SET NULL")
+    )
+    confirmed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow, nullable=False)
+    product: Mapped[Product] = relationship(back_populates="qinsi_product_mappings")
+    source_snapshot_line: Mapped[QinsiInventorySnapshotLine | None] = relationship()
 
 
 class InventoryTransaction(Base):
