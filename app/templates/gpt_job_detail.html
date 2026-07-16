@@ -1,0 +1,26 @@
+{% extends "base.html" %}
+{% block title %}GPT 任务 {{ job.job_no }}{% endblock %}
+{% block content %}
+<div class="section-head"><div><h1>GPT 识别任务</h1><p class="muted">任务编号 {{ job.job_no }}</p></div><span class="badge">{{ status_text }}</span></div>
+<section class="card">
+  <div class="summary-grid">
+    <span>批次数<strong>{{ job.batch_count }}</strong></span><span>图片数<strong>{{ job.image_count }}</strong></span>
+    <span>ZIP 状态<strong>{{ '已下载' if job.download_count else '已就绪' }}</strong></span><span>下载次数<strong>{{ job.download_count }}</strong></span>
+    <span>已交给 GPT<strong>{{ '是' if job.gpt_sent_at else '否' }}</strong></span><span>JSON 导入<strong>{{ '已导入' if job.json_imported_at else '未导入' }}</strong></span>
+  </div>
+  {% if job.gpt_status == 'sent_to_gpt' %}<div class="success message">✓ 已交给GPT · 等待JSON</div>{% elif job.gpt_status in ['json_imported','review_pending'] %}<div class="success message">✓ JSON已导入 · 待审核</div>{% elif job.gpt_status == 'reviewed' %}<div class="success message">✓ JSON已导入 · 已审核</div>{% endif %}
+  <div class="button-row"><button id="promptButton" type="button" class="secondary">复制提示词</button><a class="button secondary" href="/gpt-jobs/{{ job.id }}/zip">下载 ZIP</a>{% if job.gpt_status in ['zip_ready','zip_downloaded'] %}<form method="post" action="/gpt-jobs/{{ job.id }}/sent-to-gpt"><button type="submit">已交给 GPT</button></form>{% endif %}</div>
+</section>
+<section class="card"><h2>涉及批次</h2><div class="table-wrap"><table><thead><tr><th>批次短码</th><th>图片数</th><th>商品行数</th><th>警告数</th><th>状态</th><th></th></tr></thead><tbody>{% for row in batch_rows %}<tr><td>{{ row.batch.batch_no[-4:] }}</td><td>{{ row.image_count }}</td><td>{{ row.item_count }}</td><td>{{ row.warning_count }}</td><td>{{ row.status_text }}</td><td>{% if row.item_count %}<a class="button compact" href="/receipts/{{ row.batch.id }}/review">去审核</a>{% else %}—{% endif %}</td></tr>{% endfor %}</tbody></table></div></section>
+<section class="card"><h2>导入 JSON</h2><p class="muted">先做只读预览；只有任务内全部必要 source_file 严格匹配后才可确认写入。</p>{% if error %}<div class="error"><strong>JSON 校验未通过</strong><ul>{% for summary in error_summaries[:5] %}<li>{{ summary }}</li>{% endfor %}</ul>{% if error_summaries|length > 5 %}<p>另有{{ error_summaries|length - 5 }}条错误</p>{% endif %}{% if error_details %}<details><summary>展开查看技术详情</summary><ul>{% for detail in error_details %}<li><code>{{ detail }}</code></li>{% endfor %}</ul></details>{% endif %}</div>{% endif %}<form class="stack" method="post" action="/gpt-jobs/{{ job.id }}/recognition-preview"><textarea name="payload" rows="18" required>{{ payload or '' }}</textarea><button type="submit">导入 JSON（先预览）</button></form></section>
+{% if job.recognition_runs %}<section class="card"><h2>历史 AI 原始返回</h2>{% for run in job.recognition_runs|sort(attribute='created_at', reverse=true) %}<details><summary>{{ run.created_at|tokyo_datetime(true) }} · 批次 {{ run.batch_id }} · {{ '已接受' if run.status == 'accepted' else ('失败' if run.status in ['failed','error'] else '已导入') }}</summary><pre>{{ run.raw_response_json }}</pre></details>{% endfor %}</section>{% endif %}
+<script>
+document.querySelector('#promptButton').addEventListener('click', async event => {
+  const prompt=await fetch('/receipts/gpt-prompt').then(response=>response.text());
+  const files={{ source_files|tojson }}; const text=`${prompt}\n\n当前 GPT 任务只允许使用以下 source_file（必须逐字匹配）：\n${files.join('\n')}`;
+  let copied=false;try{await navigator.clipboard.writeText(text);copied=true}catch(_){}
+  if(!copied){const helper=document.createElement('textarea');helper.value=text;helper.setAttribute('readonly','');helper.style.position='fixed';helper.style.opacity='0';document.body.appendChild(helper);helper.select();copied=document.execCommand('copy');helper.remove()}
+  event.target.textContent=copied?'已复制提示词':'复制失败';
+});
+</script>
+{% endblock %}

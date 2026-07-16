@@ -1,0 +1,6 @@
+{% extends "base.html" %}
+{% block title %}采购批次{% endblock %}
+{% block content %}
+<div class="section-head"><div><h1>采购批次</h1><p class="muted">记录已确认采购事实和初始位置归属，不代表实时可售库存。</p></div></div>
+<section class="card table-wrap"><table><thead><tr><th>批次</th><th>采购时间</th><th>店铺</th><th>状态</th><th>商品行</th><th></th></tr></thead><tbody>{% for batch in purchase_batches %}<tr><td><strong>{{ batch.batch_no }}</strong></td><td>{{ batch.purchased_at|tokyo_datetime if batch.purchased_at else '—' }}</td><td>{{ batch.store_name or '—' }}</td><td>{{ purchase_status_cn.get(batch.status, batch.status) }}</td><td>{{ batch.items|length }}</td><td><a class="button secondary compact" href="/purchase-batches/{{ batch.id }}">查看</a></td></tr>{% else %}<tr><td colspan="6">暂无采购批次。</td></tr>{% endfor %}</tbody></table></section>
+{% endblock %}

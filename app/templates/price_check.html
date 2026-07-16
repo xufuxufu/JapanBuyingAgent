@@ -1,0 +1,105 @@
+{% extends "base.html" %}
+{% block title %}扫码查价 · Japan Buying Agent{% endblock %}
+{% block content %}
+<section class="price-hero">
+  <span class="badge">手机优先</span>
+  <h1>扫码 JAN 查价</h1>
+  <p>扫描包装条码或手动输入 JAN。结果仅表示各平台本次查询，不承诺全网最低价。</p>
+</section>
+
+{% if error %}<div class="error" role="alert">{{ error }}</div>{% endif %}
+<section class="scan-layout">
+  <div class="card scanner-card">
+    <div class="scanner-stage" id="scannerStage">
+      <video id="janCamera" playsinline muted aria-label="JAN 扫码相机"></video>
+      <div class="scanner-guide" aria-hidden="true"></div>
+      <p id="scannerPlaceholder">点击下方按钮开启后置摄像头</p>
+    </div>
+    <div class="button-row">
+      <button id="startScan" type="button">开启扫码</button>
+      <button id="stopScan" class="secondary" type="button" disabled>停止</button>
+    </div>
+    <p id="scannerStatus" class="muted scanner-status" role="status">也可以直接在下方输入 JAN。</p>
+  </div>
+
+  <form class="card stack price-form" method="post" action="/price-check" id="priceLookupForm">
+    <label>JAN
+      <input id="janInput" name="jan" value="{{ jan }}" inputmode="numeric" pattern="[0-9]*" minlength="8" maxlength="14" autocomplete="off" required placeholder="例：4901234567894">
+    </label>
+    <label>当前实体店采购价（日元，可选）
+      <input name="current_store_price" value="{{ current_store_price }}" type="number" min="0" step="1" inputmode="numeric" placeholder="例：1280">
+    </label>
+    <label class="inline-check"><input name="force_refresh" type="checkbox" value="true">忽略短时缓存，重新查询</label>
+    <button id="lookupSubmit" type="submit">查询当前线上价格</button>
+    <small class="muted">新 JAN 只会标记为新品候选，不会自动创建正式商品。</small>
+  </form>
+</section>
+
+{% if histories %}
+<section class="card">
+  <div class="section-head"><h2>最近查询</h2><span class="muted">最多 20 条</span></div>
+  <div class="price-history-list">
+    {% for item in histories %}
+    <a class="price-history-row" href="/price-check/results/{{ item.id }}">
+      <span><strong>{{ item.jan }}</strong><small>{{ item.created_at|tokyo_datetime(true) }}</small></span>
+      <span class="badge">{% if item.cache_hit %}缓存{% elif item.product %}已有商品{% else %}新品候选{% endif %}</span>
+    </a>
+    {% endfor %}
+  </div>
+</section>
+{% endif %}
+
+<script>
+(() => {
+  const video = document.querySelector('#janCamera');
+  const start = document.querySelector('#startScan');
+  const stop = document.querySelector('#stopScan');
+  const status = document.querySelector('#scannerStatus');
+  const placeholder = document.querySelector('#scannerPlaceholder');
+  const input = document.querySelector('#janInput');
+  const form = document.querySelector('#priceLookupForm');
+  const submit = document.querySelector('#lookupSubmit');
+  let stream = null, detector = null, scanning = false, frame = null;
+
+  function stopCamera(message) {
+    scanning = false;
+    if (frame) cancelAnimationFrame(frame);
+    if (stream) stream.getTracks().forEach(track => track.stop());
+    stream = null; video.srcObject = null; video.classList.remove('active'); placeholder.hidden = false;
+    start.disabled = false; stop.disabled = true;
+    if (message) status.textContent = message;
+  }
+  async function scanFrame() {
+    if (!scanning) return;
+    try {
+      const codes = await detector.detect(video);
+      const value = codes.map(code => code.rawValue).find(value => /^\d{8}$|^\d{12,14}$/.test(value));
+      if (value) {
+        input.value = value; stopCamera(`已识别 JAN：${value}，正在查询…`); submit.disabled = true; form.submit(); return;
+      }
+    } catch (_) { status.textContent = '正在识别，请将条码置于取景框中央。'; }
+    frame = requestAnimationFrame(scanFrame);
+  }
+  start.addEventListener('click', async () => {
+    if (!('BarcodeDetector' in window) || !navigator.mediaDevices?.getUserMedia) {
+      status.textContent = '当前浏览器不支持相机条码识别，请手动输入 JAN。'; return;
+    }
+    start.disabled = true; status.textContent = '正在请求摄像头权限…';
+    try {
+      const supported = await BarcodeDetector.getSupportedFormats();
+      const formats = ['ean_13', 'ean_8', 'upc_a', 'upc_e'].filter(item => supported.includes(item));
+      if (!formats.length) throw new Error('format');
+      detector = new BarcodeDetector({formats});
+      stream = await navigator.mediaDevices.getUserMedia({video:{facingMode:{ideal:'environment'}}, audio:false});
+      video.srcObject = stream; await video.play(); scanning = true; video.classList.add('active'); placeholder.hidden = true;
+      stop.disabled = false; status.textContent = '请将 JAN 条码置于取景框中央。'; scanFrame();
+    } catch (error) {
+      stopCamera(error?.name === 'NotAllowedError' ? '未获得摄像头权限，请授权后重试或手动输入 JAN。' : '无法启动条码识别，请手动输入 JAN。');
+    }
+  });
+  stop.addEventListener('click', () => stopCamera('扫码已停止，可手动输入 JAN。'));
+  form.addEventListener('submit', () => { submit.disabled = true; submit.textContent = '查询中…'; });
+  window.addEventListener('pagehide', () => stopCamera());
+})();
+</script>
+{% endblock %}

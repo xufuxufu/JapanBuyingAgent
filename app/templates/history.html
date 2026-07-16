@@ -1,0 +1,65 @@
+{% extends "base.html" %}
+{% block title %}小票历史{% endblock %}
+{% block content %}
+<div class="section-head history-heading"><div><h1>小票历史</h1><p class="muted">选择已就绪批次，批量下载稳定命名的识别图。</p></div></div>
+{% if rows %}
+<div class="history-select-tools card" aria-label="批次选择工具">
+  <button type="button" class="secondary" id="selectToday">全选今天</button>
+  <button type="button" class="secondary" id="selectPending">选择待识别</button>
+  <button type="button" class="link-button" id="clearSelection">取消选择</button>
+</div>
+<div id="historyList">
+{% for row in rows %}{% set batch = row.batch %}
+<article class="history card{% if row.auto_duplicate %} duplicate-history{% endif %}" data-batch-id="{{ batch.id }}" data-image-count="{{ row.ready_count }}" data-today="{{ 'true' if '今日' in row.tags else 'false' }}" data-pending="{{ 'true' if batch.gpt_status in ['not_packaged','zip_downloaded'] else 'false' }}" data-reidentify="{{ 'true' if row.will_reidentify else 'false' }}">
+  <label class="history-check" title="{% if row.eligible %}选择批次{% else %}图片尚未全部就绪{% endif %}"><input class="batch-checkbox" type="checkbox" value="{{ batch.id }}" {% if not row.eligible %}disabled{% endif %}><span class="sr-only">选择编号 {{ batch.batch_no[-4:] }}</span></label>
+  {% if batch.images %}<img src="/receipts/{{ batch.id }}/images/{{ batch.images[0].id }}/processed?v={{ batch.images[0].rotation_degrees }}" alt="小票缩略图">{% endif %}
+  <div class="history-info">
+    <strong>{{ batch.created_at|tokyo_datetime }} 上传</strong>
+    <small>编号 {{ batch.batch_no[-4:] }} · {{ batch.image_count }}张</small>
+    <div class="history-tags">{% for tag in row.tags %}<span class="badge flow-tag">{{ tag }}</span>{% endfor %}<span class="badge selected-tag" hidden>已选择</span></div>
+    <p class="history-status"><span>{{ row.image_status_text }}</span> · <span class="gpt-status-text">{{ row.gpt_status_text }}</span></p>
+    {% if row.auto_duplicate %}<details class="duplicate-summary"><summary>重复，已自动合并</summary><p class="muted">原图、AI记录和来源关系仍完整保留。</p></details>{% endif %}
+  </div>
+  <div class="history-actions"><a class="button secondary" href="/receipts/{{ batch.id }}">查看</a>{% if row.latest_gpt_job %}<a class="button secondary" href="/gpt-jobs/{{ row.latest_gpt_job.id }}">GPT任务</a>{% endif %}</div>
+</article>
+{% endfor %}
+</div>
+<aside id="bulkBar" class="bulk-bar" hidden aria-live="polite">
+  <div><strong id="bulkCount">已选择0个批次</strong><small id="bulkHint">0张图片</small></div>
+  <div class="bulk-actions"><button type="button" id="downloadZip">下载识别ZIP</button><button type="button" class="secondary" id="bulkCancel">取消选择</button></div>
+</aside>
+<script>
+(() => {
+  const boxes=[...document.querySelectorAll('.batch-checkbox')], bulk=document.querySelector('#bulkBar');
+  const count=document.querySelector('#bulkCount'), hint=document.querySelector('#bulkHint'), download=document.querySelector('#downloadZip');
+  function selected(){return boxes.filter(box=>box.checked)}
+  function renderSelection(){
+    const current=selected(), images=current.reduce((sum,box)=>sum+Number(box.closest('.history').dataset.imageCount||0),0);
+    bulk.hidden=current.length===0; count.textContent=`已选择${current.length}个批次`; hint.textContent=`${images}张图片`;
+    boxes.forEach(box=>{const card=box.closest('.history'), tag=card.querySelector('.selected-tag'); tag.hidden=!box.checked; const flow=[...card.querySelectorAll('.flow-tag')]; flow.forEach((item,index)=>item.hidden=box.checked&&index>0);});
+  }
+  function choose(predicate){boxes.forEach(box=>{if(!box.disabled)box.checked=predicate(box.closest('.history'))});renderSelection()}
+  boxes.forEach(box=>box.addEventListener('change',renderSelection));
+  document.querySelector('#selectToday').addEventListener('click',()=>choose(card=>card.dataset.today==='true'));
+  document.querySelector('#selectPending').addEventListener('click',()=>choose(card=>card.dataset.pending==='true'));
+  function clear(){boxes.forEach(box=>box.checked=false);renderSelection()}
+  document.querySelector('#clearSelection').addEventListener('click',clear); document.querySelector('#bulkCancel').addEventListener('click',clear);
+  download.addEventListener('click',async()=>{
+    const current=selected(); if(!current.length)return;
+    if(current.some(box=>box.closest('.history').dataset.reidentify==='true')&&!confirm('所选批次包含已导入JSON的记录，将重新识别。是否继续？'))return;
+    download.disabled=true; hint.textContent='正在生成ZIP…';
+    try{
+      const query=new URLSearchParams(); current.forEach(box=>query.append('batch_ids',box.value));
+      const response=await fetch(`/receipts/recognition-images.zip?${query}`,{credentials:'same-origin'});
+      if(!response.ok){let text=await response.text();try{text=JSON.parse(text).detail||text}catch(_){}throw new Error(text||`HTTP ${response.status}`)}
+      const selectedImages=Number(response.headers.get('X-Selected-Images')||0), excluded=Number(response.headers.get('X-Excluded-Duplicates')||0), actual=Number(response.headers.get('X-Zip-Images')||0);
+      const blob=await response.blob(), link=document.createElement('a'), disposition=response.headers.get('Content-Disposition')||'';
+      const encoded=(disposition.match(/filename\*=UTF-8''([^;]+)/i)||[])[1]; link.href=URL.createObjectURL(blob); link.download=encoded?decodeURIComponent(encoded):'GPT识别.zip'; document.body.append(link);link.click();link.remove();setTimeout(()=>URL.revokeObjectURL(link.href),1000);
+      hint.textContent=`选择${selectedImages}张 · 自动排除重复${excluded}张 · ZIP实际${actual}张`;
+    }catch(error){hint.textContent=`下载失败：${error.message}`}
+    finally{download.disabled=false}
+  });
+})();
+</script>
+{% else %}<p class="muted">暂无记录。</p>{% endif %}
+{% endblock %}

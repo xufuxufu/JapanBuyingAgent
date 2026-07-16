@@ -1,0 +1,57 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>{% block title %}Japan Buying Agent{% endblock %}</title>
+  <link rel="stylesheet" href="/static/app.css">
+</head>
+<body>
+  <header><a href="/">Japan Buying Agent</a><nav><a href="/price-check">扫码查价</a><a href="/receipts/upload">上传</a><a href="/receipts">历史</a><a href="/gpt-jobs">GPT识别任务</a><a href="/products">商品</a><a href="/watched-products">关注商品</a><a href="/product-enrichment">新品异常</a><a href="/stores">门店</a><a href="/purchase-batches">采购批次</a><a href="/qinsi-exports">秦丝导出</a><a href="/products/import">导入商品</a><a href="/locations">位置管理</a></nav></header>
+<main>{% block content %}{% endblock %}</main>
+<div id="imageViewer" class="image-viewer" hidden aria-modal="true" role="dialog" aria-label="图片查看器">
+  <div class="viewer-toolbar">
+    <div class="viewer-switch"><button type="button" data-viewer-type="original">原图</button><button type="button" data-viewer-type="processed">处理图</button></div>
+    <span id="viewerPage"></span>
+    <a id="viewerDownload" class="button compact" download>下载</a>
+    <button id="viewerClose" class="viewer-close" type="button" aria-label="关闭">×</button>
+  </div>
+  <div id="viewerStage" class="viewer-stage"><img id="viewerImage" alt="小票预览" draggable="false"></div>
+</div>
+<script>
+(() => {
+  const links = [...document.querySelectorAll('.viewer-link')];
+  if (!links.length) return;
+  const overlay = document.querySelector('#imageViewer');
+  const stage = document.querySelector('#viewerStage');
+  const image = document.querySelector('#viewerImage');
+  const page = document.querySelector('#viewerPage');
+  const download = document.querySelector('#viewerDownload');
+  const typeButtons = [...overlay.querySelectorAll('[data-viewer-type]')];
+  const pages = [...new Map(links.map(link => [link.dataset.page, {page: link.dataset.page, original: link.dataset.original, processed: link.dataset.processed}])).values()];
+  let current = 0, type = 'original', scale = 1, x = 0, y = 0;
+  const pointers = new Map(); let dragStart = null, pinchStart = null;
+  function transform() { image.style.transform = `translate(${x}px,${y}px) scale(${scale})`; }
+  function reset() { scale = 1; x = 0; y = 0; transform(); }
+  function show() {
+    const item = pages[current]; const url = item[type] || item.original;
+    image.src = url; download.href = url; download.download = `receipt_${String(item.page).padStart(2,'0')}_${type}.jpg`;
+    page.textContent = `第 ${item.page} 页 / ${pages.length}`;
+    typeButtons.forEach(button => button.classList.toggle('active', button.dataset.viewerType === type)); reset();
+  }
+  function open(link) { current = Math.max(0, pages.findIndex(item => item.page === link.dataset.page)); type = link.dataset.type || 'original'; overlay.hidden = false; document.body.classList.add('viewer-open'); show(); }
+  function close() { overlay.hidden = true; document.body.classList.remove('viewer-open'); pointers.clear(); }
+  links.forEach(link => link.addEventListener('click', event => { event.preventDefault(); open(link); }));
+  typeButtons.forEach(button => button.addEventListener('click', () => { type = button.dataset.viewerType; show(); }));
+  document.querySelector('#viewerClose').addEventListener('click', close);
+  overlay.addEventListener('click', event => { if (event.target === overlay) close(); });
+  document.addEventListener('keydown', event => { if (event.key === 'Escape' && !overlay.hidden) close(); });
+  stage.addEventListener('wheel', event => { event.preventDefault(); scale = Math.min(8, Math.max(1, scale * (event.deltaY < 0 ? 1.15 : .87))); if (scale === 1) x = y = 0; transform(); }, {passive:false});
+  stage.addEventListener('pointerdown', event => { stage.setPointerCapture(event.pointerId); pointers.set(event.pointerId, {x:event.clientX,y:event.clientY}); if (pointers.size === 1) dragStart={px:event.clientX,py:event.clientY,x,y}; if (pointers.size === 2) { const p=[...pointers.values()]; pinchStart={distance:Math.hypot(p[0].x-p[1].x,p[0].y-p[1].y),scale}; } });
+  stage.addEventListener('pointermove', event => { if (!pointers.has(event.pointerId)) return; pointers.set(event.pointerId,{x:event.clientX,y:event.clientY}); if (pointers.size === 2 && pinchStart) { const p=[...pointers.values()]; scale=Math.min(8,Math.max(1,pinchStart.scale*Math.hypot(p[0].x-p[1].x,p[0].y-p[1].y)/Math.max(1,pinchStart.distance))); transform(); } else if (pointers.size === 1 && dragStart && scale>1) { x=dragStart.x+event.clientX-dragStart.px; y=dragStart.y+event.clientY-dragStart.py; transform(); } });
+  function release(event) { pointers.delete(event.pointerId); pinchStart=null; if (pointers.size === 1) { const p=[...pointers.values()][0]; dragStart={px:p.x,py:p.y,x,y}; } else dragStart=null; }
+  stage.addEventListener('pointerup', release); stage.addEventListener('pointercancel', release);
+})();
+</script>
+</body>
+</html>

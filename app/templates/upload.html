@@ -1,0 +1,109 @@
+{% extends "base.html" %}
+{% block title %}上传小票{% endblock %}
+{% block content %}
+<section class="page-intro"><h1>上传小票</h1><p class="muted">原图会完整保留，后台自动准备识别图。</p><p id="recentCompleted" class="recent-completed" hidden></p></section>
+<form id="uploadForm" class="card stack compact-upload" novalidate>
+  <div class="upload-actions">
+    <label class="pick-button">📷 直接拍照<input id="cameraInput" type="file" accept=".jpg,.jpeg,.png,.webp,.heic,.heif,image/jpeg,image/png,image/webp,image/heic,image/heif" capture="environment" hidden></label>
+    <label class="pick-button secondary-pick">🖼️ 从相册多选<input id="galleryInput" type="file" accept=".jpg,.jpeg,.png,.webp,.heic,.heif,image/jpeg,image/png,image/webp,image/heic,image/heif" multiple hidden></label>
+  </div>
+  <label class="source-type-field">来源<select id="sourceType"><option value="mobile">手机</option><option value="pc">电脑</option><option value="unknown">未知</option></select></label>
+  <div class="selection-bar"><strong id="selectedCount">已选择 0 张</strong><button type="button" class="link-button" id="clearButton">全部清除</button></div>
+  <div id="uploadPreviews" class="upload-previews" aria-live="polite"></div>
+  <div id="uploadMessage" class="message" hidden></div>
+  <div id="uploadProgress" class="upload-progress" hidden>
+    <div class="progress-line"><strong id="progressPercent">准备上传</strong><span id="progressFile">已选择 0 张</span></div>
+    <progress id="progressBar" max="100" value="0">0%</progress>
+  </div>
+  <section id="uploadResult" class="upload-result compact-result" hidden aria-live="polite">
+    <strong id="resultSummary"></strong>
+    <details id="duplicateDetails" class="duplicate-upload-details" hidden><summary id="duplicateSummary"></summary><ul id="duplicateList"></ul></details>
+    <div id="failureBlock" hidden><p id="failureCount"></p><ul id="failureList"></ul></div>
+    <div class="button-row upload-result-actions"><button id="retryFailedButton" type="button" class="secondary" hidden>重试失败</button><a id="enterBatchButton" class="button" href="#" hidden>查看批次</a><button id="continueButton" type="button" class="secondary">继续上传</button></div>
+  </section>
+  <button id="submitButton" type="submit" disabled>上传</button>
+  <p class="muted upload-note">单张最大25MB；支持 JPG、PNG、WEBP，HEIC取决于本机支持。</p>
+</form>
+<script>
+(() => {
+  const UPLOAD_URL = '/api/receipt-batches/upload';
+  const selectedFiles = [];
+  let isUploading=false, activeRequestId=null, activeBatchId=null, pollToken=0;
+  const form=document.querySelector('#uploadForm'), camera=document.querySelector('#cameraInput'), gallery=document.querySelector('#galleryInput');
+  const previews=document.querySelector('#uploadPreviews'), count=document.querySelector('#selectedCount'), submit=document.querySelector('#submitButton');
+  const message=document.querySelector('#uploadMessage'), result=document.querySelector('#uploadResult'), resultSummary=document.querySelector('#resultSummary');
+  const duplicateDetails=document.querySelector('#duplicateDetails'), duplicateSummary=document.querySelector('#duplicateSummary'), duplicateList=document.querySelector('#duplicateList'), failureBlock=document.querySelector('#failureBlock'), failureCount=document.querySelector('#failureCount'), failureList=document.querySelector('#failureList');
+  const progress=document.querySelector('#uploadProgress'), progressBar=document.querySelector('#progressBar'), progressPercent=document.querySelector('#progressPercent'), progressFile=document.querySelector('#progressFile');
+  const retryFailed=document.querySelector('#retryFailedButton'), enterBatch=document.querySelector('#enterBatchButton'), continueButton=document.querySelector('#continueButton'), recent=document.querySelector('#recentCompleted');
+  const keyFor=file=>`${file.name}:${file.size}:${file.lastModified}`;
+  const uploadError=(code,text)=>Object.assign(new Error(`${code}：${text}`),{code});
+  const submitCompat=target=>{if(typeof target.requestSubmit==='function')target.requestSubmit();else target.dispatchEvent(new Event('submit',{bubbles:true,cancelable:true}))};
+  function makeRequestId(){
+    if(window.crypto&&typeof window.crypto.randomUUID==='function')return window.crypto.randomUUID();
+    const bytes=new Uint8Array(16);if(window.crypto&&window.crypto.getRandomValues)window.crypto.getRandomValues(bytes);else for(let i=0;i<bytes.length;i++)bytes[i]=Math.floor(Math.random()*256);
+    return `safari-${Date.now().toString(36)}-${[...bytes].map(value=>value.toString(16).padStart(2,'0')).join('')}`;
+  }
+  function resetUploadSession(clearFiles=false){
+    pollToken++;activeBatchId=null;activeRequestId=null;
+    message.hidden=true;message.textContent='';progress.hidden=true;progressBar.value=0;progressBar.setAttribute('value','0');progressPercent.textContent='准备上传';progressFile.textContent=`已选择 ${selectedFiles.length} 张`;
+    result.hidden=true;resultSummary.textContent='';duplicateDetails.hidden=true;duplicateSummary.textContent='';duplicateList.innerHTML='';failureBlock.hidden=true;failureCount.textContent='';failureList.innerHTML='';retryFailed.hidden=true;enterBatch.hidden=true;enterBatch.href='#';
+    if(clearFiles){selectedFiles.length=0;camera.value='';gallery.value=''}
+    render();
+  }
+  function setProgress(percent,current,total){progress.hidden=false;progressBar.value=percent;progressBar.textContent=`${percent}%`;progressPercent.textContent=`${percent}%`;progressFile.textContent=`当前文件 ${current} / ${total}`}
+  function uploadWithProgress(body,filesSnapshot){
+    return new Promise((resolve,reject)=>{
+      const xhr=new XMLHttpRequest();let sawProgress=false,dots=0;xhr.open('POST', UPLOAD_URL, true);xhr.timeout = 180000;
+      const noProgressTimer=setTimeout(()=>{if(sawProgress)return;progressBar.removeAttribute('value');progressPercent.textContent='正在上传';progressFile.textContent=`已选择 ${filesSnapshot.length} 张`},700);
+      const activityTimer=setInterval(()=>{if(!sawProgress&&isUploading){dots=(dots+1)%4;progressPercent.textContent=`正在上传${'.'.repeat(dots)}`}},500);
+      const stopTimers=()=>{clearTimeout(noProgressTimer);clearInterval(activityTimer)};
+      xhr.upload.addEventListener('progress',event=>{if(!event.lengthComputable||event.loaded<=0)return;sawProgress=true;const percent=Math.min(100,Math.round(event.loaded/event.total*100));const bytes=filesSnapshot.reduce((sum,file)=>sum+file.size,0),uploaded=bytes*event.loaded/event.total;let cumulative=0,current=filesSnapshot.length;for(let index=0;index<filesSnapshot.length;index++){cumulative+=filesSnapshot[index].size;if(uploaded<=cumulative){current=index+1;break}}setProgress(percent,current,filesSnapshot.length)});
+      xhr.upload.addEventListener('load',()=>{stopTimers();setProgress(100,filesSnapshot.length,filesSnapshot.length);message.textContent='上传完成，服务器正在处理图片…'});
+      xhr.addEventListener('load',()=>{stopTimers();if(xhr.status === 0)return reject(uploadError('UPLOAD_CONNECTION','服务器未返回响应；请求可能未到达服务器，或 Safari/Tailscale HTTPS 连接失败，可直接重试。'));let data={};try{data=JSON.parse(xhr.responseText||'{}')}catch(_){return reject(uploadError('SERVER_ERROR',`服务器响应无法解析（HTTP ${xhr.status}）`))}resolve({ok:xhr.status>=200&&xhr.status<300,status:xhr.status,data})});
+      xhr.addEventListener('error',()=>{stopTimers();reject(uploadError('UPLOAD_NETWORK','网络中断或 Safari/Tailscale HTTPS 连接失败；所选文件已保留，可直接重试。'))});
+      xhr.addEventListener('timeout',()=>{stopTimers();reject(uploadError('UPLOAD_TIMEOUT','上传超过180秒；可直接重试，request_id会防止重复批次。'))});
+      xhr.addEventListener('abort',()=>{stopTimers();reject(uploadError('UPLOAD_ABORTED','上传被取消；文件已保留。'))});xhr.send(body);
+    });
+  }
+  async function pollBatch(batchId,total){
+    const token=++pollToken;activeBatchId=batchId;progress.hidden=true;result.hidden=false;
+    while(token===pollToken&&activeBatchId===batchId){
+      try{
+        const response=await fetch(`/api/receipt-batches/${batchId}/status`,{cache:'no-store',credentials:'same-origin'});if(!response.ok)throw new Error(`HTTP ${response.status}`);const state=await response.json();
+        resultSummary.textContent=`正在处理 ${state.processed_images+state.failed_images} / ${state.total_images}`;
+        if(state.image_status!=='processing'&&state.processed_images+state.failed_images>=state.total_images){
+          resultSummary.textContent=state.failed_images?`已完成${state.total_images-state.failed_images}张，处理失败${state.failed_images}张`:`✓ 已完成${state.total_images}张`;
+          result.classList.toggle('has-error',state.failed_images>0);const now=new Date();recent.hidden=false;recent.innerHTML=`最近完成：${now.toLocaleTimeString('zh-CN',{hour:'2-digit',minute:'2-digit',hour12:false})} · ${state.total_images}张 <a href="/receipts/${batchId}">查看</a>`;return;
+        }
+      }catch(_){resultSummary.textContent=`正在处理 0 / ${total}`}
+      await new Promise(resolve=>setTimeout(resolve,1000));
+    }
+  }
+  function addFiles(files){resetUploadSession(false);const known=new Set(selectedFiles.map(keyFor));[...files].forEach(file=>{if(!known.has(keyFor(file)))selectedFiles.push(file)});render()}
+  function render(){
+    previews.innerHTML='';selectedFiles.forEach((file,index)=>{const card=document.createElement('article');card.className='upload-preview';const img=document.createElement('img');img.src=URL.createObjectURL(file);img.onload=()=>URL.revokeObjectURL(img.src);const meta=document.createElement('div'),name=document.createElement('strong'),size=document.createElement('small');name.textContent=`${index+1}. ${file.name}`;size.textContent=`${(file.size/1024/1024).toFixed(2)} MB`;meta.append(name,size);const remove=document.createElement('button');remove.type='button';remove.className='danger compact';remove.textContent='移除';remove.disabled=isUploading;remove.addEventListener('click',()=>{resetUploadSession(false);selectedFiles.splice(index,1);render()});card.append(img,meta,remove);previews.append(card)});
+    count.textContent=`已选择 ${selectedFiles.length} 张`;submit.disabled=!selectedFiles.length||isUploading;camera.disabled=gallery.disabled=isUploading;
+  }
+  camera.addEventListener('change',event=>addFiles(event.target.files));gallery.addEventListener('change',event=>addFiles(event.target.files));
+  document.querySelector('#clearButton').addEventListener('click',()=>{if(!isUploading)resetUploadSession(true)});
+  retryFailed.addEventListener('click',()=>{if(selectedFiles.length){activeRequestId=null;submitCompat(form)}});
+  continueButton.addEventListener('click',()=>{if(!isUploading)resetUploadSession(true)});
+  document.addEventListener('visibilitychange',()=>{if(!document.hidden&&activeBatchId)pollBatch(activeBatchId,selectedFiles.length)});
+  form.addEventListener('submit',async event=>{
+    event.preventDefault();if (isUploading || !selectedFiles.length) return;
+    isUploading=true;submit.textContent='上传中…';render();progress.hidden=false;progressBar.value=0;progressPercent.textContent='准备上传';progressFile.textContent=`已选择 ${selectedFiles.length} 张`;message.hidden=false;message.className='message info';message.textContent='正在上传…';
+    const filesSnapshot=[...selectedFiles],body=new FormData();filesSnapshot.forEach(file=>body.append('files',file,file.name));body.append('source_type',document.querySelector('#sourceType').value);activeRequestId=activeRequestId||makeRequestId();body.append('request_id',activeRequestId);
+    try{
+      const response=await uploadWithProgress(body,filesSnapshot),data=response.data;if(!response.ok&&!Array.isArray(data.failures))throw uploadError('SERVER_ERROR',data.detail||`服务器返回HTTP ${response.status}`);
+      const failures=Array.isArray(data.failures)?data.failures:[],duplicates=Array.isArray(data.duplicates)?data.duplicates:[];failureList.innerHTML='';failures.forEach(item=>{const row=document.createElement('li');row.textContent=`${item.filename}：${item.reason}（${item.code||'UPLOAD_FAILED'}）`;failureList.append(row)});
+      failureBlock.hidden=failures.length===0;failureCount.textContent=failures.length?`失败${failures.length}张`:'';retryFailed.hidden=failures.length===0;duplicateDetails.hidden=duplicates.length===0;duplicateSummary.textContent=duplicates.length?`已自动跳过${duplicates.length}张重复图片`:'';duplicateList.innerHTML='';duplicates.forEach(item=>{const row=document.createElement('li'),time=new Date(item.matched_at).toLocaleString('zh-CN',{hour12:false});row.textContent=`${item.filename} → 批次${item.matched_batch_id} 第${item.matched_page_no}页 · ${time}`;duplicateList.append(row)});
+      result.hidden=false;enterBatch.hidden=!data.id;enterBatch.href=data.id?`/receipts/${data.id}`:'#';const failedNames=new Set(failures.map(item=>item.filename));selectedFiles.splice(0,selectedFiles.length,...filesSnapshot.filter(file=>failedNames.has(file.name)));activeRequestId=null;message.hidden=true;
+      if(data.duplicate_only){progress.hidden=true;resultSummary.textContent=`已自动跳过${duplicates.length}张重复图片`;activeBatchId=null}
+      else if(data.id){resultSummary.textContent=`正在处理 0 / ${data.success_count||0}`;pollBatch(data.id,data.success_count||0)}
+      else{progress.hidden=true;resultSummary.textContent='上传失败'}
+    }catch(error){message.hidden=false;message.className='message error';message.textContent=error.message||'UPLOAD_NETWORK：上传失败，文件已保留，可直接重试。'}
+    finally{isUploading=false;submit.textContent='上传';render()}
+  });
+})();
+</script>
+{% endblock %}

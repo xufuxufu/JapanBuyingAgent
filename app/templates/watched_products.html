@@ -1,0 +1,43 @@
+{% extends "base.html" %}
+{% block title %}关注商品{% endblock %}
+{% macro watch_card(row, group) %}
+<article class="card watch-card">
+  <div class="watch-card-head">
+    {% if group == 'recommended' %}<input type="checkbox" name="recommendation_ids" value="{{ row.recommendation.id }}" form="batch-accept">
+    {% else %}<input type="checkbox" name="product_ids" value="{{ row.product.id }}" form="batch-enable">{% endif %}
+    {% if row.product.main_image_path %}<img src="/product-images/{{ row.product.id }}" alt="商品主图" loading="lazy">{% elif row.product.main_image_source_url %}<img src="{{ row.product.main_image_source_url }}" alt="商品主图" loading="lazy">{% else %}<div class="watch-image-empty">暂无图</div>{% endif %}
+    <div><h3><a href="/products/{{ row.product.id }}">{{ row.product.display_name or row.product.name_cn or row.product.name_ja or '待补商品名' }}</a></h3><p class="muted">JAN {{ row.product.jan or '—' }}</p></div>
+  </div>
+  <div class="watch-price-grid">
+    <span><strong>{{ row.latest_purchase_price if row.latest_purchase_price is not none else '—' }}</strong>最近采购价</span>
+    <span><strong>{{ row.minimum_purchase_price if row.minimum_purchase_price is not none else '—' }}</strong>历史最低采购价</span>
+    <span><strong>{{ row.online_price if row.online_price is not none else '—' }}</strong>线上参考价<small>{{ row.online_price_at|tokyo_datetime if row.online_price_at else '暂无更新时间' }}</small></span>
+    <span><strong>{{ row.recommended_target_price if row.recommended_target_price is not none else '—' }}</strong>推荐目标价</span>
+    <span><strong>{{ row.config.user_target_price if row.config and row.config.user_target_price is not none else '—' }}</strong>用户目标价</span>
+    <span><strong>{{ row.config.effective_target_price if row.config and row.config.effective_target_price is not none else '—' }}</strong>生效目标价</span>
+  </div>
+  <p><strong>推荐原因：</strong>{{ reason_labels.get(row.recommendation.reason, '—') if row.recommendation else '—' }}</p>
+  <div class="button-row"><a class="button secondary compact" href="/products/{{ row.product.id }}">采购与门店</a><a class="button secondary compact" href="/price-check{% if row.product.jan %}?jan={{ row.product.jan }}{% endif %}">在线查价历史</a>{% if row.enrichment_task_id %}<a class="button secondary compact" href="/product-enrichment/{{ row.enrichment_task_id }}">丰富化来源</a>{% endif %}</div>
+  {% if row.config %}
+  <form class="watch-form" method="post" action="/watched-products/{{ row.product.id }}/update">
+    <label>用户目标价<input name="user_target_price" inputmode="numeric" value="{{ row.config.user_target_price or '' }}" placeholder="整数日元"></label>
+    <label>频率<select name="frequency_tier">{% for tier,hours in frequency_hours.items() %}<option value="{{ tier }}" {% if row.config.frequency_tier == tier %}selected{% endif %}>{{ tier }}（{{ hours }}小时）</option>{% endfor %}</select></label>
+    <label class="checkbox"><input type="checkbox" name="monitor_restock" {% if row.config.monitor_restock %}checked{% endif %}>监控重新上架</label>
+    <button type="submit" class="secondary">保存配置</button>
+  </form>
+  <div class="button-row">{% if row.config.enabled %}<form method="post" action="/watched-products/{{ row.product.id }}/pause"><button type="submit" class="secondary">暂停</button></form>{% else %}<form method="post" action="/watched-products/{{ row.product.id }}/enable"><button type="submit">启用</button></form>{% endif %}</div>
+  {% else %}
+  <div class="button-row"><form method="post" action="/watched-products/recommendations/{{ row.recommendation.id }}/accept"><button type="submit">接受推荐</button></form><form method="post" action="/watched-products/recommendations/{{ row.recommendation.id }}/ignore"><button type="submit" class="secondary">忽略</button></form></div>
+  {% endif %}
+</article>
+{% endmacro %}
+{% block content %}
+<div class="section-head"><div><h1>关注商品</h1><p class="muted">推荐只使用现有采购与可信线上数据；接受推荐不会自动启用监控。</p></div><a class="button secondary" href="/products">商品列表</a></div>
+{% if message %}<div class="success message">{{ message }}</div>{% endif %}{% if error %}<div class="warning"><strong>操作失败：</strong>{{ error }}</div>{% endif %}
+<section class="card"><h2>手动加入关注</h2><form class="form-grid" method="post" action="/watched-products/add"><label class="full">商品<select name="product_id" required><option value="">请选择商品</option>{% for product in products %}<option value="{{ product.id }}">{{ product.internal_sku }} · {{ product.display_name or product.name_cn or product.name_ja }}</option>{% endfor %}</select></label><label>用户目标价（可空）<input name="user_target_price" inputmode="numeric"></label><label>频率<select name="frequency_tier">{% for tier,hours in frequency_hours.items() %}<option value="{{ tier }}" {% if tier == 'normal' %}selected{% endif %}>{{ tier }}（{{ hours }}小时）</option>{% endfor %}</select></label><button class="full" type="submit">加入关注</button></form></section>
+<form id="batch-enable" method="post" action="/watched-products/batch-enable"></form><form id="batch-accept" method="post" action="/watched-products/batch-accept"></form>
+<div class="batch-actions"><button type="submit" form="batch-enable">批量启用有有效目标价商品</button><button type="submit" form="batch-accept" class="secondary">批量接受推荐</button></div>
+{% for key,title in [('enabled','已启用'),('watched','已关注但未启用'),('recommended','系统推荐'),('paused','已暂停')] %}
+<section class="watch-group"><div class="section-head"><h2>{{ title }}</h2><span class="badge">{{ groups[key]|length }}</span></div><div class="watch-grid">{% for row in groups[key] %}{{ watch_card(row, key) }}{% else %}<div class="card muted">暂无商品。</div>{% endfor %}</div></section>
+{% endfor %}
+{% endblock %}

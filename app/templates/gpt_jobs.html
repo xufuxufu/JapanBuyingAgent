@@ -1,0 +1,11 @@
+{% extends "base.html" %}
+{% block title %}GPT 识别任务{% endblock %}
+{% block content %}
+<div class="section-head"><div><h1>GPT 识别任务</h1><p class="muted">每个识别 ZIP 对应一个独立任务，批量 JSON 只在任务内导入。</p></div><a class="button secondary" href="/receipts">选择批次生成 ZIP</a></div>
+{% for job in jobs %}
+<article class="card row">
+  <div><strong>{{ job.job_no }}</strong><small>{{ job.batch_count }} 个批次 · {{ job.image_count }} 张图片 · 下载 {{ job.download_count }} 次</small></div>
+  <div><span class="badge">{{ status_names.get(job.gpt_status, job.gpt_status) }}</span> <a class="button secondary" href="/gpt-jobs/{{ job.id }}">查看任务</a></div>
+</article>
+{% else %}<p class="muted">暂无 GPT 识别任务。请先在小票历史中选择批次并下载 ZIP。</p>{% endfor %}
+{% endblock %}

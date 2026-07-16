@@ -1,0 +1,65 @@
+{% extends "base.html" %}
+{% block title %}小票详情{% endblock %}
+{% block content %}
+<div class="section-head batch-heading"><div><h1>{{ batch.created_at|tokyo_datetime }} 上传</h1><p class="muted">编号 {{ batch.batch_no[-4:] }} · {{ batch.source_type }}</p></div><span class="badge">{{ batch_status_cn.get(batch.status, '状态未知') }}</span></div>
+{% if duplicate_master %}<div class="warning">重复，已自动合并到主记录。<a href="/receipts/{{ duplicate_master.batch_id }}">查看主记录</a></div>{% endif %}
+{% if duplicate_links %}<details class="card"><summary>查看 {{ duplicate_links|length }} 条重复记录</summary>{% for duplicate in duplicate_links %}<p><a href="/receipts/{{ duplicate.batch_id }}">重复记录 #{{ duplicate.id }}</a> · 原图与AI结果均保留</p>{% endfor %}</details>{% endif %}
+{% if rotated %}<div id="rotationMessage" class="message success">已旋转90°</div>{% else %}<div id="rotationMessage" class="message success" hidden></div>{% endif %}
+<section class="card compact-card">
+  <div class="section-head"><div><h2>识别图片</h2><p class="muted">按页码 01 → {{ '%02d'|format(batch.image_count) }} 上传给 ChatGPT。</p></div><a class="button" href="/receipts/{{ batch.id }}/recognition-images.zip">下载全部 ZIP</a></div>
+</section>
+<section class="image-cards">
+{% for image in batch.images %}
+  {% set original_url = '/receipts/' ~ batch.id ~ '/images/' ~ image.id ~ '/original' %}
+  {% set processed_url = '/receipts/' ~ batch.id ~ '/images/' ~ image.id ~ '/processed?v=' ~ image.rotation_degrees %}
+  <article class="card image-card compact-card" data-image-card="{{ image.id }}">
+    <div class="section-head"><h3>第 {{ image.page_no }} 页</h3><span class="badge image-status">{{ preprocess_status_cn.get(image.preprocessing_status, '状态未知') }}</span></div>
+    <div class="compare-grid">
+      <figure><a class="viewer-link" href="{{ original_url }}" data-page="{{ image.page_no }}" data-type="original" data-original="{{ original_url }}" data-processed="{{ processed_url }}"><img src="{{ original_url }}" alt="原图第 {{ image.page_no }} 页"></a><figcaption>原图 {{ image.width }}×{{ image.height }}</figcaption></figure>
+      <figure><a class="viewer-link" href="{{ processed_url }}" data-page="{{ image.page_no }}" data-type="processed" data-original="{{ original_url }}" data-processed="{{ processed_url }}"><img data-processed-image="{{ image.id }}" src="{% if image.preprocessing_status in ['processed','fallback'] %}{{ processed_url }}{% else %}{{ original_url }}{% endif %}" alt="处理图第 {{ image.page_no }} 页"></a><figcaption class="processed-caption">处理图 {{ image.processed_width or '处理中' }}{% if image.processed_height %}×{{ image.processed_height }}{% endif %}</figcaption></figure>
+    </div>
+    <div class="warning image-warning" {% if not image.processing_warning %}hidden{% endif %}>{{ image.processing_warning or '' }}</div>
+    <div class="message operation-message" hidden></div>
+    <div class="image-controls">
+      <div class="image-tools">
+        <form class="async-image-form rotate-form" method="post" action="/receipts/{{ batch.id }}/images/{{ image.id }}/rotate" data-image-id="{{ image.id }}" data-working="旋转中…"><button class="secondary" type="submit">旋转</button></form>
+        <form class="async-image-form reprocess-form" method="post" action="/receipts/{{ batch.id }}/images/{{ image.id }}/reprocess" data-image-id="{{ image.id }}" data-working="处理中…"><button class="secondary" type="submit">重试</button></form>
+        <a class="button" href="/receipts/{{ batch.id }}/images/{{ image.id }}/download">下载</a>
+      </div>
+      <form class="async-image-form source-form compact-source" method="post" action="/receipts/{{ batch.id }}/images/{{ image.id }}/source" data-image-id="{{ image.id }}" data-working="保存中…"><label>识别使用<select name="source"><option value="original" {% if image.recognition_source == 'original' %}selected{% endif %}>原图</option><option value="processed" {% if image.recognition_source == 'processed' %}selected{% endif %}>处理图</option></select></label></form>
+    </div>
+    <small class="muted recognition-name">{{ image.recognition_filename }}</small>
+  </article>
+{% endfor %}
+</section>
+<section class="card">
+  <div class="section-head"><h2>GPT 识别任务</h2>{% if batch.receipts %}<a class="button" href="/receipts/{{ batch.id }}/review">进入人工确认</a>{% endif %}</div>
+  {% if gpt_jobs %}<p>此批次属于以下任务：</p><div class="button-row">{% for job in gpt_jobs %}<a class="button secondary" href="/gpt-jobs/{{ job.id }}">{{ job.job_no }}</a>{% endfor %}</div>{% else %}<p class="muted">请从小票历史选择批次下载识别 ZIP，系统将创建独立 GPT 识别任务。</p><a class="button secondary" href="/receipts">前往小票历史</a>{% endif %}
+</section>
+{% if batch.recognition_runs %}<section class="card"><h2>历史 AI 原始返回</h2>{% for run in batch.recognition_runs|sort(attribute='created_at', reverse=true) %}<details><summary>第 {{ loop.revindex }} 次 · {{ run.created_at|tokyo_datetime(true) }} · {{ ai_status_cn.get(run.status, '状态未知') }}</summary><pre>{{ run.raw_response_json }}</pre></details>{% endfor %}</section>{% endif %}
+{% set confirmed = batch.status == 'confirmed' or (batch.receipts and batch.receipts[0].confirmation_status == 'confirmed') %}
+{% if not confirmed %}<form method="post" action="/receipts/{{ batch.id }}/delete" onsubmit="return confirm('删除这个未确认批次及其图片？')"><button class="danger" type="submit">删除未确认批次</button></form>{% endif %}
+<script>
+function submitCompat(form) { if (typeof form.requestSubmit === 'function') form.requestSubmit(); else form.dispatchEvent(new Event('submit',{bubbles:true,cancelable:true})); }
+function updateImageCard(card, image) {
+  const url=`${image.processed_url}${image.processed_url.includes('?')?'&':'?'}t=${Date.now()}`;
+  card.querySelector('[data-processed-image]').src=url; card.querySelector('.image-status').textContent=image.preprocessing_status;
+  card.querySelector('.processed-caption').textContent=`处理图 ${image.processed_width||'—'}×${image.processed_height||'—'}`;
+  const warning=card.querySelector('.image-warning'); warning.textContent=image.processing_warning||''; warning.hidden=!image.processing_warning;
+  card.querySelectorAll('.viewer-link').forEach(link=>{link.dataset.processed=url;if(link.dataset.type==='processed')link.href=url;});
+  const select=card.querySelector('select[name="source"]'); if(select)select.value=image.recognition_source;
+}
+document.querySelectorAll('.source-form select').forEach(select=>select.addEventListener('change',()=>submitCompat(select.form)));
+document.querySelectorAll('.async-image-form').forEach(form=>form.addEventListener('submit',async event=>{
+  event.preventDefault(); const scrollPosition={x:window.scrollX,y:window.scrollY}; const card=form.closest('[data-image-card]'), notice=card.querySelector('.operation-message');
+  if(card.dataset.busy==='1')return; const formData=new FormData(form); card.dataset.busy='1'; const controls=[...card.querySelectorAll('button,select')]; controls.forEach(control=>control.disabled=true);
+  notice.hidden=false; notice.className='message operation-message info'; notice.textContent=form.dataset.working||'处理中…';
+  try {
+    const response=await fetch(form.action,{method:'POST',body:formData,headers:{Accept:'application/json'},credentials:'same-origin'});
+    let data={}; try{data=await response.json();}catch(_){throw new Error(`SERVER_ERROR：HTTP ${response.status}`);} if(!response.ok)throw new Error(typeof data.detail==='string'?data.detail:`SERVER_ERROR：HTTP ${response.status}`);
+    updateImageCard(card,data.image); notice.className='message operation-message success'; notice.textContent=data.message||'操作完成';
+  } catch(error) { notice.className='message operation-message error'; notice.textContent=error.message||'SERVER_ERROR：操作失败，可重试。'; }
+  finally { controls.forEach(control=>control.disabled=false); card.dataset.busy='0'; window.requestAnimationFrame(()=>window.scrollTo(scrollPosition.x,scrollPosition.y)); }
+}));
+</script>
+{% endblock %}

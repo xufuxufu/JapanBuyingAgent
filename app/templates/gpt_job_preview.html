@@ -1,0 +1,14 @@
+{% extends "base.html" %}
+{% block title %}批量 JSON 导入预览{% endblock %}
+{% block content %}
+<div class="section-head"><div><h1>批量 JSON 导入预览</h1><p class="muted">任务 {{ job.job_no }} · 此页未写入数据库</p></div><span class="badge">schema {{ preview.parsed.schema_version }}</span></div>
+{% if is_repeat %}<div class="warning"><strong>重新导入提醒：</strong>确认后才会替换当前未确认草稿；旧 AI 原始返回历史不会删除。</div>{% endif %}
+<section class="card"><div class="summary-grid"><span>匹配成功图片<strong>{{ preview.matched_image_count }}</strong></span><span>未匹配图片<strong>{{ preview.unmatched_image_count }}</strong></span><span>涉及批次<strong>{{ preview.batch_count }}</strong></span><span>商品行数<strong>{{ preview.item_count }}</strong></span><span>warnings<strong>{{ preview.warning_count }}</strong></span></div></section>
+{% if preview.unknown_source_files %}<div class="error"><strong>未找到的 source_file：</strong>{{ preview.unknown_source_files|join('、') }}</div>{% endif %}
+{% if preview.cross_job_source_files %}<div class="error"><strong>跨 GPT 任务文件：</strong>{{ preview.cross_job_source_files|join('、') }}</div>{% endif %}
+{% if preview.duplicate_source_files %}<div class="error"><strong>重复 source_file：</strong>{{ preview.duplicate_source_files|join('、') }}</div>{% endif %}
+{% if preview.page_mismatches %}<div class="error"><strong>source_page_no 不一致：</strong>{{ preview.page_mismatches|join('；') }}</div>{% endif %}
+{% if preview.missing_source_files %}<div class="warning"><strong>缺少图片结果：</strong>{{ preview.missing_source_files|join('、') }}。GPT 可以遗漏图片进入警告预览，但默认禁止完成整个任务。</div>{% endif %}
+<section class="card"><h2>每批次明细</h2><div class="table-wrap"><table><thead><tr><th>批次短码</th><th>匹配/应有图片</th><th>商品行</th><th>warnings</th><th>缺少结果</th></tr></thead><tbody>{% for row in preview.batch_details %}<tr><td>{{ row.batch_no[-4:] }}</td><td>{{ row.matched_image_count }}/{{ row.expected_image_count }}</td><td>{{ row.item_count }}</td><td>{{ row.warning_count }}</td><td>{{ row.missing_source_files|join('、') if row.missing_source_files else '—' }}</td></tr>{% endfor %}</tbody></table></div></section>
+<div class="button-row"><a class="button secondary" href="/gpt-jobs/{{ job.id }}">返回修改</a>{% if preview.can_import %}<form method="post" action="/gpt-jobs/{{ job.id }}/recognition-json"><textarea name="payload" hidden>{{ payload }}</textarea><button type="submit">确认导入并创建待审核草稿</button></form>{% else %}<button type="button" disabled>匹配未完成，禁止导入</button>{% endif %}</div>
+{% endblock %}

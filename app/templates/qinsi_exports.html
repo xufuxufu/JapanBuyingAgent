@@ -1,0 +1,6 @@
+{% extends "base.html" %}
+{% block title %}秦丝导出记录{% endblock %}
+{% block content %}
+<div class="section-head"><div><h1>秦丝导出记录</h1><p class="muted">采购批次生成、下载与导入结果确认记录。</p></div>{% if purchase_batch_id %}<a class="button secondary" href="/purchase-batches/{{ purchase_batch_id }}">返回采购批次</a>{% endif %}</div>
+<section class="card table-wrap"><table><thead><tr><th>导出批次号</th><th>类型</th><th>采购批次</th><th>目标仓库</th><th>创建时间</th><th>文件名</th><th>状态</th><th>明细数</th><th></th></tr></thead><tbody>{% for job in jobs %}<tr><td><strong>{{ job.export_no }}</strong></td><td>{{ qinsi_export_type_cn[job.export_type] }}</td><td><a href="/purchase-batches/{{ job.purchase_batch_id }}">{{ job.purchase_batch.batch_no }}</a></td><td>{{ job.qinsi_target_warehouse.display_name }}</td><td>{{ job.created_at|tokyo_datetime }}</td><td>{{ job.filename }}</td><td><span class="badge">{{ qinsi_export_status_cn[job.status] }}</span></td><td>{{ job.line_count }}</td><td><a class="button secondary compact" href="/qinsi-exports/{{ job.id }}">查看</a></td></tr>{% else %}<tr><td colspan="9">暂无秦丝导出记录。</td></tr>{% endfor %}</tbody></table></section>
+{% endblock %}

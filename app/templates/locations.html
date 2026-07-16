@@ -1,0 +1,8 @@
+{% extends "base.html" %}
+{% block title %}位置管理{% endblock %}
+{% block content %}
+<div class="section-head"><div><h1>位置管理</h1><p class="muted">位置内部编码保持稳定；本阶段仅提供只读列表，不提供删除功能。</p></div></div>
+<section class="card table-wrap"><table><thead><tr><th>名称</th><th>类型</th><th>秦丝仓库标识</th><th>启用状态</th></tr></thead><tbody>
+{% for location in locations %}<tr><td><strong>{{ location.display_name }}</strong><br><small class="muted">{{ location.internal_code }}</small></td><td>{{ location_type_cn.get(location.location_type, location.location_type) }}</td><td>{{ '是' if location.is_qinsi_warehouse else '否' }}</td><td>{{ '启用' if location.is_active else '禁用' }}</td></tr>{% else %}<tr><td colspan="4">暂无位置。</td></tr>{% endfor %}
+</tbody></table></section>
+{% endblock %}
