@@ -3,6 +3,7 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass
 from datetime import datetime
+from decimal import Decimal
 
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session, selectinload
@@ -149,8 +150,8 @@ class PurchaseFact:
     item: PurchaseBatchItem
     batch: PurchaseBatch
     receipt: Receipt
-    store: Store
-    reference_unit_price: float | None
+    store: Store | None
+    reference_unit_price: Decimal | None
 
 
 def purchase_facts(session: Session, *, product_id: int | None = None, store_id: int | None = None) -> list[PurchaseFact]:
@@ -173,9 +174,9 @@ def purchase_facts(session: Session, *, product_id: int | None = None, store_id:
     for item in items:
         batch, receipt = item.purchase_batch, item.purchase_batch.receipt
         store = batch.store or receipt.store
-        if store is None or (store_id is not None and store.id != store_id):
+        if store_id is not None and (store is None or store.id != store_id):
             continue
-        unit_price = item.actual_line_amount / item.quantity if item.actual_line_amount is not None and item.quantity else None
+        unit_price = Decimal(item.actual_line_amount) / item.quantity if item.actual_line_amount is not None and item.quantity else None
         facts.append(PurchaseFact(item, batch, receipt, store, unit_price))
     return facts
 
@@ -187,6 +188,8 @@ def _date_key(fact: PurchaseFact) -> tuple[datetime, int]:
 def product_store_summaries(session: Session, product_id: int) -> list[dict]:
     groups: dict[int, list[PurchaseFact]] = {}
     for fact in purchase_facts(session, product_id=product_id):
+        if fact.store is None:
+            continue
         groups.setdefault(fact.store.id, []).append(fact)
     rows = []
     for facts in groups.values():
@@ -213,9 +216,27 @@ def store_product_summaries(session: Session, store_id: int) -> tuple[list[dict]
             "product": latest.item.product, "purchase_count": len({fact.batch.id for fact in product_facts}),
             "quantity": sum(fact.item.quantity for fact in product_facts),
             "total_amount": sum(fact.item.actual_line_amount or 0 for fact in product_facts),
+            "minimum_price": min((fact.reference_unit_price for fact in product_facts if fact.reference_unit_price is not None), default=None),
             "latest_date": latest.batch.purchased_at, "latest_batch": latest.batch, "latest_receipt": latest.receipt,
         })
     return sorted(rows, key=lambda row: (row["latest_date"] or datetime.min), reverse=True), sorted(facts, key=_date_key, reverse=True)
+
+
+def store_overview_summaries(session: Session) -> dict[int, dict]:
+    store_id = func.coalesce(PurchaseBatch.store_id, Receipt.store_id).label("store_id")
+    rows = session.execute(
+        select(
+            store_id, func.count(func.distinct(PurchaseBatch.id)),
+            func.coalesce(func.sum(PurchaseBatchItem.quantity), 0), func.max(PurchaseBatch.purchased_at),
+        )
+        .select_from(PurchaseBatchItem)
+        .join(PurchaseBatch, PurchaseBatch.id == PurchaseBatchItem.purchase_batch_id)
+        .join(Receipt, Receipt.id == PurchaseBatch.receipt_id)
+        .where(PurchaseBatch.status != "cancelled", PurchaseBatchItem.quantity > 0, store_id.is_not(None))
+        .group_by(store_id)
+    ).all()
+    return {value: {"purchase_count": int(count), "quantity": int(quantity), "latest_date": latest}
+            for value, count, quantity, latest in rows}
 
 
 def product_trend_points(facts: list[PurchaseFact]) -> list[dict]:
@@ -223,9 +244,30 @@ def product_trend_points(facts: list[PurchaseFact]) -> list[dict]:
     if not priced:
         return []
     low, high = min(fact.reference_unit_price for fact in priced), max(fact.reference_unit_price for fact in priced)
-    span = max(1, high - low)
+    span = max(Decimal(1), high - low)
     count = len(priced)
     return [{
         "fact": fact, "x": 30 if count == 1 else 30 + index * 540 / (count - 1),
-        "y": 185 - (fact.reference_unit_price - low) * 145 / span,
+        "y": 185 - float((fact.reference_unit_price - low) * 145 / span),
     } for index, fact in enumerate(priced)]
+
+
+def store_monthly_trend_points(facts: list[PurchaseFact]) -> list[dict]:
+    grouped: dict[str, dict] = {}
+    for fact in facts:
+        value = fact.batch.purchased_at or fact.batch.confirmed_at
+        key = value.strftime("%Y-%m")
+        row = grouped.setdefault(key, {"bucket": key, "amount": 0, "batch_ids": set(), "quantity": 0})
+        row["amount"] += fact.item.actual_line_amount or 0
+        row["quantity"] += fact.item.quantity
+        row["batch_ids"].add(fact.batch.id)
+    rows = []
+    for _, row in sorted(grouped.items()):
+        rows.append({"bucket": row["bucket"], "amount": row["amount"],
+                     "quantity": row["quantity"], "purchase_count": len(row["batch_ids"])})
+    if not rows:
+        return []
+    maximum = max(row["amount"] for row in rows) or 1
+    count = len(rows)
+    return [dict(row, x=30 if count == 1 else 30 + index * 540 / (count - 1),
+                 y=185 - row["amount"] * 145 / maximum) for index, row in enumerate(rows)]

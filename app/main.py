@@ -3,6 +3,7 @@ from __future__ import annotations
 import io
 import json
 from datetime import date, datetime, timedelta, timezone
+from decimal import Decimal, ROUND_HALF_UP
 from difflib import SequenceMatcher
 from pathlib import Path
 from urllib.parse import quote
@@ -18,7 +19,8 @@ from sqlalchemy.orm import Session, selectinload
 
 from app.config import PREVIEW_DIR, PRODUCT_IMAGE_DIR, PROJECT_ROOT, ensure_data_directories
 from app.db import SessionLocal, get_db
-from app.models import ImportJob, ImportRow, Product, ProductAlias, ProductWatchConfig, PurchaseBatch, PurchaseBatchItem, QinsiPurchaseExportJob, Receipt, ReceiptBatch, ReceiptImage, ReceiptItem, Store, StoreBrand, ZipPackageItem, ZipPackageJob
+from app.models import ImportJob, ImportRow, Product, ProductAlias, ProductWatchConfig, ProductWatchSnapshot, PurchaseBatch, PurchaseBatchItem, QinsiPurchaseExportJob, Receipt, ReceiptBatch, ReceiptImage, ReceiptItem, Store, StoreBrand, ZipPackageItem, ZipPackageJob
+from app.analytics_service import analytics_dashboard, resolve_date_range
 from app.product_matching import bind_product, create_product_from_item, match_batch, match_date, match_receipt, normalize_alias
 from app.product_identity import create_product_record, format_product_display_name, normalize_product_name, update_product_identifiers
 from app.price_service import build_lookup_view, query_prices, recent_price_lookup_histories
@@ -48,7 +50,7 @@ from app.qinsi_inventory import (
     update_product_low_stock_threshold, watched_inventory_status_distribution,
 )
 from app.schemas import LocationOutput, PriceLookupInput, ProductCreateInput, ProductOutput, ProductUpdateInput, PurchaseBatchOutput, PurchaseConfirmationInput, QinsiExportConfirmationInput, ReceiptDraftInput, ReceiptItemDraftInput, StoreBrandCreateInput, StoreCreateInput
-from app.store_service import confirm_receipt_store, create_store, create_store_brand, product_store_summaries, product_trend_points, purchase_facts, store_product_summaries
+from app.store_service import confirm_receipt_store, create_store, create_store_brand, product_store_summaries, product_trend_points, purchase_facts, store_monthly_trend_points, store_overview_summaries, store_product_summaries
 from app.watch_service import (
     FREQUENCY_HOURS, REASON_LABELS, accept_recommendations, add_watch, bulk_enable_watches,
     generate_watch_recommendations, get_watch, ignore_recommendation, list_watch_groups,
@@ -1046,17 +1048,31 @@ def locations_page(request: Request, db: Session = Depends(get_db)):
     })
 
 
+@app.get("/purchase-analytics", response_class=HTMLResponse)
+def purchase_analytics_page(
+    request: Request, range_key: str = Query("30d", alias="range"),
+    start_date: date | None = Query(None), end_date: date | None = Query(None),
+    bucket: str | None = Query(None), db: Session = Depends(get_db),
+):
+    period = resolve_date_range(range_key, start_date, end_date)
+    context = analytics_dashboard(db, period, selected_bucket=bucket)
+    context["range_options"] = (
+        ("30d", "最近30天"), ("90d", "最近90天"), ("month", "本月"),
+        ("last_month", "上月"), ("year", "今年"), ("custom", "自定义日期"),
+    )
+    return templates.TemplateResponse(request, "purchase_analytics.html", context)
+
+
 @app.get("/stores", response_class=HTMLResponse)
 def stores_page(request: Request, db: Session = Depends(get_db)):
     brands = list(db.scalars(select(StoreBrand).order_by(StoreBrand.name_cn, StoreBrand.name_ja, StoreBrand.id)))
     stores = list(db.scalars(select(Store).options(selectinload(Store.brand)).order_by(Store.is_active.desc(), Store.name_cn, Store.name_ja, Store.id)))
+    summaries = store_overview_summaries(db)
     rows = []
     for store in stores:
-        _, facts = store_product_summaries(db, store.id)
+        summary = summaries.get(store.id, {"purchase_count": 0, "quantity": 0, "latest_date": None})
         rows.append({
-            "store": store, "purchase_count": len({fact.batch.id for fact in facts}),
-            "quantity": sum(fact.item.quantity for fact in facts),
-            "latest_date": max((fact.batch.purchased_at for fact in facts if fact.batch.purchased_at), default=None),
+            "store": store, **summary,
         })
     return templates.TemplateResponse(request, "stores.html", {
         "brands": brands, "rows": rows, "error": request.query_params.get("error"),
@@ -1103,6 +1119,7 @@ def store_detail(store_id: int, request: Request, db: Session = Depends(get_db))
         "purchase_count": len({fact.batch.id for fact in facts}),
         "quantity": sum(fact.item.quantity for fact in facts),
         "total_amount": sum(fact.item.actual_line_amount or 0 for fact in facts),
+        "product_count": len({fact.item.product_id for fact in facts}),
         "latest_date": max((fact.batch.purchased_at for fact in facts if fact.batch.purchased_at), default=None),
     }
     receipt_rows, seen = [], set()
@@ -1112,6 +1129,7 @@ def store_detail(store_id: int, request: Request, db: Session = Depends(get_db))
             seen.add(fact.receipt.id)
     return templates.TemplateResponse(request, "store_detail.html", {
         "store": store, "products": products, "facts": facts, "receipt_rows": receipt_rows, "stats": stats,
+        "monthly_trend": store_monthly_trend_points(facts),
     })
 
 
@@ -1564,13 +1582,18 @@ def product_detail(product_id: int, request: Request, db: Session = Depends(get_
         for item, _, _, _ in rows:
             amount = item.line_total if item.line_total is not None else (item.unit_price * item.quantity - item.discount_amount if item.unit_price is not None else None)
             if amount is not None:
-                legacy_prices.append(amount / item.quantity)
+                legacy_prices.append(Decimal(amount) / item.quantity)
     stats = {
         "count": len({fact.batch.id for fact in facts}) if facts else len(rows),
         "quantity": sum(fact.item.quantity for fact in facts) if facts else sum(item.quantity for item, _, _, _ in rows),
         "latest_price": latest_fact.reference_unit_price if latest_fact else (legacy_prices[0] if legacy_prices else None),
+        "latest_date": latest_fact.batch.purchased_at if latest_fact else (rows[0][1].purchased_at if rows else None),
         "minimum_price": min(prices) if prices else (min(legacy_prices) if legacy_prices else None),
         "maximum_price": max(prices) if prices else (max(legacy_prices) if legacy_prices else None),
+        "average_price": (
+            Decimal(sum(fact.item.actual_line_amount for fact in facts if fact.item.actual_line_amount is not None))
+            / sum(fact.item.quantity for fact in facts if fact.item.actual_line_amount is not None)
+        ).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP) if any(fact.item.actual_line_amount is not None for fact in facts) else None,
     }
     purchase_details = list(db.scalars(
         select(PurchaseBatchItem)
@@ -1584,10 +1607,37 @@ def product_detail(product_id: int, request: Request, db: Session = Depends(get_
         .order_by(PurchaseBatchItem.id.desc())
     ))
     inventory = latest_inventory_for_product(db, product_id)
+    online_prices = list(db.scalars(
+        select(ProductWatchSnapshot).where(
+            ProductWatchSnapshot.product_id == product_id,
+            ProductWatchSnapshot.status == "success",
+            ProductWatchSnapshot.total_price.is_not(None),
+        ).order_by(ProductWatchSnapshot.checked_at.desc(), ProductWatchSnapshot.id.desc()).limit(180)
+    ))
+    combined = [
+        {"kind": "purchase", "date": fact.batch.purchased_at or fact.batch.confirmed_at,
+         "price": fact.reference_unit_price, "fact": fact, "snapshot": None}
+        for fact in facts if fact.reference_unit_price is not None
+    ] + [
+        {"kind": "online", "date": snapshot.checked_at, "price": Decimal(snapshot.total_price),
+         "fact": None, "snapshot": snapshot}
+        for snapshot in online_prices
+    ]
+    combined.sort(key=lambda point: (point["date"], point["kind"]))
+    if combined:
+        low = min(point["price"] for point in combined)
+        span = max(Decimal(1), max(point["price"] for point in combined) - low)
+        for index, point in enumerate(combined):
+            point["x"] = 30 if len(combined) == 1 else 30 + index * 540 / (len(combined) - 1)
+            point["y"] = 185 - float((point["price"] - low) * 145 / span)
     return templates.TemplateResponse(request, "product_detail.html", {
         "product": product, "rows": rows, "stats": stats, "purchase_details": purchase_details,
         "store_summaries": product_store_summaries(db, product_id),
         "trend_points": product_trend_points(facts), "purchase_facts": facts,
+        "combined_price_points": combined,
+        "purchase_price_points": [point for point in combined if point["kind"] == "purchase"],
+        "online_price_points": [point for point in combined if point["kind"] == "online"],
+        "current_online_price": online_prices[0] if online_prices else None,
         "watch": get_watch(db, product_id),
         "inventory": inventory,
         "purchase_assistance": purchase_assistance(db, product, inventory=inventory),
