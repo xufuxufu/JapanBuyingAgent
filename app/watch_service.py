@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session, selectinload
@@ -195,6 +195,8 @@ def update_watch(
     config.frequency_tier = frequency_tier
     config.monitor_restock = monitor_restock
     refresh_recommended_target(session, config)
+    if config.enabled:
+        config.next_check_at = datetime.now(timezone.utc) + timedelta(hours=FREQUENCY_HOURS[frequency_tier])
     session.commit()
     session.refresh(config)
     return config
@@ -209,6 +211,8 @@ def set_watch_enabled(session: Session, product_id: int, enabled: bool) -> Produ
         raise ValueError("没有有效目标价，不能启用监控")
     config.enabled = enabled
     config.pause_reason = None if enabled else "user_paused"
+    if enabled:
+        config.next_check_at = datetime.now(timezone.utc)
     session.commit()
     session.refresh(config)
     return config
@@ -331,6 +335,7 @@ def bulk_enable_watches(session: Session, product_ids: set[int]) -> list[Product
         if config.effective_target_price is not None:
             config.enabled = True
             config.pause_reason = None
+            config.next_check_at = datetime.now(timezone.utc)
             enabled.append(config)
     session.commit()
     return enabled

@@ -15,7 +15,9 @@
     <span><strong>{{ row.recommended_target_price if row.recommended_target_price is not none else '—' }}</strong>推荐目标价</span>
     <span><strong>{{ row.config.user_target_price if row.config and row.config.user_target_price is not none else '—' }}</strong>用户目标价</span>
     <span><strong>{{ row.config.effective_target_price if row.config and row.config.effective_target_price is not none else '—' }}</strong>生效目标价</span>
+    {% if row.config %}<span><strong>{{ row.config.current_lowest_price if row.config.current_lowest_price is not none else '—' }}</strong>当前监控最低价</span><span><strong>{{ row.config.historical_online_lowest_price if row.config.historical_online_lowest_price is not none else '—' }}</strong>历史在线最低价</span><span><strong>{{ row.config.last_check_status or '未检查' }}</strong>最近监控状态</span>{% endif %}
   </div>
+  {% if row.config %}<p class="muted">最近检查：{{ row.config.last_check_at|tokyo_datetime if row.config.last_check_at else '尚未检查' }} · 下次检查：{{ row.config.next_check_at|tokyo_datetime if row.config.next_check_at else '等待调度' }}</p>{% endif %}
   <p><strong>推荐原因：</strong>{{ reason_labels.get(row.recommendation.reason, '—') if row.recommendation else '—' }}</p>
   <div class="button-row"><a class="button secondary compact" href="/products/{{ row.product.id }}">采购与门店</a><a class="button secondary compact" href="/price-check{% if row.product.jan %}?jan={{ row.product.jan }}{% endif %}">在线查价历史</a>{% if row.enrichment_task_id %}<a class="button secondary compact" href="/product-enrichment/{{ row.enrichment_task_id }}">丰富化来源</a>{% endif %}</div>
   {% if row.config %}
@@ -25,7 +27,7 @@
     <label class="checkbox"><input type="checkbox" name="monitor_restock" {% if row.config.monitor_restock %}checked{% endif %}>监控重新上架</label>
     <button type="submit" class="secondary">保存配置</button>
   </form>
-  <div class="button-row">{% if row.config.enabled %}<form method="post" action="/watched-products/{{ row.product.id }}/pause"><button type="submit" class="secondary">暂停</button></form>{% else %}<form method="post" action="/watched-products/{{ row.product.id }}/enable"><button type="submit">启用</button></form>{% endif %}</div>
+  <div class="button-row">{% if row.config.enabled %}<form method="post" action="/watched-products/{{ row.product.id }}/check-now"><button type="submit">立即检查</button></form><form method="post" action="/watched-products/{{ row.product.id }}/pause"><button type="submit" class="secondary">暂停</button></form>{% else %}<form method="post" action="/watched-products/{{ row.product.id }}/enable"><button type="submit">启用</button></form>{% endif %}</div>
   {% else %}
   <div class="button-row"><form method="post" action="/watched-products/recommendations/{{ row.recommendation.id }}/accept"><button type="submit">接受推荐</button></form><form method="post" action="/watched-products/recommendations/{{ row.recommendation.id }}/ignore"><button type="submit" class="secondary">忽略</button></form></div>
   {% endif %}

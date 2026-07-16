@@ -130,13 +130,17 @@ def _latest_purchase_price(session: Session, product: Product | None) -> int | N
     return latest if latest is not None else product.purchase_price
 
 
-def _history(session: Session, run: PriceSearchRun, lookup: PriceLookupInput, cache_hit: bool) -> PriceLookupHistory:
+def _history(
+    session: Session, run: PriceSearchRun, lookup: PriceLookupInput, cache_hit: bool,
+    lookup_source: str,
+) -> PriceLookupHistory:
     item = PriceLookupHistory(
         search_run_id=run.id,
         product_id=run.product_id,
         jan=lookup.jan,
         current_store_price=lookup.current_store_price,
         cache_hit=cache_hit,
+        lookup_source=lookup_source,
     )
     session.add(item)
     session.commit()
@@ -179,13 +183,15 @@ def query_prices(
     providers: list[PriceProvider] | None = None,
     *,
     now: datetime | None = None,
+    lookup_source: str = "manual",
+    provider_timeout_seconds: float = PROVIDER_TIMEOUT_SECONDS,
 ) -> PriceLookupView:
     now = now or datetime.now(timezone.utc)
     product = session.scalar(select(Product).where(Product.jan == lookup.jan))
     if not lookup.force_refresh:
         cached = _cached_run(session, lookup.jan, now)
         if cached is not None:
-            history = _history(session, cached, lookup, True)
+            history = _history(session, cached, lookup, True, lookup_source)
             if product is None:
                 _trigger_enrichment_for_lookup(session, lookup.jan, history.id)
             return build_lookup_view(session, history.id)
@@ -205,7 +211,7 @@ def query_prices(
         marketplace = _marketplace(session, provider)
         started_at = datetime.now(timezone.utc)
         try:
-            response = provider.search(lookup.jan, PROVIDER_TIMEOUT_SECONDS)
+            response = provider.search(lookup.jan, provider_timeout_seconds)
             if response.status == "success" and not response.offers:
                 response = ProviderResponse("empty", message="Provider 返回空结果")
         except (httpx.TimeoutException, TimeoutError):
@@ -257,7 +263,7 @@ def query_prices(
     run.completed_at = datetime.now(timezone.utc)
     run.provider_summary_json = json.dumps(summary, ensure_ascii=False)
     session.commit()
-    history = _history(session, run, lookup, False)
+    history = _history(session, run, lookup, False, lookup_source)
     if product is None:
         _trigger_enrichment_for_lookup(session, lookup.jan, history.id)
     return build_lookup_view(session, history.id)

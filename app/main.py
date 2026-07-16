@@ -17,7 +17,7 @@ from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.orm import Session, selectinload
 
 from app.config import PREVIEW_DIR, PRODUCT_IMAGE_DIR, PROJECT_ROOT, ensure_data_directories
-from app.db import get_db
+from app.db import SessionLocal, get_db
 from app.models import ImportJob, ImportRow, Product, ProductAlias, ProductWatchConfig, PurchaseBatch, PurchaseBatchItem, QinsiPurchaseExportJob, Receipt, ReceiptBatch, ReceiptImage, ReceiptItem, Store, StoreBrand, ZipPackageItem, ZipPackageJob
 from app.product_matching import bind_product, create_product_from_item, match_batch, match_date, match_receipt, normalize_alias
 from app.product_identity import create_product_record, format_product_display_name, normalize_product_name, update_product_identifiers
@@ -27,6 +27,12 @@ from app.product_enrichment import (
     list_review_tasks, process_enrichment_task, safe_trigger_receipt_items,
 )
 from app.location_service import get_default_physical_location, initialize_default_locations, list_locations
+from app.monitor_scheduler import scheduler_running, start_monitor_scheduler, stop_monitor_scheduler
+from app.monitor_service import (
+    NOTIFICATION_TYPE_LABELS, archive_read_notifications, bulk_mark_notifications_read,
+    list_notifications, mark_notification_read, monitor_dashboard, run_due_monitor_cycle,
+    run_single_monitor_cycle, unread_notification_count,
+)
 from app.purchase_service import get_purchase_batch, list_purchase_batches
 from app.qinsi_export import (
     confirm_qinsi_export, generate_purchase_batch_exports, get_qinsi_export_job,
@@ -88,6 +94,27 @@ templates.env.filters["tokyo_datetime"] = tokyo_datetime
 app.mount("/static", StaticFiles(directory=str(PROJECT_ROOT / "app" / "static")), name="static")
 app.mount("/media/preview", StaticFiles(directory=str(PREVIEW_DIR)), name="preview")
 PROMPT_PATH = PROJECT_ROOT / "docs" / "GPT_RECEIPT_PROMPT.md"
+
+
+def _nav_unread_count() -> int:
+    try:
+        with SessionLocal() as session:
+            return unread_notification_count(session)
+    except Exception:
+        return 0
+
+
+templates.env.globals["nav_unread_count"] = _nav_unread_count
+
+
+@app.on_event("startup")
+async def start_price_monitor() -> None:
+    start_monitor_scheduler()
+
+
+@app.on_event("shutdown")
+async def stop_price_monitor() -> None:
+    await stop_monitor_scheduler()
 
 
 @app.middleware("http")
@@ -1192,6 +1219,56 @@ def api_purchase_batches(db: Session = Depends(get_db)):
     return list_purchase_batches(db)
 
 
+@app.get("/notifications", response_class=HTMLResponse)
+def notifications_page(
+    request: Request, include_archived: bool = Query(False), db: Session = Depends(get_db),
+):
+    return templates.TemplateResponse(request, "notifications.html", {
+        "notifications": list_notifications(db, include_archived=include_archived),
+        "include_archived": include_archived,
+        "notification_type_labels": NOTIFICATION_TYPE_LABELS,
+        "message": request.query_params.get("message"),
+    })
+
+
+@app.post("/notifications/{notification_id}/read")
+def notification_read(notification_id: int, db: Session = Depends(get_db)):
+    try:
+        mark_notification_read(db, notification_id)
+    except LookupError as exc:
+        raise HTTPException(404, str(exc)) from exc
+    return RedirectResponse("/notifications", status_code=303)
+
+
+@app.post("/notifications/batch-read")
+async def notifications_batch_read(request: Request, db: Session = Depends(get_db)):
+    form = await request.form()
+    ids = {int(value) for value in form.getlist("notification_ids") if str(value).isdigit()}
+    count = bulk_mark_notifications_read(db, ids)
+    return RedirectResponse(f"/notifications?message={quote(f'已标记{count}条通知为已读')}", status_code=303)
+
+
+@app.post("/notifications/archive-read")
+def notifications_archive_read(db: Session = Depends(get_db)):
+    count = archive_read_notifications(db)
+    return RedirectResponse(f"/notifications?message={quote(f'已归档{count}条已读通知')}", status_code=303)
+
+
+@app.get("/monitor-status", response_class=HTMLResponse)
+def monitor_status_page(request: Request, db: Session = Depends(get_db)):
+    return templates.TemplateResponse(request, "monitor_status.html", {
+        "dashboard": monitor_dashboard(db),
+        "scheduler_running": scheduler_running(),
+        "message": request.query_params.get("message"),
+    })
+
+
+@app.post("/monitor/run-once")
+def monitor_run_once(background_tasks: BackgroundTasks):
+    background_tasks.add_task(run_due_monitor_cycle)
+    return RedirectResponse(f"/monitor-status?message={quote('已提交一轮到期监控任务')}", status_code=303)
+
+
 def _return_path(value: str, fallback: str = "/watched-products") -> str:
     return value if value.startswith("/") and not value.startswith("//") else fallback
 
@@ -1245,6 +1322,19 @@ def watched_products_update(
         db.rollback()
         return RedirectResponse(f"{_return_path(return_to)}?error={quote(str(exc))}", status_code=303)
     return RedirectResponse(_return_path(return_to), status_code=303)
+
+
+@app.post("/watched-products/{product_id}/check-now")
+def watched_product_check_now(
+    product_id: int, background_tasks: BackgroundTasks, db: Session = Depends(get_db),
+):
+    config = get_watch(db, product_id)
+    if config is None:
+        return RedirectResponse(f"/watched-products?error={quote('关注配置不存在')}", status_code=303)
+    if not config.enabled or config.effective_target_price is None or not config.product.jan:
+        return RedirectResponse(f"/watched-products?error={quote('只有已启用且目标价和JAN有效的关注可立即检查')}", status_code=303)
+    background_tasks.add_task(run_single_monitor_cycle, product_id)
+    return RedirectResponse(f"/watched-products?message={quote('已提交立即检查任务')}", status_code=303)
 
 
 @app.post("/watched-products/{product_id}/enable")

@@ -256,6 +256,8 @@ class Product(Base):
     price_search_runs: Mapped[list[PriceSearchRun]] = relationship(back_populates="product")
     watch_config: Mapped[ProductWatchConfig | None] = relationship(back_populates="product", uselist=False)
     watch_recommendations: Mapped[list[ProductWatchRecommendation]] = relationship(back_populates="product")
+    watch_snapshots: Mapped[list[ProductWatchSnapshot]] = relationship(back_populates="product")
+    watch_notifications: Mapped[list[ProductWatchNotification]] = relationship(back_populates="product")
 
 
 class ProductAlias(Base):
@@ -777,6 +779,7 @@ class PriceLookupHistory(Base):
     jan: Mapped[str] = mapped_column(String(32), nullable=False, index=True)
     current_store_price: Mapped[int | None] = mapped_column(Integer)
     cache_hit: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    lookup_source: Mapped[str] = mapped_column(String(20), default="manual", nullable=False, index=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False, index=True)
     search_run: Mapped[PriceSearchRun] = relationship(back_populates="lookup_histories")
     product: Mapped[Product | None] = relationship()
@@ -795,6 +798,7 @@ class ProductWatchConfig(Base):
         ),
         Index("uq_product_watch_configs_product", "product_id", unique=True),
         Index("ix_product_watch_configs_enabled", "enabled"),
+        Index("ix_product_watch_configs_due", "enabled", "next_check_at"),
     )
     id: Mapped[int] = mapped_column(primary_key=True)
     product_id: Mapped[int] = mapped_column(ForeignKey("products.id", ondelete="CASCADE"), nullable=False)
@@ -811,7 +815,20 @@ class ProductWatchConfig(Base):
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow, nullable=False)
     last_target_reached_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     pause_reason: Mapped[str | None] = mapped_column(String(100))
+    last_check_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    next_check_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    current_lowest_price: Mapped[int | None] = mapped_column(Integer)
+    previous_lowest_price: Mapped[int | None] = mapped_column(Integer)
+    historical_online_lowest_price: Mapped[int | None] = mapped_column(Integer)
+    last_in_stock: Mapped[bool | None] = mapped_column(Boolean)
+    last_provider_codes: Mapped[str | None] = mapped_column(String(255))
+    last_check_status: Mapped[str | None] = mapped_column(String(30))
+    consecutive_failures: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    last_error_summary: Mapped[str | None] = mapped_column(Text)
+    failure_notification_sent: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     product: Mapped[Product] = relationship(back_populates="watch_config")
+    snapshots: Mapped[list[ProductWatchSnapshot]] = relationship(back_populates="watch_config")
+    notifications: Mapped[list[ProductWatchNotification]] = relationship(back_populates="watch_config")
 
 
 class ProductWatchRecommendation(Base):
@@ -839,6 +856,81 @@ class ProductWatchRecommendation(Base):
     ignored: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     accepted: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     product: Mapped[Product] = relationship(back_populates="watch_recommendations")
+
+
+class ProductWatchSnapshot(Base):
+    __tablename__ = "product_watch_snapshots"
+    __table_args__ = (
+        CheckConstraint("status IN ('success','failed')", name="ck_product_watch_snapshots_status"),
+        Index("ix_product_watch_snapshots_product_time", "product_id", "checked_at"),
+        Index("ix_product_watch_snapshots_config_time", "watch_config_id", "checked_at"),
+    )
+    id: Mapped[int] = mapped_column(primary_key=True)
+    watch_config_id: Mapped[int] = mapped_column(ForeignKey("product_watch_configs.id", ondelete="CASCADE"), nullable=False)
+    product_id: Mapped[int] = mapped_column(ForeignKey("products.id", ondelete="CASCADE"), nullable=False)
+    price_lookup_history_id: Mapped[int | None] = mapped_column(ForeignKey("price_lookup_histories.id", ondelete="SET NULL"), index=True)
+    checked_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
+    lowest_item_price: Mapped[int | None] = mapped_column(Integer)
+    shipping_price: Mapped[int | None] = mapped_column(Integer)
+    total_price: Mapped[int | None] = mapped_column(Integer)
+    marketplace: Mapped[str | None] = mapped_column(String(100))
+    seller: Mapped[str | None] = mapped_column(String(255))
+    url: Mapped[str | None] = mapped_column(Text)
+    is_in_stock: Mapped[bool | None] = mapped_column(Boolean)
+    result_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    status: Mapped[str] = mapped_column(String(20), nullable=False)
+    provider_codes: Mapped[str | None] = mapped_column(String(255))
+    error_summary: Mapped[str | None] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
+    watch_config: Mapped[ProductWatchConfig] = relationship(back_populates="snapshots")
+    product: Mapped[Product] = relationship(back_populates="watch_snapshots")
+    lookup_history: Mapped[PriceLookupHistory | None] = relationship()
+    notifications: Mapped[list[ProductWatchNotification]] = relationship(back_populates="snapshot")
+
+
+class ProductWatchNotification(Base):
+    __tablename__ = "product_watch_notifications"
+    __table_args__ = (
+        CheckConstraint(
+            "event_type IN ('target_reached','new_historical_low','restocked','monitor_failed')",
+            name="ck_product_watch_notifications_type",
+        ),
+        Index("uq_product_watch_notifications_dedupe", "dedupe_key", unique=True),
+        Index("ix_product_watch_notifications_unread", "is_read", "archived_at", "triggered_at"),
+        Index("ix_product_watch_notifications_product", "product_id"),
+    )
+    id: Mapped[int] = mapped_column(primary_key=True)
+    watch_config_id: Mapped[int] = mapped_column(ForeignKey("product_watch_configs.id", ondelete="CASCADE"), nullable=False)
+    product_id: Mapped[int] = mapped_column(ForeignKey("products.id", ondelete="CASCADE"), nullable=False)
+    snapshot_id: Mapped[int | None] = mapped_column(ForeignKey("product_watch_snapshots.id", ondelete="SET NULL"), index=True)
+    event_type: Mapped[str] = mapped_column(String(30), nullable=False)
+    target_price: Mapped[int | None] = mapped_column(Integer)
+    current_price: Mapped[int | None] = mapped_column(Integer)
+    marketplace: Mapped[str | None] = mapped_column(String(100))
+    seller: Mapped[str | None] = mapped_column(String(255))
+    url: Mapped[str | None] = mapped_column(Text)
+    dedupe_key: Mapped[str] = mapped_column(String(255), nullable=False)
+    triggered_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
+    data_updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    is_read: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    read_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    archived_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
+    watch_config: Mapped[ProductWatchConfig] = relationship(back_populates="notifications")
+    product: Mapped[Product] = relationship(back_populates="watch_notifications")
+    snapshot: Mapped[ProductWatchSnapshot | None] = relationship(back_populates="notifications")
+
+
+class MonitorSchedulerState(Base):
+    __tablename__ = "monitor_scheduler_states"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    code: Mapped[str] = mapped_column(String(30), unique=True, nullable=False, default="default")
+    last_scan_started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    last_scan_completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    last_success_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    last_failure_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    last_error_summary: Mapped[str | None] = mapped_column(Text)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow, nullable=False)
 
 
 class PriceWatchRule(Base):

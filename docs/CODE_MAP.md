@@ -12,5 +12,6 @@
 | 在线查价 | `app/price_providers.py`、`app/price_service.py`、`app/main.py` | Provider 接口、JAN 查询、可信结果过滤、缓存、历史、店内价比较 | `tests/test_price_lookup.py` |
 | 商品丰富化 | `app/product_enrichment.py`、`app/models.py`、`app/main.py` | 新 JAN 任务、Provider 候选、DeepSeek 名称、主图本地化、异常待办与安全建品 | `tests/test_product_enrichment.py` |
 | 关注商品 | `app/watch_service.py`、`app/models.py`、`app/main.py` | 关注配置、推荐目标价、推荐生成、批量接受与启用 | `tests/test_product_watches.py` |
+| 价格监控与通知 | `app/monitor_service.py`、`app/monitor_scheduler.py`、`app/main.py`、`app/models.py` | 到期扫描、可信价格快照、达价事件、网页通知与失败退避 | `tests/test_price_monitoring.py` |
 | Migration | `migrations/env.py`、`migrations/versions/`、`alembic.ini` | SQLite schema 演进、历史升级兼容、当前 head 管理 | `tests/test_migrations.py` |
 | 页面入口 | `app/main.py`、`app/templates/`、`app/static/app.css` | FastAPI 路由、Jinja 页面、移动端样式；入口含小票、商品、采购、秦丝、查价 | 各业务测试中的页面 200 与表单流程测试 |
