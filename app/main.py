@@ -1258,7 +1258,9 @@ def create_store_page(
 
 
 @app.get("/stores/{store_id}", response_class=HTMLResponse)
-def store_detail(store_id: int, request: Request, db: Session = Depends(get_db)):
+def store_detail(
+    store_id: int, request: Request, month: str | None = Query(None), db: Session = Depends(get_db),
+):
     store = db.scalar(select(Store).where(Store.id == store_id).options(selectinload(Store.brand), selectinload(Store.aliases)))
     if store is None:
         raise HTTPException(404, "门店不存在")
@@ -1275,9 +1277,14 @@ def store_detail(store_id: int, request: Request, db: Session = Depends(get_db))
         if fact.receipt.id not in seen:
             receipt_rows.append(fact)
             seen.add(fact.receipt.id)
+    month_facts = [
+        fact for fact in facts
+        if month and (fact.batch.purchased_at or fact.batch.confirmed_at).strftime("%Y-%m") == month
+    ]
     return templates.TemplateResponse(request, "store_detail.html", {
         "store": store, "products": products, "facts": facts, "receipt_rows": receipt_rows, "stats": stats,
         "monthly_trend": store_monthly_trend_points(facts),
+        "selected_month": month, "month_facts": month_facts,
         "recent_restock_lists": recent_lists_for_store(db, store_id),
         "restock_status_labels": LIST_STATUS_LABELS,
     })

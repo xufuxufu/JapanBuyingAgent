@@ -10,7 +10,7 @@ from sqlalchemy.orm import Session, selectinload
 from app.models import (
     Product, ProductWatchConfig, PurchaseBatch, PurchaseBatchItem,
     QinsiInventorySnapshot, QinsiInventorySnapshotLine,
-    QinsiPurchaseExportLine, QinsiPurchaseExportLineSource, Receipt, Store,
+    QinsiPurchaseExportLine, QinsiPurchaseExportLineSource, Receipt, RestockList, Store,
 )
 from app.qinsi_inventory import inventory_settings
 
@@ -193,9 +193,81 @@ def _product_ranking(session: Session, period: DateRange) -> list[dict]:
     return result
 
 
-def inventory_distribution(session: Session, *, now: datetime | None = None) -> tuple[QinsiInventorySnapshot | None, list[dict]]:
+def _latest_inventory_states(
+    session: Session, product_ids: set[int], *, now: datetime,
+) -> tuple[QinsiInventorySnapshot | None, dict[int, dict]]:
+    latest_snapshot = session.scalar(select(QinsiInventorySnapshot).where(
+        QinsiInventorySnapshot.status.in_({"completed", "completed_with_issues"})
+    ).order_by(func.coalesce(QinsiInventorySnapshot.data_at, QinsiInventorySnapshot.imported_at).desc(),
+               QinsiInventorySnapshot.id.desc()).limit(1))
+    if not product_ids:
+        return latest_snapshot, {}
+    snapshot_products = (
+        select(
+            QinsiInventorySnapshotLine.product_id.label("product_id"),
+            QinsiInventorySnapshotLine.snapshot_id.label("snapshot_id"),
+            func.coalesce(QinsiInventorySnapshot.data_at, QinsiInventorySnapshot.imported_at).label("data_at"),
+        )
+        .join(QinsiInventorySnapshot, QinsiInventorySnapshot.id == QinsiInventorySnapshotLine.snapshot_id)
+        .where(
+            QinsiInventorySnapshot.status.in_({"completed", "completed_with_issues"}),
+            QinsiInventorySnapshotLine.matching_status == "matched",
+            QinsiInventorySnapshotLine.warehouse_status == "matched",
+            QinsiInventorySnapshotLine.product_id.in_(product_ids),
+            QinsiInventorySnapshotLine.quantity.is_not(None),
+        )
+        .distinct().subquery()
+    )
+    ranked = select(
+        snapshot_products,
+        func.row_number().over(
+            partition_by=snapshot_products.c.product_id,
+            order_by=(snapshot_products.c.data_at.desc(), snapshot_products.c.snapshot_id.desc()),
+        ).label("rn"),
+    ).subquery()
+    latest = select(
+        ranked.c.product_id, ranked.c.snapshot_id, ranked.c.data_at,
+    ).where(ranked.c.rn == 1).subquery()
+    rows = session.execute(
+        select(
+            latest.c.product_id, latest.c.snapshot_id, latest.c.data_at,
+            func.sum(QinsiInventorySnapshotLine.quantity),
+        )
+        .join(
+            QinsiInventorySnapshotLine,
+            (QinsiInventorySnapshotLine.product_id == latest.c.product_id)
+            & (QinsiInventorySnapshotLine.snapshot_id == latest.c.snapshot_id),
+        )
+        .where(
+            QinsiInventorySnapshotLine.matching_status == "matched",
+            QinsiInventorySnapshotLine.warehouse_status == "matched",
+            QinsiInventorySnapshotLine.quantity.is_not(None),
+        )
+        .group_by(latest.c.product_id, latest.c.snapshot_id, latest.c.data_at)
+    ).all()
+    settings = inventory_settings()
+    states = {}
+    for product_id, snapshot_id, data_at, quantity in rows:
+        aware_at = data_at if data_at.tzinfo else data_at.replace(tzinfo=timezone.utc)
+        if now - aware_at > timedelta(hours=settings.stale_hours):
+            status = "snapshot_stale"
+        elif quantity <= 0:
+            status = "out_of_stock"
+        else:
+            status = "stock_available"
+        states[product_id] = {
+            "snapshot_id": snapshot_id, "data_at": data_at, "quantity": int(quantity), "status": status,
+        }
+    return latest_snapshot, states
+
+
+def inventory_distribution(
+    session: Session, *, now: datetime | None = None,
+    products: list[Product] | None = None, inventory_states: dict[int, dict] | None = None,
+    inventory_snapshot: QinsiInventorySnapshot | None = None,
+) -> tuple[QinsiInventorySnapshot | None, list[dict]]:
     now = now or datetime.now(timezone.utc)
-    products = list(session.scalars(select(Product).where(Product.status == "active")))
+    products = products if products is not None else list(session.scalars(select(Product).where(Product.status == "active")))
     counts = {key: 0 for key in INVENTORY_LABELS}
     if not products:
         return None, [{"key": key, "label": label, "count": 0} for key, label in INVENTORY_LABELS.items()]
@@ -204,37 +276,22 @@ def inventory_distribution(session: Session, *, now: datetime | None = None) -> 
             PurchaseBatch.status != "cancelled", PurchaseBatchItem.quantity > 0, _pending_item_filter()
         ).distinct()
     ))
-    snapshot = session.scalar(select(QinsiInventorySnapshot).where(
-        QinsiInventorySnapshot.status.in_({"completed", "completed_with_issues"})
-    ).order_by(func.coalesce(QinsiInventorySnapshot.data_at, QinsiInventorySnapshot.imported_at).desc(),
-               QinsiInventorySnapshot.id.desc()).limit(1))
-    quantities = {}
-    if snapshot:
-        quantities = dict(session.execute(
-            select(QinsiInventorySnapshotLine.product_id, func.sum(QinsiInventorySnapshotLine.quantity))
-            .where(QinsiInventorySnapshotLine.snapshot_id == snapshot.id,
-                   QinsiInventorySnapshotLine.matching_status == "matched",
-                   QinsiInventorySnapshotLine.product_id.is_not(None),
-                   QinsiInventorySnapshotLine.quantity.is_not(None))
-            .group_by(QinsiInventorySnapshotLine.product_id)
-        ).all())
-    stale = False
-    if snapshot:
-        value = snapshot.data_at or snapshot.imported_at
-        if value.tzinfo is None:
-            value = value.replace(tzinfo=timezone.utc)
-        stale = now - value > timedelta(hours=inventory_settings().stale_hours)
+    if inventory_states is None:
+        snapshot, states = _latest_inventory_states(session, {product.id for product in products}, now=now)
+    else:
+        snapshot, states = inventory_snapshot, inventory_states
     default_threshold = inventory_settings().default_low_stock_threshold
     for product in products:
+        state = states.get(product.id)
         if product.id in pending_ids:
             key = "incoming_or_pending"
-        elif product.id not in quantities:
+        elif state is None:
             key = "no_snapshot"
-        elif stale:
+        elif state["status"] == "snapshot_stale":
             key = "snapshot_stale"
-        elif quantities[product.id] <= 0:
+        elif state["status"] == "out_of_stock":
             key = "out_of_stock"
-        elif quantities[product.id] < (product.low_stock_threshold or default_threshold):
+        elif state["quantity"] < (product.low_stock_threshold or default_threshold):
             key = "stock_low"
         else:
             key = "stock_available"
@@ -269,8 +326,40 @@ def analytics_dashboard(session: Session, period: DateRange, *, selected_bucket:
         ProductWatchConfig.effective_target_price.is_not(None),
         ProductWatchConfig.current_lowest_price <= ProductWatchConfig.effective_target_price,
     )) or 0
+    products = list(session.scalars(select(Product).where(Product.status == "active")))
+    now = datetime.now(timezone.utc)
+    inventory_snapshot, inventory_states = _latest_inventory_states(
+        session, {product.id for product in products}, now=now,
+    )
+    default_threshold = inventory_settings().default_low_stock_threshold
+    watches = list(session.scalars(
+        select(ProductWatchConfig).where(ProductWatchConfig.enabled.is_(True)).options(selectinload(ProductWatchConfig.product))
+    ))
+    candidate_rows = []
+    low_stock_watched = 0
+    for watch in watches:
+        state = inventory_states.get(watch.product_id)
+        low = bool(state and state["status"] != "snapshot_stale" and (
+            state["status"] == "out_of_stock"
+            or state["quantity"] < (watch.product.low_stock_threshold or default_threshold)
+        ))
+        reached = bool(
+            watch.current_lowest_price is not None and watch.effective_target_price is not None
+            and watch.current_lowest_price <= watch.effective_target_price
+        )
+        if low:
+            low_stock_watched += 1
+        if low or reached:
+            candidate_rows.append({
+                "product": watch.product, "watch": watch, "low_stock": low, "target_reached": reached,
+                "inventory": state,
+            })
+    candidate_rows.sort(key=lambda row: (not row["low_stock"], not row["target_reached"], row["product"].id))
     granularity, trends = _trend_rows(session, period)
-    snapshot, inventory_rows = inventory_distribution(session)
+    snapshot, inventory_rows = inventory_distribution(
+        session, now=now, products=products, inventory_states=inventory_states,
+        inventory_snapshot=inventory_snapshot,
+    )
     details = []
     if selected_bucket:
         bucket = _bucket_expression(granularity)
@@ -289,8 +378,14 @@ def analytics_dashboard(session: Session, period: DateRange, *, selected_bucket:
             "new_products": int(new_products), "store_count": int(store_count),
             "average_amount": (Decimal(amount) / purchase_count).quantize(Decimal("1"), rounding=ROUND_HALF_UP) if purchase_count else Decimal(0),
             "pending_quantity": int(pending_quantity), "target_reached": int(target_reached),
+            "low_stock_watched": low_stock_watched,
         },
         "stores": _store_ranking(session, period), "products": _product_ranking(session, period),
         "inventory_snapshot": snapshot, "inventory_rows": inventory_rows,
+        "restock_candidates": candidate_rows[:100],
+        "active_restock_lists": list(session.scalars(
+            select(RestockList).where(RestockList.status == "active")
+            .options(selectinload(RestockList.store)).order_by(RestockList.updated_at.desc()).limit(100)
+        )),
         "selected_bucket": selected_bucket, "detail_batches": details,
     }
