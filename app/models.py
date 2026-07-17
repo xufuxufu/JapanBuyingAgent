@@ -261,6 +261,7 @@ class Product(Base):
     watch_notifications: Mapped[list[ProductWatchNotification]] = relationship(back_populates="product")
     qinsi_inventory_lines: Mapped[list[QinsiInventorySnapshotLine]] = relationship(back_populates="product")
     qinsi_product_mappings: Mapped[list[QinsiProductMapping]] = relationship(back_populates="product")
+    restock_list_items: Mapped[list[RestockListItem]] = relationship(back_populates="product")
 
 
 class ProductAlias(Base):
@@ -317,6 +318,7 @@ class Store(Base):
     aliases: Mapped[list[StoreAlias]] = relationship(back_populates="store", cascade="all, delete-orphan")
     receipts: Mapped[list[Receipt]] = relationship(back_populates="store")
     purchase_batches: Mapped[list[PurchaseBatch]] = relationship(back_populates="store")
+    restock_lists: Mapped[list[RestockList]] = relationship(back_populates="store")
 
     @property
     def display_name(self) -> str:
@@ -411,6 +413,82 @@ class PurchaseBatchItem(Base):
     initial_location: Mapped[Location] = relationship(foreign_keys=[initial_location_id])
     qinsi_target_warehouse: Mapped[Location] = relationship(foreign_keys=[qinsi_target_warehouse_id])
     qinsi_export_lines: Mapped[list[QinsiPurchaseExportLine]] = relationship(back_populates="purchase_batch_item")
+    restock_list_items: Mapped[list[RestockListItem]] = relationship(back_populates="purchase_batch_item")
+
+
+class RestockList(Base):
+    __tablename__ = "restock_lists"
+    __table_args__ = (
+        CheckConstraint("status IN ('draft','active','completed','cancelled')", name="ck_restock_lists_status"),
+        CheckConstraint(
+            "source_type IN ('manual','store_history','watched_products','purchase_analysis')",
+            name="ck_restock_lists_source_type",
+        ),
+        Index("ix_restock_lists_store_status", "store_id", "status"),
+        Index("ix_restock_lists_status_created", "status", "created_at"),
+    )
+    id: Mapped[int] = mapped_column(primary_key=True)
+    name: Mapped[str] = mapped_column(String(255), nullable=False)
+    store_id: Mapped[int] = mapped_column(ForeignKey("stores.id", ondelete="RESTRICT"), nullable=False, index=True)
+    status: Mapped[str] = mapped_column(String(20), default="draft", nullable=False, index=True)
+    source_type: Mapped[str] = mapped_column(String(30), default="manual", nullable=False)
+    notes: Mapped[str | None] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False, index=True)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow, nullable=False)
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    store: Mapped[Store] = relationship(back_populates="restock_lists")
+    items: Mapped[list[RestockListItem]] = relationship(
+        back_populates="restock_list", cascade="all, delete-orphan", order_by="RestockListItem.sort_value",
+    )
+
+
+class RestockListItem(Base):
+    __tablename__ = "restock_list_items"
+    __table_args__ = (
+        UniqueConstraint("restock_list_id", "product_id", name="uq_restock_list_items_list_product"),
+        CheckConstraint(
+            "status IN ('to_check','found','not_found','purchased','skipped')",
+            name="ck_restock_list_items_status",
+        ),
+        CheckConstraint("planned_quantity IS NULL OR planned_quantity > 0", name="ck_restock_items_planned_quantity"),
+        CheckConstraint("actual_purchase_quantity IS NULL OR actual_purchase_quantity > 0", name="ck_restock_items_actual_quantity"),
+        CheckConstraint("actual_purchase_price IS NULL OR actual_purchase_price > 0", name="ck_restock_items_actual_price"),
+        Index("ix_restock_list_items_product_status", "product_id", "status"),
+        Index("ix_restock_list_items_list_sort", "restock_list_id", "sort_value"),
+    )
+    id: Mapped[int] = mapped_column(primary_key=True)
+    restock_list_id: Mapped[int] = mapped_column(ForeignKey("restock_lists.id", ondelete="CASCADE"), nullable=False, index=True)
+    product_id: Mapped[int] = mapped_column(ForeignKey("products.id", ondelete="RESTRICT"), nullable=False, index=True)
+    added_source: Mapped[str] = mapped_column(String(30), default="manual", nullable=False)
+    sort_value: Mapped[int] = mapped_column(Integer, default=1000, nullable=False)
+    planned_quantity: Mapped[int | None] = mapped_column(Integer)
+    target_purchase_price_snapshot: Mapped[int | None] = mapped_column(Integer)
+    latest_purchase_price_snapshot: Mapped[int | None] = mapped_column(Integer)
+    historical_lowest_purchase_price_snapshot: Mapped[int | None] = mapped_column(Integer)
+    latest_store_purchase_price_snapshot: Mapped[int | None] = mapped_column(Integer)
+    store_lowest_purchase_price_snapshot: Mapped[int | None] = mapped_column(Integer)
+    latest_store_purchase_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    qinsi_quantity_snapshot: Mapped[int | None] = mapped_column(Integer)
+    qinsi_snapshot_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    online_lowest_price_snapshot: Mapped[int | None] = mapped_column(Integer)
+    online_price_checked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    recommendation_reason: Mapped[str | None] = mapped_column(Text)
+    status: Mapped[str] = mapped_column(String(20), default="to_check", nullable=False, index=True)
+    notes: Mapped[str | None] = mapped_column(Text)
+    actual_purchase_quantity: Mapped[int | None] = mapped_column(Integer)
+    actual_purchase_price: Mapped[int | None] = mapped_column(Integer)
+    watch_config_id: Mapped[int | None] = mapped_column(ForeignKey("product_watch_configs.id", ondelete="SET NULL"), index=True)
+    online_snapshot_id: Mapped[int | None] = mapped_column(ForeignKey("product_watch_snapshots.id", ondelete="SET NULL"), index=True)
+    qinsi_snapshot_id: Mapped[int | None] = mapped_column(ForeignKey("qinsi_inventory_snapshots.id", ondelete="SET NULL"), index=True)
+    purchase_batch_item_id: Mapped[int | None] = mapped_column(ForeignKey("purchase_batch_items.id", ondelete="SET NULL"), index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow, nullable=False)
+    restock_list: Mapped[RestockList] = relationship(back_populates="items")
+    product: Mapped[Product] = relationship(back_populates="restock_list_items")
+    watch_config: Mapped[ProductWatchConfig | None] = relationship()
+    online_snapshot: Mapped[ProductWatchSnapshot | None] = relationship()
+    qinsi_snapshot: Mapped[QinsiInventorySnapshot | None] = relationship()
+    purchase_batch_item: Mapped[PurchaseBatchItem | None] = relationship(back_populates="restock_list_items")
 
 
 class QinsiPurchaseExportJob(Base):

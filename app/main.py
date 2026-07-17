@@ -19,7 +19,7 @@ from sqlalchemy.orm import Session, selectinload
 
 from app.config import PREVIEW_DIR, PRODUCT_IMAGE_DIR, PROJECT_ROOT, ensure_data_directories
 from app.db import SessionLocal, get_db
-from app.models import ImportJob, ImportRow, Product, ProductAlias, ProductWatchConfig, ProductWatchSnapshot, PurchaseBatch, PurchaseBatchItem, QinsiPurchaseExportJob, Receipt, ReceiptBatch, ReceiptImage, ReceiptItem, Store, StoreBrand, ZipPackageItem, ZipPackageJob
+from app.models import ImportJob, ImportRow, Product, ProductAlias, ProductWatchConfig, ProductWatchSnapshot, PurchaseBatch, PurchaseBatchItem, QinsiPurchaseExportJob, Receipt, ReceiptBatch, ReceiptImage, ReceiptItem, RestockList, RestockListItem, Store, StoreBrand, ZipPackageItem, ZipPackageJob
 from app.analytics_service import analytics_dashboard, resolve_date_range
 from app.product_matching import bind_product, create_product_from_item, match_batch, match_date, match_receipt, normalize_alias
 from app.product_identity import create_product_record, format_product_display_name, normalize_product_name, update_product_identifiers
@@ -51,6 +51,13 @@ from app.qinsi_inventory import (
 )
 from app.schemas import LocationOutput, PriceLookupInput, ProductCreateInput, ProductOutput, ProductUpdateInput, PurchaseBatchOutput, PurchaseConfirmationInput, QinsiExportConfirmationInput, ReceiptDraftInput, ReceiptItemDraftInput, StoreBrandCreateInput, StoreCreateInput
 from app.store_service import confirm_receipt_store, create_store, create_store_brand, product_store_summaries, product_trend_points, purchase_facts, store_monthly_trend_points, store_overview_summaries, store_product_summaries
+from app.restock_service import (
+    ITEM_STATUS_LABELS, LIST_STATUS_LABELS, SOURCE_LABELS, active_lists_for_product,
+    add_product_to_list, copy_restock_list, create_restock_list, get_restock_list,
+    link_purchase_item, list_restock_lists, list_statistics, lists_for_product,
+    recent_lists_for_store, restock_candidates, trace_rows, update_restock_item,
+    update_restock_list_status,
+)
 from app.watch_service import (
     FREQUENCY_HOURS, REASON_LABELS, accept_recommendations, add_watch, bulk_enable_watches,
     generate_watch_recommendations, get_watch, ignore_recommendation, list_watch_groups,
@@ -1063,6 +1070,147 @@ def purchase_analytics_page(
     return templates.TemplateResponse(request, "purchase_analytics.html", context)
 
 
+@app.get("/restock-lists", response_class=HTMLResponse)
+def restock_lists_page(
+    request: Request, store_id: int | None = Query(None), status_filter: str | None = Query(None, alias="status"),
+    db: Session = Depends(get_db),
+):
+    rows = list_restock_lists(db, store_id=store_id, status=status_filter)
+    stores = list(db.scalars(select(Store).where(Store.is_active.is_(True)).order_by(Store.name_cn, Store.name_ja, Store.id)))
+    return templates.TemplateResponse(request, "restock_lists.html", {
+        "rows": [(row, list_statistics(row)) for row in rows], "stores": stores,
+        "store_id": store_id, "status_filter": status_filter or "",
+        "list_status_labels": LIST_STATUS_LABELS, "source_labels": SOURCE_LABELS,
+    })
+
+
+@app.get("/restock-lists/new", response_class=HTMLResponse)
+def restock_list_new_page(
+    request: Request, store_id: int | None = Query(None), source: str = Query("store_history"),
+    product_id: list[int] | None = Query(None), db: Session = Depends(get_db),
+):
+    stores = list(db.scalars(select(Store).where(Store.is_active.is_(True)).order_by(Store.name_cn, Store.name_ja, Store.id)))
+    selected_store = db.get(Store, store_id) if store_id else None
+    candidates = restock_candidates(db, store_id) if selected_store else []
+    products = list(db.scalars(select(Product).where(Product.status == "active").order_by(Product.updated_at.desc()).limit(1000)))
+    return templates.TemplateResponse(request, "restock_list_new.html", {
+        "stores": stores, "selected_store": selected_store, "candidates": candidates,
+        "products": products, "selected_product_ids": set(product_id or []), "source": source,
+        "error": request.query_params.get("error"),
+    })
+
+
+@app.post("/restock-lists")
+async def restock_list_create(request: Request, db: Session = Depends(get_db)):
+    form = await request.form()
+    store_id = int(form.get("store_id") or 0)
+    product_ids = {
+        int(value) for value in [*form.getlist("product_ids"), *form.getlist("manual_product_ids")]
+        if str(value).isdigit()
+    }
+    try:
+        row = create_restock_list(
+            db, name=str(form.get("name") or ""), store_id=store_id, product_ids=product_ids,
+            source_type=str(form.get("source_type") or "manual"), notes=str(form.get("notes") or "") or None,
+            status=str(form.get("status") or "active"),
+        )
+    except (LookupError, ValueError, IntegrityError) as exc:
+        db.rollback()
+        return RedirectResponse(f"/restock-lists/new?store_id={store_id}&error={quote(str(exc))}", status_code=303)
+    return RedirectResponse(f"/restock-lists/{row.id}", status_code=303)
+
+
+@app.post("/restock-lists/from-watches")
+async def restock_list_from_watches(request: Request, db: Session = Depends(get_db)):
+    form = await request.form()
+    product_ids = {int(value) for value in form.getlist("restock_product_ids") if str(value).isdigit()}
+    try:
+        row = create_restock_list(
+            db, name=str(form.get("name") or ""), store_id=int(form.get("store_id") or 0),
+            product_ids=product_ids, source_type="watched_products", status="active",
+            notes=str(form.get("notes") or "") or None,
+        )
+    except (LookupError, ValueError, IntegrityError) as exc:
+        db.rollback()
+        return RedirectResponse(f"/watched-products?error={quote(str(exc))}", status_code=303)
+    return RedirectResponse(f"/restock-lists/{row.id}", status_code=303)
+
+
+@app.get("/restock-lists/{list_id}", response_class=HTMLResponse)
+def restock_list_detail_page(list_id: int, request: Request, db: Session = Depends(get_db)):
+    row = get_restock_list(db, list_id)
+    if row is None:
+        raise HTTPException(404, "补货清单不存在")
+    return templates.TemplateResponse(request, "restock_list_detail.html", {
+        "restock_list": row, "stats": list_statistics(row), "trace_rows": trace_rows(db, row),
+        "list_status_labels": LIST_STATUS_LABELS, "item_status_labels": ITEM_STATUS_LABELS,
+        "source_labels": SOURCE_LABELS, "readonly": row.status in {"completed", "cancelled"},
+        "products": list(db.scalars(select(Product).where(Product.status == "active").order_by(Product.updated_at.desc()).limit(1000))),
+        "error": request.query_params.get("error"),
+    })
+
+
+@app.post("/restock-lists/{list_id}/status")
+def restock_list_status_update(list_id: int, status: str = Form(...), db: Session = Depends(get_db)):
+    try:
+        update_restock_list_status(db, list_id, status)
+    except (LookupError, ValueError) as exc:
+        db.rollback()
+        return RedirectResponse(f"/restock-lists/{list_id}?error={quote(str(exc))}", status_code=303)
+    return RedirectResponse(f"/restock-lists/{list_id}", status_code=303)
+
+
+@app.post("/restock-lists/{list_id}/copy")
+def restock_list_copy(list_id: int, db: Session = Depends(get_db)):
+    try:
+        row = copy_restock_list(db, list_id)
+    except (LookupError, ValueError) as exc:
+        db.rollback()
+        raise HTTPException(422, str(exc)) from exc
+    return RedirectResponse(f"/restock-lists/{row.id}", status_code=303)
+
+
+@app.post("/restock-lists/{list_id}/items")
+def restock_list_add_item(list_id: int, product_id: int = Form(...), db: Session = Depends(get_db)):
+    try:
+        add_product_to_list(db, list_id, product_id)
+    except (LookupError, ValueError, IntegrityError) as exc:
+        db.rollback()
+        return RedirectResponse(f"/restock-lists/{list_id}?error={quote(str(exc))}", status_code=303)
+    return RedirectResponse(f"/restock-lists/{list_id}", status_code=303)
+
+
+@app.post("/restock-list-items/{item_id}")
+def restock_list_item_update(
+    item_id: int, status: str = Form(...), planned_quantity: str = Form(""),
+    actual_purchase_quantity: str = Form(""), actual_purchase_price: str = Form(""),
+    notes: str = Form(""), db: Session = Depends(get_db),
+):
+    item = db.get(RestockListItem, item_id)
+    list_id = item.restock_list_id if item else 0
+    try:
+        update_restock_item(
+            db, item_id, status=status, planned_quantity=planned_quantity,
+            actual_quantity=actual_purchase_quantity, actual_price=actual_purchase_price, notes=notes,
+        )
+    except (LookupError, ValueError) as exc:
+        db.rollback()
+        return RedirectResponse(f"/restock-lists/{list_id}?error={quote(str(exc))}", status_code=303)
+    return RedirectResponse(f"/restock-lists/{list_id}#restock-item-{item_id}", status_code=303)
+
+
+@app.post("/restock-list-items/{item_id}/link-purchase")
+def restock_list_item_link_purchase(item_id: int, purchase_batch_item_id: int = Form(...), db: Session = Depends(get_db)):
+    item = db.get(RestockListItem, item_id)
+    list_id = item.restock_list_id if item else 0
+    try:
+        link_purchase_item(db, item_id, purchase_batch_item_id)
+    except (LookupError, ValueError) as exc:
+        db.rollback()
+        return RedirectResponse(f"/restock-lists/{list_id}?error={quote(str(exc))}", status_code=303)
+    return RedirectResponse(f"/restock-lists/{list_id}#restock-item-{item_id}", status_code=303)
+
+
 @app.get("/stores", response_class=HTMLResponse)
 def stores_page(request: Request, db: Session = Depends(get_db)):
     brands = list(db.scalars(select(StoreBrand).order_by(StoreBrand.name_cn, StoreBrand.name_ja, StoreBrand.id)))
@@ -1130,6 +1278,8 @@ def store_detail(store_id: int, request: Request, db: Session = Depends(get_db))
     return templates.TemplateResponse(request, "store_detail.html", {
         "store": store, "products": products, "facts": facts, "receipt_rows": receipt_rows, "stats": stats,
         "monthly_trend": store_monthly_trend_points(facts),
+        "recent_restock_lists": recent_lists_for_store(db, store_id),
+        "restock_status_labels": LIST_STATUS_LABELS,
     })
 
 
@@ -1447,6 +1597,7 @@ def watched_products_page(request: Request, db: Session = Depends(get_db)):
     ))
     return templates.TemplateResponse(request, "watched_products.html", {
         "groups": list_watch_groups(db), "products": products,
+        "stores": list(db.scalars(select(Store).where(Store.is_active.is_(True)).order_by(Store.name_cn, Store.name_ja, Store.id))),
         "frequency_hours": FREQUENCY_HOURS, "reason_labels": REASON_LABELS,
         "message": request.query_params.get("message"), "error": request.query_params.get("error"),
     })
@@ -1639,6 +1790,10 @@ def product_detail(product_id: int, request: Request, db: Session = Depends(get_
         "online_price_points": [point for point in combined if point["kind"] == "online"],
         "current_online_price": online_prices[0] if online_prices else None,
         "watch": get_watch(db, product_id),
+        "active_restock_lists": active_lists_for_product(db, product_id),
+        "product_restock_lists": lists_for_product(db, product_id),
+        "restock_status_labels": LIST_STATUS_LABELS,
+        "restock_item_status_labels": ITEM_STATUS_LABELS,
         "inventory": inventory,
         "purchase_assistance": purchase_assistance(db, product, inventory=inventory),
         "inventory_status_labels": INVENTORY_STATUS_LABELS,

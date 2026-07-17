@@ -7,7 +7,7 @@
 - 开发端口：`8020`
 - 定位：日本实体采购辅助系统；秦丝负责销售与实时可售库存。
 - 数据：项目独立 SQLite；Excel 仅用于导入、导出和字段参考。
-- 当前 migration head：`20260716_0017`
+- 当前 migration head：`20260717_0018`
 
 ## 核心业务流程
 
@@ -52,6 +52,7 @@
 - 关注商品：`app/watch_service.py`
 - 价格监控与通知：`app/monitor_service.py`、`app/monitor_scheduler.py`
 - 秦丝库存快照与采购辅助：`app/qinsi_inventory.py`
+- 补货清单：`app/restock_service.py`
 - 页面与样式：`app/templates/`、`app/static/app.css`
 - migration：`migrations/versions/`
 - 测试：`tests/`

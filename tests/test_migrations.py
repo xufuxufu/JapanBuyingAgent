@@ -20,8 +20,9 @@ def test_migration_from_empty_and_repeat_safe(tmp_path, monkeypatch):
     assert {"receipt_batches", "receipt_images", "receipts", "receipt_items", "ai_recognition_runs", "products", "product_aliases", "store_brands", "stores", "store_aliases", "locations", "purchase_batches", "purchase_batch_items", "inventory_transactions", "import_jobs", "import_rows", "product_match_logs", "qinsi_export_jobs", "qinsi_export_lines", "qinsi_export_line_sources", "qinsi_purchase_export_jobs", "qinsi_purchase_export_lines", "qinsi_purchase_export_line_sources", "marketplaces", "price_search_runs", "product_offers", "price_provider_attempts", "price_lookup_histories", "price_watch_rules", "price_alerts", "product_watch_configs", "product_watch_recommendations", "duplicate_detection_logs", "zip_package_jobs", "zip_package_items"} <= tables
     assert {"product_watch_snapshots", "product_watch_notifications", "monitor_scheduler_states"} <= tables
     assert {"qinsi_inventory_snapshots", "qinsi_inventory_snapshot_lines", "qinsi_product_mappings"} <= tables
+    assert {"restock_lists", "restock_list_items"} <= tables
     assert "low_stock_threshold" in product_columns
-    assert revision == ("20260716_0017",)
+    assert revision == ("20260717_0018",)
 
 
 def test_upgrade_from_phase1_preserves_old_data(tmp_path, monkeypatch):
@@ -47,7 +48,7 @@ def test_upgrade_from_phase1_preserves_old_data(tmp_path, monkeypatch):
     assert image[:3] == ("old.jpg", "original", 0)
     assert image[3] == "RCPT-20260714-0900-0001_P01.jpg"
     assert receipt == ("旧店", None)
-    assert revision == ("20260716_0017",)
+    assert revision == ("20260717_0018",)
 
 
 def test_sqlite_foreign_keys_enabled(db_session):
@@ -70,7 +71,7 @@ def test_upgrade_from_current_0004_preserves_rows_and_defers_visual_hashes(tmp_p
         revision = connection.execute("SELECT version_num FROM alembic_version").fetchone()
     assert row == ("old.jpg", "abc123", None, None, "none")
     assert status == ("ready", "not_packaged", "not_matched", "not_exported")
-    assert revision == ("20260716_0017",)
+    assert revision == ("20260717_0018",)
 
 
 def test_upgrade_from_0007_backfills_stable_unique_internal_skus(tmp_path, monkeypatch):
@@ -99,7 +100,7 @@ def test_upgrade_from_0007_backfills_stable_unique_internal_skus(tmp_path, monke
     assert rows[0][:3] == (1, None, "Q-OLD-1") and rows[1][:3] == (2, "00123457", "Q-OLD-2")
     assert rows[0][3] == "NJ-20260715-000001" and rows[1][3] == "NJ-20260715-000002"
     assert internal_sku_column[3] == 1
-    assert revision == ("20260716_0017",)
+    assert revision == ("20260717_0018",)
 
 
 def test_upgrade_from_0008_creates_and_seeds_location_master(tmp_path, monkeypatch):
@@ -115,7 +116,7 @@ def test_upgrade_from_0008_creates_and_seeds_location_master(tmp_path, monkeypat
         revision = connection.execute("SELECT version_num FROM alembic_version").fetchone()
     assert len(rows) == 9
     assert rows[0] == ("QW-2025-QIANYU", "2025千羽", "qinsi_warehouse", 1)
-    assert revision == ("20260716_0017",)
+    assert revision == ("20260717_0018",)
 
 
 def test_upgrade_from_0009_creates_purchase_batch_tables(tmp_path, monkeypatch):
@@ -130,7 +131,7 @@ def test_upgrade_from_0009_creates_purchase_batch_tables(tmp_path, monkeypatch):
         tables = {row[0] for row in connection.execute("SELECT name FROM sqlite_master WHERE type='table'")}
         revision = connection.execute("SELECT version_num FROM alembic_version").fetchone()
     assert {"purchase_batches", "purchase_batch_items"} <= tables
-    assert revision == ("20260716_0017",)
+    assert revision == ("20260717_0018",)
 
 
 def test_upgrade_from_0010_creates_qinsi_purchase_export_loop_tables(tmp_path, monkeypatch):
@@ -143,7 +144,7 @@ def test_upgrade_from_0010_creates_qinsi_purchase_export_loop_tables(tmp_path, m
         tables = {row[0] for row in connection.execute("SELECT name FROM sqlite_master WHERE type='table'")}
         revision = connection.execute("SELECT version_num FROM alembic_version").fetchone()
     assert {"qinsi_purchase_export_jobs", "qinsi_purchase_export_lines", "qinsi_purchase_export_line_sources"} <= tables
-    assert revision == ("20260716_0017",)
+    assert revision == ("20260717_0018",)
 
 
 def test_upgrade_from_0011_creates_price_lookup_p0_tables(tmp_path, monkeypatch):
@@ -158,7 +159,7 @@ def test_upgrade_from_0011_creates_price_lookup_p0_tables(tmp_path, monkeypatch)
         product_columns = {row[1] for row in connection.execute("PRAGMA table_info(products)")}
     assert {"price_provider_attempts", "price_lookup_histories"} <= tables
     assert {"display_name", "main_image_path", "main_image_source_url", "product_data_confirmed"} <= product_columns
-    assert revision == ("20260716_0017",)
+    assert revision == ("20260717_0018",)
 
 
 def test_upgrade_from_0012_preserves_receipt_product_and_purchase_text(tmp_path, monkeypatch):
@@ -189,4 +190,4 @@ def test_upgrade_from_0012_preserves_receipt_product_and_purchase_text(tmp_path,
     assert receipt == (1, "旧门店原始文字", None)
     assert product == (1, "NJ-20260716-000001", "旧商品")
     assert purchase == (1, "旧采购门店文字", None)
-    assert revision == ("20260716_0017",)
+    assert revision == ("20260717_0018",)

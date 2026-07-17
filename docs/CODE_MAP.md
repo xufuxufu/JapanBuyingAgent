@@ -14,5 +14,6 @@
 | 关注商品 | `app/watch_service.py`、`app/models.py`、`app/main.py` | 关注配置、推荐目标价、推荐生成、批量接受与启用 | `tests/test_product_watches.py` |
 | 价格监控与通知 | `app/monitor_service.py`、`app/monitor_scheduler.py`、`app/main.py`、`app/models.py` | 到期扫描、可信价格快照、达价事件、网页通知与失败退避 | `tests/test_price_monitoring.py` |
 | 秦丝库存快照 | `app/qinsi_inventory.py`、`app/qinsi_import.py`、`app/main.py`、`app/models.py` | 不可覆盖库存快照、精确商品/仓库匹配、最近快照聚合与采购辅助判断 | `tests/test_qinsi_inventory_snapshots.py` |
+| 补货清单 | `app/restock_service.py`、`app/main.py`、`app/models.py` | 按具体门店生成/维护现场补货清单、候选排序、临时购买结果、正式小票关联回溯 | `tests/test_restock_lists.py` |
 | Migration | `migrations/env.py`、`migrations/versions/`、`alembic.ini` | SQLite schema 演进、历史升级兼容、当前 head 管理 | `tests/test_migrations.py` |
 | 页面入口 | `app/main.py`、`app/templates/`、`app/static/app.css` | FastAPI 路由、Jinja 页面、移动端样式；入口含小票、商品、采购、秦丝、查价 | 各业务测试中的页面 200 与表单流程测试 |
