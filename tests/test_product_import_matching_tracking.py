@@ -4,17 +4,16 @@ from datetime import datetime, timezone
 import io
 from pathlib import Path
 import re
-from xml.sax.saxutils import escape
-import zipfile
 
+from openpyxl import Workbook
 from sqlalchemy import func, select
 
 from app.models import (
-    ImportRow, Product, ProductAlias, ProductMatchLog, Receipt, ReceiptBatch,
+    Product, ProductAlias, ProductMatchLog, QinsiGoodsImportRow, Receipt, ReceiptBatch,
     ReceiptImage, ReceiptItem, ZipPackageItem, ZipPackageJob,
 )
 from app.product_matching import bind_product, match_item, validate_jan
-from app.qinsi_import import confirm_import, create_import_preview
+from app.qinsi_goods_import import FIXED_HEADERS, confirm_import, create_import_preview
 from app.services import confirm_receipt, repair_confirmed_review_statuses
 
 
@@ -23,26 +22,27 @@ QINSI_BOOK = ROOT / "reference" / "qinsi" / "goodsImportTemplate已有商品模�
 
 
 def make_xlsx(rows: list[list[str]]) -> bytes:
-    headers = ["名称（必填）", "货号（必填且唯一）", "条码", "状态"]
-    all_rows = [headers, *rows]
-    xml_rows = []
-    for row_no, values in enumerate(all_rows, 1):
-        cells = []
-        for column, value in enumerate(values):
-            ref = f"{chr(65 + column)}{row_no}"
-            cells.append(f'<c r="{ref}" t="inlineStr"><is><t>{escape(value)}</t></is></c>')
-        xml_rows.append(f'<row r="{row_no}">{"".join(cells)}</row>')
-    files = {
-        "[Content_Types].xml": '<?xml version="1.0"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/><Override PartName="/xl/worksheets/sheet1.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/></Types>',
-        "_rels/.rels": '<?xml version="1.0"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/></Relationships>',
-        "xl/workbook.xml": '<?xml version="1.0"?><workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><sheets><sheet name="商品导入" sheetId="1" r:id="rId1"/></sheets></workbook>',
-        "xl/_rels/workbook.xml.rels": '<?xml version="1.0"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/></Relationships>',
-        "xl/worksheets/sheet1.xml": f'<?xml version="1.0"?><worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData>{"".join(xml_rows)}</sheetData></worksheet>',
-    }
+    workbook = Workbook()
+    goods = workbook.active
+    goods.title = "商品导入"
+    goods.append([*FIXED_HEADERS, "新日本仓库"])
+    indexes = {header: index for index, header in enumerate(FIXED_HEADERS)}
+    for name, code, barcode, status in rows:
+        values = [None] * 30
+        values[indexes["名称（必填）"]] = name
+        values[indexes["货号（必填且唯一）"]] = code
+        values[indexes["条码"]] = barcode or None
+        values[indexes["状态"]] = status
+        goods.append(values)
+    config = workbook.create_sheet("配置")
+    config.cell(4, 1, "新日本仓库")
+    config.cell(5, 1, "启用")
+    config.cell(5, 2, "停用")
+    config.cell(7, 1, "启用")
+    config.cell(7, 2, "停用")
     output = io.BytesIO()
-    with zipfile.ZipFile(output, "w", zipfile.ZIP_DEFLATED) as archive:
-        for name, value in files.items():
-            archive.writestr(name, value.encode("utf-8"))
+    workbook.save(output)
+    workbook.close()
     return output.getvalue()
 
 
@@ -106,17 +106,20 @@ def test_historical_confirmed_pending_repair_is_idempotent(db_session):
     assert receipts[0].items[1].review_status == "ignored"
 
 
-def test_existing_qinsi_workbook_preview_mapping_warning_and_import(db_session):
+def test_existing_qinsi_workbook_preview_mapping_and_import(db_session):
     job = create_import_preview(db_session, QINSI_BOOK.name, QINSI_BOOK.read_bytes())
-    assert (job.total_rows, job.skipped_count, job.warning_count, job.conflict_count, job.error_count) == (2000, 1998, 2, 0, 0)
-    rows = list(db_session.scalars(select(ImportRow).where(ImportRow.import_job_id == job.id, ImportRow.status == "warning").order_by(ImportRow.row_no)))
-    assert len(rows) == 2 and all("184" in (row.warnings_json or "") for row in rows)
+    assert (job.total_rows, job.skipped_count, job.warning_count, job.conflict_count, job.error_count) == (2000, 1998, 0, 0, 0)
+    rows = list(db_session.scalars(select(QinsiGoodsImportRow).where(
+        QinsiGoodsImportRow.import_batch_id == job.id,
+        QinsiGoodsImportRow.validation_status == "new",
+    ).order_by(QinsiGoodsImportRow.excel_row_number)))
+    assert len(rows) == 2
     confirm_import(db_session, job)
     products = list(db_session.scalars(select(Product).order_by(Product.id)))
     assert job.success_count == 2
     assert products[0].jan == "4570110290418" and products[0].qinsi_product_code == "1234321"
     assert products[1].jan == "4901872962495" and products[1].qinsi_product_code == "4901872097296"
-    assert products[0].specification == "184"  # quarantined as warned; never guessed away
+    assert products[0].specification is None
 
 
 def test_repeat_qinsi_import_is_incremental_and_does_not_blank_fields(db_session):
@@ -127,9 +130,8 @@ def test_repeat_qinsi_import_is_incremental_and_does_not_blank_fields(db_session
     product.name_ja = "既有非空字段"
     db_session.commit()
     second = create_import_preview(db_session, QINSI_BOOK.name, content)
-    confirm_import(db_session, second)
     assert db_session.scalar(select(func.count()).select_from(Product)) == 2
-    assert second.success_count == 0 and second.skipped_count == 2000
+    assert second.id == first.id and second.status == "completed"
     assert product.name_ja == "既有非空字段"
 
 

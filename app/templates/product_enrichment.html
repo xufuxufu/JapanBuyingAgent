@@ -1,17 +1,62 @@
 {% extends "base.html" %}
-{% block title %}新品资料异常{% endblock %}
+{% block title %}后台待补全 · Japan Buying Agent{% endblock %}
 {% block content %}
-<div class="section-head"><div><h1>新品资料异常</h1><p class="muted">仅显示待确认、待处理和失败任务；正常完成无需逐个确认。</p></div></div>
+<div class="section-head"><div><h1>后台待补全</h1><p class="muted">吊牌上传、OCR、平台和 AI 失败都不会阻塞现场扫码；正式商品只在人工确认后创建或关联。</p></div></div>
+
+<section class="card">
+  <div class="section-head">
+    <div><h2>小票批次 / 小票记录</h2><p class="muted">从小票侧查看识别批次、审核状态和商品行；已匹配商品行可进入商品详情。</p></div>
+    <div class="button-row"><a class="button secondary compact" href="/receipts">小票记录</a><a class="button secondary compact" href="/receipts/upload">小票识别</a></div>
+  </div>
+</section>
+
+<form class="card enrichment-filters" method="get" action="/product-enrichment">
+  <label>缺失字段<select name="missing"><option value="">全部</option><option value="name" {% if filters.missing == 'name' %}selected{% endif %}>缺名称</option><option value="price" {% if filters.missing == 'price' %}selected{% endif %}>缺价格</option><option value="image" {% if filters.missing == 'image' %}selected{% endif %}>缺图片</option></select></label>
+  <label class="inline-check"><input type="checkbox" name="low_confidence" value="true" {% if filters.low_confidence %}checked{% endif %}>低可信度</label>
+  <label class="inline-check"><input type="checkbox" name="failed" value="true" {% if filters.failed %}checked{% endif %}>失败任务</label>
+  <button type="submit" class="secondary">筛选</button>
+</form>
+
+<form method="post" action="/field-purchase/items/batch">
+  <section class="card">
+    <div class="section-head"><h2>现场采购草稿</h2><span class="badge">{{ field_items|length }} 条</span></div>
+    <div class="bulk-edit-grid">
+      <label>品牌<input name="brand" maxlength="128"></label>
+      <label>分类<input name="category" maxlength="128"></label>
+      <label>单位<input name="unit_name" maxlength="128"></label>
+      <label>审核人<input name="actor" maxlength="128" value="批量审核"></label>
+    </div>
+    <div class="button-row"><button name="action" value="edit" type="submit">批量编辑</button><button name="action" value="retry" type="submit" class="secondary">批量重试</button></div>
+    <div class="table-wrap"><table><thead><tr><th>选择</th><th>吊牌</th><th>JAN / 临时ID</th><th>批次 / 门店</th><th>数量 / 价格</th><th>状态</th><th></th></tr></thead><tbody>
+      {% for item in field_items %}{% set evidence = item.tag_evidence|first %}
+      <tr>
+        <td><input type="checkbox" name="item_ids" value="{{ item.id }}" aria-label="选择草稿 {{ item.id }}"></td>
+        <td>{% if evidence %}<a href="/field-purchase/tag-evidence/{{ evidence.id }}" target="_blank"><img class="product-thumb" src="/field-purchase/tag-evidence/{{ evidence.id }}" alt="吊牌原图"></a>{% else %}—{% endif %}</td>
+        <td><strong>{{ item.jan or item.temporary_id }}</strong><small>{{ item.name_cn or item.name_ja or '名称待补' }}</small></td>
+        <td>{{ item.batch.batch_no }}<small>{{ item.batch.store.display_name if item.batch.store else '未填写门店' }} · {{ item.captured_by }}</small></td>
+        <td>×{{ item.quantity }}<small>{{ ('¥' ~ item.unit_price) if item.unit_price is not none else '价格待补' }}</small></td>
+        <td><span class="badge state-{{ item.status }}">{{ item.status }}</span>{% if item.enrichment_task %}<small>可信度 {{ '%.0f'|format((item.enrichment_task.confidence or 0) * 100) }}%</small>{% endif %}</td>
+        <td><a class="button secondary compact" href="/field-purchase/items/{{ item.id }}/review">审核</a></td>
+      </tr>
+      {% else %}<tr><td colspan="7">暂无现场草稿待处理。</td></tr>{% endfor %}
+    </tbody></table></div>
+  </section>
+</form>
+
 <form method="post" action="/product-enrichment/batch-accept">
-<section class="card table-wrap"><table><thead><tr><th>选择</th><th>主图</th><th>JAN / 名称</th><th>来源</th><th>警告 / 失败环节</th><th>创建时间</th><th></th></tr></thead><tbody>
-{% for task in tasks %}{% set candidate = (task.candidates|selectattr('selected')|list|first) %}<tr>
-<td>{% if (task.confidence or 0) >= 0.85 %}<input type="checkbox" name="task_ids" value="{{ task.id }}" aria-label="选择 {{ task.jan }}">{% else %}—{% endif %}</td>
-<td>{% if candidate and candidate.image_url %}<img class="product-thumb" src="{{ candidate.image_url }}" alt="{{ candidate.name_ja or task.jan }}" loading="lazy">{% else %}—{% endif %}</td>
-<td><strong>{{ task.jan }}</strong><br>{{ candidate.name_ja if candidate else '日文名待补' }}<br><small>置信度 {{ '%.0f'|format((task.confidence or 0) * 100) }}%</small></td>
-<td>{{ candidate.platform if candidate else task.trigger_source }}</td>
-<td><span class="badge state-{{ task.status }}">{{ task.status }}</span><br>{{ task.last_error or ((task.warnings_json or '[]')[:120]) }}</td>
-<td>{{ task.created_at|tokyo_datetime }}</td><td><a class="button secondary compact" href="/product-enrichment/{{ task.id }}">处理</a></td>
-</tr>{% else %}<tr><td colspan="7">暂无商品资料异常。</td></tr>{% endfor %}
-</tbody></table></section>
-{% if tasks %}<button type="submit">批量接受所选高置信候选</button>{% endif %}</form>
+  <section class="card">
+    <div class="section-head"><h2>平台 / AI 候选异常</h2><span class="badge">{{ tasks|length }} 条</span></div>
+    <div class="table-wrap"><table><thead><tr><th>选择</th><th>主图</th><th>JAN / 名称</th><th>来源</th><th>警告 / 失败环节</th><th>创建时间</th><th></th></tr></thead><tbody>
+    {% for task in tasks %}{% set candidate = (task.candidates|selectattr('selected')|list|first) %}<tr>
+      <td>{% if (task.confidence or 0) >= 0.85 %}<input type="checkbox" name="task_ids" value="{{ task.id }}" aria-label="选择 {{ task.jan }}">{% else %}—{% endif %}</td>
+      <td>{% if candidate and candidate.image_url %}<img class="product-thumb" src="{{ candidate.image_url }}" alt="{{ candidate.name_ja or task.jan }}" loading="lazy">{% else %}—{% endif %}</td>
+      <td><strong>{{ task.jan }}</strong><br>{{ candidate.name_ja if candidate else '日文名待补' }}<br><small>置信度 {{ '%.0f'|format((task.confidence or 0) * 100) }}%</small></td>
+      <td>{{ candidate.platform if candidate else task.trigger_source }}</td>
+      <td><span class="badge state-{{ task.status }}">{{ task.status }}</span><br>{{ task.last_error or ((task.warnings_json or '[]')[:120]) }}</td>
+      <td>{{ task.created_at|tokyo_datetime }}</td><td><a class="button secondary compact" href="/product-enrichment/{{ task.id }}">处理</a></td>
+    </tr>{% else %}<tr><td colspan="7">暂无平台或 AI 候选异常。</td></tr>{% endfor %}
+    </tbody></table></div>
+  </section>
+  {% if tasks %}<button type="submit">批量接受所选高置信候选</button>{% endif %}
+</form>
 {% endblock %}

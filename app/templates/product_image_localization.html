@@ -1,0 +1,68 @@
+{% extends "base.html" %}
+{% block title %}商品图片本地化 · Japan Buying Agent{% endblock %}
+{% block content %}
+<div class="section-head"><div><h1>商品图片本地化</h1><p class="muted">独立 Worker 持续分批下载，不调用 AI、不逐张分析图片；关闭浏览器不会中断。</p></div><div class="button-row"><form class="js-image-job-action" method="post" action="/product-image-localization/queue"><button type="submit">启动 / 继续处理</button></form><form class="js-image-job-action" method="post" action="/product-image-localization/retry-failed"><button type="submit" class="secondary">重试失败</button></form></div></div>
+{% if message %}<div class="success message">{{ message }}</div>{% endif %}
+<div id="imageLocalizationFeedback" class="message" role="status" hidden></div>
+<section class="card"><h2>进度</h2><div class="summary-grid"><span><strong id="imageTotal">{{ dashboard.total }}</strong>总数</span><span><strong id="imageCompleted">{{ dashboard.completed }}</strong>完成</span><span><strong id="imageFailed">{{ dashboard.failed }}</strong>失败</span><span><strong id="imagePending">{{ dashboard.pending }}</strong>待处理</span><span><strong id="imageDisk">{{ dashboard.disk_megabytes }} MB</strong>磁盘占用</span><span><strong id="imageSpeed">{{ dashboard.average_per_minute }}/分钟</strong>平均速度</span></div><progress id="imageLocalizationProgress" max="{{ dashboard.total or 1 }}" value="{{ dashboard.completed }}"></progress></section>
+<section class="card table-wrap"><h2>最近任务</h2><table><thead><tr><th>ID</th><th>状态</th><th>尝试</th><th>错误</th><th>更新时间</th></tr></thead><tbody>{% for job in dashboard.recent_jobs %}<tr><td>{{ job.id }}</td><td>{{ job.status }}</td><td>{{ job.attempts }}/{{ job.max_attempts }}</td><td>{{ job.last_error or '—' }}</td><td>{{ job.updated_at|tokyo_datetime(true) }}</td></tr>{% else %}<tr><td colspan="5">暂无图片任务。</td></tr>{% endfor %}</tbody></table></section>
+<script>
+(() => {
+  const forms = [...document.querySelectorAll(".js-image-job-action")];
+  const feedback = document.querySelector("#imageLocalizationFeedback");
+  const progress = document.querySelector("#imageLocalizationProgress");
+  let polling = false;
+  function render(data) {
+    document.querySelector("#imageTotal").textContent = data.total;
+    document.querySelector("#imageCompleted").textContent = data.completed;
+    document.querySelector("#imageFailed").textContent = data.failed;
+    document.querySelector("#imagePending").textContent = data.pending;
+    document.querySelector("#imageDisk").textContent = `${data.disk_megabytes} MB`;
+    document.querySelector("#imageSpeed").textContent = `${data.average_per_minute}/分钟`;
+    progress.max = Math.max(1, data.total);
+    progress.value = data.completed;
+  }
+  async function poll() {
+    if (polling) return;
+    polling = true;
+    try {
+      const response = await fetch("/api/product-image-localization/status", {headers: {"Accept": "application/json"}});
+      if (!response.ok) throw new Error(`HTTP ${response.status}`);
+      const data = await response.json();
+      render(data);
+      feedback.textContent = data.pending ? `处理中：完成 ${data.completed}，失败 ${data.failed}，待处理 ${data.pending}` : `当前可运行队列已处理完：完成 ${data.completed}，失败 ${data.failed}`;
+      feedback.className = data.failed ? "warning message" : "success message";
+      feedback.hidden = false;
+    } catch (_) {
+      feedback.textContent = "进度读取失败，将自动重试。";
+      feedback.className = "warning message";
+      feedback.hidden = false;
+    } finally {
+      polling = false;
+    }
+  }
+  forms.forEach((form) => form.addEventListener("submit", async (event) => {
+    event.preventDefault();
+    const button = form.querySelector("button");
+    button.disabled = true;
+    feedback.hidden = false;
+    feedback.className = "message";
+    feedback.textContent = "请求已发送，正在启动 Worker…";
+    try {
+      const response = await fetch(form.action, {method: "POST", headers: {"Accept": "application/json"}});
+      if (!response.ok) throw new Error(`HTTP ${response.status}`);
+      const data = await response.json();
+      feedback.textContent = `已接受，本次加入 ${data.queued} 个任务。`;
+      render(data.dashboard);
+    } catch (_) {
+      feedback.textContent = "启动失败，请重试。";
+      feedback.className = "error message";
+    } finally {
+      button.disabled = false;
+      poll();
+    }
+  }));
+  window.setInterval(poll, 2000);
+})();
+</script>
+{% endblock %}

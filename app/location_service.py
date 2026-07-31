@@ -10,6 +10,7 @@ from app.models import Location
 
 DEFAULT_PHYSICAL_LOCATION_CODE = "LOC-JP-HOME"
 QINSI_NO_BARCODE_LOCATION_CODE = "QW-NO-BARCODE"
+QINSI_NEW_JAPAN_WAREHOUSE_CODE = "QW-NEW-JAPAN"
 
 
 @dataclass(frozen=True, slots=True)
@@ -25,7 +26,7 @@ DEFAULT_LOCATIONS = (
     DefaultLocation("QW-2025-QIANYU", "2025千羽", "qinsi_warehouse", True, 10),
     DefaultLocation("QW-2025-ZHAOCAIMAO", "2025招财猫", "qinsi_warehouse", True, 20),
     DefaultLocation("QW-NO-BARCODE", "无条码商品", "qinsi_warehouse", True, 30),
-    DefaultLocation("QW-NEW-JAPAN", "新日本仓库", "qinsi_warehouse", True, 40),
+    DefaultLocation(QINSI_NEW_JAPAN_WAREHOUSE_CODE, "新日本仓库", "qinsi_warehouse", True, 40),
     DefaultLocation(DEFAULT_PHYSICAL_LOCATION_CODE, "日本家里库存", "local_physical", True, 50),
     DefaultLocation("TRANSIT-INTERNATIONAL", "国际快递在途", "transit", False, 100),
     DefaultLocation("TRANSIT-HAND-CARRY", "人工带货在途", "transit", False, 110),

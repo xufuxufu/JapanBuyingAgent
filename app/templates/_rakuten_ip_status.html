@@ -1,0 +1,44 @@
+{% if rakuten_ip_status %}
+<section class="card rakuten-ip-status state-{{ rakuten_ip_status.status }}">
+  {% if rakuten_ip_status.status == 'matched' %}
+  <p class="success message">Rakuten出口IP正常：{{ rakuten_ip_status.configured_ip }}</p>
+  {% elif rakuten_ip_status.status == 'mismatched' %}
+  <p class="warning message">Rakuten许可IP与当前公网IP不一致，Rakuten查询可能失败。</p>
+  <div class="summary-grid">
+    <span><strong>{{ rakuten_ip_status.configured_ip or '—' }}</strong>乐天后台登记IP</span>
+    <span><strong data-current-public-ip>{{ rakuten_ip_status.current_public_ip or '—' }}</strong>当前公网IP</span>
+  </div>
+  <p class="muted">请在Rakuten后台 Allowed IP 中登记当前公网IP。</p>
+  {% elif rakuten_ip_status.status == 'check_failed' %}
+  <p class="warning message">Rakuten出口IP检测失败，不影响页面使用。</p>
+  <div class="summary-grid">
+    <span><strong>{{ rakuten_ip_status.configured_ip or '—' }}</strong>乐天后台登记IP</span>
+    <span><strong>—</strong>当前公网IP</span>
+  </div>
+  {% else %}
+  <p class="warning message">Rakuten许可IP未配置。</p>
+  {% endif %}
+  <div class="button-row">
+    <form method="post" action="/rakuten-ip/recheck">
+      <input type="hidden" name="return_to" value="{{ request.url.path }}">
+      <button class="secondary compact" type="submit">重新检测</button>
+    </form>
+    {% if rakuten_ip_status.current_public_ip %}
+    <button class="secondary compact" type="button" data-copy-current-public-ip="{{ rakuten_ip_status.current_public_ip }}">复制当前IP</button>
+    {% endif %}
+  </div>
+  {% if rakuten_ip_status.checked_at %}<small class="muted">检测时间：{{ rakuten_ip_status.checked_at|tokyo_datetime(true) }}</small>{% endif %}
+</section>
+<script>
+document.querySelectorAll('[data-copy-current-public-ip]').forEach(button => {
+  button.addEventListener('click', async () => {
+    try {
+      await navigator.clipboard.writeText(button.dataset.copyCurrentPublicIp || '');
+      button.textContent = '已复制';
+    } catch (_) {
+      button.textContent = '请手动复制';
+    }
+  });
+});
+</script>
+{% endif %}

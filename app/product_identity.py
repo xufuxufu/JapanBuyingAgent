@@ -12,7 +12,8 @@ TOKYO = timezone(timedelta(hours=9), "Asia/Tokyo")
 INTERNAL_SKU_PATTERN = re.compile(r"^NJ-(\d{8})-(\d{6})$")
 PRODUCT_NAME_MAX_LENGTH = 128
 DISPLAY_NAME_MAX_LENGTH = 128
-PRODUCT_NAME_SEPARATOR = "｜"
+PRODUCT_NAME_SEPARATOR = "|"
+PRODUCT_NAME_WHITESPACE_PATTERN = re.compile(r"[\s\u3000]+")
 IMPORTANT_TOKEN_PATTERN = re.compile(
     r"(?i)(?:\d+(?:\.\d+)?\s*(?:ml|l|g|kg|mm|cm|個|本|枚|袋|包|錠|粒)|"
     r"[A-Z]{1,8}[-_/]?[A-Z0-9]{1,16}|黑|白|红|蓝|绿|粉|紫|金|银|黒|赤|青|緑|桃|白)"
@@ -27,16 +28,23 @@ def normalize_optional_identifier(value: str | None) -> str | None:
     return value or None
 
 
+def normalize_product_name_whitespace(value: str | None) -> str | None:
+    if value is None:
+        return None
+    normalized = PRODUCT_NAME_WHITESPACE_PATTERN.sub(" ", value).strip()
+    return normalized or None
+
+
 def normalize_product_name(value: str | None, label: str) -> str | None:
-    value = normalize_optional_identifier(value)
+    value = normalize_product_name_whitespace(value)
     if value is not None and len(value) > PRODUCT_NAME_MAX_LENGTH:
         raise ValueError(f"{label}最长 {PRODUCT_NAME_MAX_LENGTH} 字符")
     return value
 
 
 def format_product_display_name(name_cn: str | None, name_ja: str | None) -> str:
-    cn = normalize_optional_identifier(name_cn) or "中文名待补"
-    ja = normalize_optional_identifier(name_ja) or "日文名待补"
+    cn = (normalize_product_name_whitespace(name_cn) or "中文名待补").replace(PRODUCT_NAME_SEPARATOR, "·")
+    ja = (normalize_product_name_whitespace(name_ja) or "日文名待补").replace(PRODUCT_NAME_SEPARATOR, "·")
     raw = f"{cn}{PRODUCT_NAME_SEPARATOR}{ja}"
     if len(raw) <= DISPLAY_NAME_MAX_LENGTH:
         return raw
@@ -137,7 +145,7 @@ def create_product_record(
         jan=assert_jan_available(session, jan),
         qinsi_product_code=assert_qinsi_code_available(session, qinsi_product_code),
         name_cn=normalize_product_name(name_cn, "中文名"),
-        display_name=format_product_display_name(name_cn, None),
+        display_name=format_product_display_name(normalize_product_name(name_cn, "中文名"), None),
         product_data_confirmed=True, name_locked=True,
         product_origin=product_origin, source=source,
     )

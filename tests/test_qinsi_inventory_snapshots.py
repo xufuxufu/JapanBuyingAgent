@@ -5,6 +5,7 @@ from types import SimpleNamespace
 
 from sqlalchemy import func, select
 
+from app.analytics_service import _latest_inventory_states
 from app.location_service import initialize_default_locations
 from app.models import (
     Location, Product, ProductWatchConfig, PurchaseBatch, PurchaseBatchItem,
@@ -139,6 +140,35 @@ def test_latest_inventory_aggregates_by_warehouse_and_marks_stale(db_session):
     view = latest_inventory_for_product(db_session, item.id, now=NOW)
     assert {row.warehouse.display_name: row.quantity for row in view.warehouses} == {"新日本仓库": 2, "2025千羽": 3}
     assert view.total_quantity == 5 and view.is_stale is True
+
+
+def test_newer_single_warehouse_snapshot_does_not_hide_other_warehouses(db_session):
+    initialize_default_locations(db_session)
+    item = product(db_session, "分仓最新快照商品", code="PER-WAREHOUSE-1")
+    create_inventory_snapshot(
+        db_session,
+        "new-japan.xlsx",
+        workbook([{"name": item.name_cn, "code": item.qinsi_product_code, "quantity": 2}], "新日本仓库"),
+        data_at=NOW,
+        now=NOW,
+    )
+    create_inventory_snapshot(
+        db_session,
+        "qianyu.xlsx",
+        workbook([{"name": item.name_cn, "code": item.qinsi_product_code, "quantity": 3}], "2025千羽"),
+        data_at=NOW + timedelta(minutes=1),
+        now=NOW + timedelta(minutes=1),
+    )
+    view = latest_inventory_for_product(db_session, item.id, now=NOW + timedelta(minutes=2))
+    _, states = _latest_inventory_states(
+        db_session, {item.id}, now=NOW + timedelta(minutes=2),
+    )
+    assert {row.warehouse.display_name: row.quantity for row in view.warehouses} == {
+        "新日本仓库": 2,
+        "2025千羽": 3,
+    }
+    assert view.total_quantity == 5
+    assert states[item.id]["quantity"] == 5
 
 
 def test_low_stock_target_price_and_pending_purchase_are_separate(db_session):

@@ -4,13 +4,13 @@ from dataclasses import dataclass
 from datetime import date, datetime, time, timedelta, timezone
 from decimal import Decimal, ROUND_HALF_UP
 
-from sqlalchemy import Numeric, cast, exists, func, select
+from sqlalchemy import Numeric, cast, exists, func, or_, select
 from sqlalchemy.orm import Session, selectinload
 
 from app.models import (
-    Product, ProductWatchConfig, PurchaseBatch, PurchaseBatchItem,
+    FieldPurchaseBatch, FieldPurchaseItem, Product, ProductWatchConfig, PurchaseBatch, PurchaseBatchItem,
     QinsiInventorySnapshot, QinsiInventorySnapshotLine,
-    QinsiPurchaseExportLine, QinsiPurchaseExportLineSource, Receipt, RestockList, Store,
+    QinsiPurchaseExportLine, QinsiPurchaseExportLineSource, Receipt, ReceiptImage, ReceiptItem, RestockList, Store,
 )
 from app.qinsi_inventory import inventory_settings
 
@@ -150,6 +150,38 @@ def _store_ranking(session: Session, period: DateRange) -> list[dict]:
             for store, count, quantity, amount, latest in rows]
 
 
+def _field_purchase_store_summary(session: Session, period: DateRange) -> list[dict]:
+    rows = session.execute(
+        select(
+            FieldPurchaseBatch.store_id,
+            Store,
+            func.count(func.distinct(FieldPurchaseBatch.id)),
+            func.coalesce(func.sum(FieldPurchaseItem.quantity), 0),
+            func.max(FieldPurchaseBatch.started_at),
+        )
+        .select_from(FieldPurchaseBatch)
+        .outerjoin(FieldPurchaseItem, FieldPurchaseItem.batch_id == FieldPurchaseBatch.id)
+        .outerjoin(Store, Store.id == FieldPurchaseBatch.store_id)
+        .where(
+            FieldPurchaseBatch.status != "CANCELLED",
+            FieldPurchaseBatch.started_at >= period.start_at,
+            FieldPurchaseBatch.started_at < period.end_at,
+        )
+        .group_by(FieldPurchaseBatch.store_id, Store.id)
+        .order_by(func.max(FieldPurchaseBatch.started_at).desc())
+    ).all()
+    return [
+        {
+            "store": store,
+            "label": store.display_name if store else "未填写门店",
+            "batch_count": int(batch_count),
+            "quantity": int(quantity),
+            "latest_at": latest_at,
+        }
+        for _store_id, store, batch_count, quantity, latest_at in rows
+    ]
+
+
 def _product_ranking(session: Session, period: DateRange) -> list[dict]:
     rows = session.execute(
         select(
@@ -205,6 +237,7 @@ def _latest_inventory_states(
     snapshot_products = (
         select(
             QinsiInventorySnapshotLine.product_id.label("product_id"),
+            QinsiInventorySnapshotLine.warehouse_id.label("warehouse_id"),
             QinsiInventorySnapshotLine.snapshot_id.label("snapshot_id"),
             func.coalesce(QinsiInventorySnapshot.data_at, QinsiInventorySnapshot.imported_at).label("data_at"),
         )
@@ -213,6 +246,7 @@ def _latest_inventory_states(
             QinsiInventorySnapshot.status.in_({"completed", "completed_with_issues"}),
             QinsiInventorySnapshotLine.matching_status == "matched",
             QinsiInventorySnapshotLine.warehouse_status == "matched",
+            QinsiInventorySnapshotLine.warehouse_id.is_not(None),
             QinsiInventorySnapshotLine.product_id.in_(product_ids),
             QinsiInventorySnapshotLine.quantity.is_not(None),
         )
@@ -221,29 +255,30 @@ def _latest_inventory_states(
     ranked = select(
         snapshot_products,
         func.row_number().over(
-            partition_by=snapshot_products.c.product_id,
+            partition_by=(snapshot_products.c.product_id, snapshot_products.c.warehouse_id),
             order_by=(snapshot_products.c.data_at.desc(), snapshot_products.c.snapshot_id.desc()),
         ).label("rn"),
     ).subquery()
     latest = select(
-        ranked.c.product_id, ranked.c.snapshot_id, ranked.c.data_at,
+        ranked.c.product_id, ranked.c.warehouse_id, ranked.c.snapshot_id, ranked.c.data_at,
     ).where(ranked.c.rn == 1).subquery()
     rows = session.execute(
         select(
-            latest.c.product_id, latest.c.snapshot_id, latest.c.data_at,
+            latest.c.product_id, func.max(latest.c.snapshot_id), func.min(latest.c.data_at),
             func.sum(QinsiInventorySnapshotLine.quantity),
         )
         .join(
             QinsiInventorySnapshotLine,
             (QinsiInventorySnapshotLine.product_id == latest.c.product_id)
-            & (QinsiInventorySnapshotLine.snapshot_id == latest.c.snapshot_id),
+            & (QinsiInventorySnapshotLine.snapshot_id == latest.c.snapshot_id)
+            & (QinsiInventorySnapshotLine.warehouse_id == latest.c.warehouse_id),
         )
         .where(
             QinsiInventorySnapshotLine.matching_status == "matched",
             QinsiInventorySnapshotLine.warehouse_status == "matched",
             QinsiInventorySnapshotLine.quantity.is_not(None),
         )
-        .group_by(latest.c.product_id, latest.c.snapshot_id, latest.c.data_at)
+        .group_by(latest.c.product_id)
     ).all()
     settings = inventory_settings()
     states = {}
@@ -381,6 +416,7 @@ def analytics_dashboard(session: Session, period: DateRange, *, selected_bucket:
             "low_stock_watched": low_stock_watched,
         },
         "stores": _store_ranking(session, period), "products": _product_ranking(session, period),
+        "field_purchase_stores": _field_purchase_store_summary(session, period),
         "inventory_snapshot": snapshot, "inventory_rows": inventory_rows,
         "restock_candidates": candidate_rows[:100],
         "active_restock_lists": list(session.scalars(
@@ -388,4 +424,81 @@ def analytics_dashboard(session: Session, period: DateRange, *, selected_bucket:
             .options(selectinload(RestockList.store)).order_by(RestockList.updated_at.desc()).limit(100)
         )),
         "selected_bucket": selected_bucket, "detail_batches": details,
+    }
+
+
+def procurement_data(session: Session, period: DateRange, filters: dict[str, str]) -> dict:
+    conditions = list(_valid_range(period))
+    if filters.get("receipt_no"):
+        conditions.append(Receipt.receipt_number.like(f"%{filters['receipt_no'].strip()}%"))
+    if filters.get("query"):
+        value = f"%{filters['query'].strip()}%"
+        conditions.append(or_(
+            Product.jan.like(value), Product.display_name.like(value), Product.name_cn.like(value),
+            Product.name_ja.like(value), ReceiptItem.raw_name.like(value),
+        ))
+    if filters.get("store_id", "").isdigit():
+        conditions.append(func.coalesce(PurchaseBatch.store_id, Receipt.store_id) == int(filters["store_id"]))
+    if filters.get("operator"):
+        conditions.append(PurchaseBatch.operator_name == filters["operator"])
+    if filters.get("batch"):
+        conditions.append(PurchaseBatch.batch_no.like(f"%{filters['batch'].strip()}%"))
+    if filters.get("status"):
+        conditions.append(PurchaseBatch.status == filters["status"])
+    if filters.get("notes"):
+        conditions.append(or_(
+            PurchaseBatch.note.like(f"%{filters['notes'].strip()}%"),
+            Receipt.confirmation_warning.like(f"%{filters['notes'].strip()}%"),
+        ))
+    rows = session.execute(
+        select(PurchaseBatchItem, PurchaseBatch, Product, Receipt, Store, ReceiptImage)
+        .join(PurchaseBatch, PurchaseBatch.id == PurchaseBatchItem.purchase_batch_id)
+        .join(Product, Product.id == PurchaseBatchItem.product_id)
+        .join(Receipt, Receipt.id == PurchaseBatch.receipt_id)
+        .outerjoin(Store, Store.id == func.coalesce(PurchaseBatch.store_id, Receipt.store_id))
+        .join(ReceiptItem, ReceiptItem.id == PurchaseBatchItem.receipt_item_id)
+        .outerjoin(ReceiptImage, ReceiptImage.id == ReceiptItem.source_image_id)
+        .where(*conditions)
+        .order_by(PurchaseBatch.purchased_at.desc(), PurchaseBatchItem.id.desc())
+    ).all()
+    details = []
+    product_groups: dict[int, dict] = {}
+    batch_groups: dict[int, dict] = {}
+    store_groups: dict[str, dict] = {}
+    operator_groups: dict[str, dict] = {}
+    total_quantity = total_amount = 0
+    prices: list[Decimal] = []
+    for item, batch, product, receipt, store, image in rows:
+        amount = int(item.actual_line_amount or 0)
+        total_quantity += item.quantity
+        total_amount += amount
+        unit_paid = (Decimal(amount) / item.quantity) if item.quantity else Decimal(0)
+        if amount > 0:
+            prices.append(unit_paid)
+        detail = {"item": item, "batch": batch, "product": product, "receipt": receipt,
+                  "store": store, "image": image, "unit_paid": unit_paid.quantize(Decimal("0.01"))}
+        details.append(detail)
+        for groups, key, label in (
+            (product_groups, product.id, product.display_name or product.name_cn or product.name_ja or product.internal_sku),
+            (batch_groups, batch.id, f"{batch.batch_no} / {receipt.receipt_number or '无小票号'}"),
+            (store_groups, str(store.id) if store else "none", store.display_name if store else (batch.store_name or receipt.raw_store_name or "未填写门店")),
+            (operator_groups, batch.operator_name or "unrecorded", batch.operator_name or "未记录"),
+        ):
+            row = groups.setdefault(key, {"label": label, "quantity": 0, "amount": 0, "count": set()})
+            row["quantity"] += item.quantity
+            row["amount"] += amount
+            row["count"].add(batch.id)
+    def summarized(groups):
+        return [dict(value, count=len(value["count"])) for value in groups.values()]
+    return {
+        "purchase_rows": details[:500],
+        "purchase_metrics": {
+            "quantity": total_quantity, "count": len({row[1].id for row in rows}), "amount": total_amount,
+            "average_price": (sum(prices) / len(prices)).quantize(Decimal("0.01")) if prices else None,
+            "minimum_price": min(prices).quantize(Decimal("0.01")) if prices else None,
+            "maximum_price": max(prices).quantize(Decimal("0.01")) if prices else None,
+        },
+        "summary_products": summarized(product_groups), "summary_batches": summarized(batch_groups),
+        "summary_stores": summarized(store_groups), "summary_operators": summarized(operator_groups),
+        "purchase_truncated": len(details) > 500,
     }

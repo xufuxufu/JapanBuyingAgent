@@ -4,7 +4,8 @@ import os
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 
-from sqlalchemy import func, select
+from sqlalchemy import delete, func, select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, selectinload
 
 from app.models import (
@@ -126,7 +127,7 @@ def calculate_recommended_target(session: Session, product_id: int) -> tuple[int
         latest = max(prices, key=lambda row: (row[1], row[2]))
         return latest[0], "latest_purchase", calculated_at
     if product.purchase_price is not None and product.purchase_price > 0:
-        return product.purchase_price, "latest_purchase", calculated_at
+        return int(product.purchase_price), "latest_purchase", calculated_at
     online_price, _ = _latest_online_price(session, product_id)
     if online_price is not None:
         return online_price, "trusted_online_lowest", calculated_at
@@ -167,8 +168,14 @@ def add_watch(
             frequency_tier=frequency_tier or ("low" if source != "manual" else "normal"),
             enabled=False,
         )
-        session.add(config)
-        session.flush()
+        try:
+            with session.begin_nested():
+                session.add(config)
+                session.flush()
+        except IntegrityError:
+            config = get_watch(session, product_id)
+            if config is None:
+                raise
     if frequency_tier is not None:
         if frequency_tier not in FREQUENCY_HOURS:
             raise ValueError("监控频率档位无效")
@@ -179,6 +186,15 @@ def add_watch(
     session.commit()
     session.refresh(config)
     return config
+
+
+def remove_watch(session: Session, product_id: int) -> bool:
+    """Idempotently stop and remove a watch without touching its product."""
+    removed = bool(session.execute(
+        delete(ProductWatchConfig).where(ProductWatchConfig.product_id == product_id)
+    ).rowcount)
+    session.commit()
+    return removed
 
 
 def update_watch(

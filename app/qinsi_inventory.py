@@ -7,6 +7,7 @@ import re
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 
 from sqlalchemy import func, select
@@ -25,7 +26,7 @@ from app.models import (
     QinsiPurchaseExportLine,
     QinsiPurchaseExportLineSource,
 )
-from app.qinsi_import import read_product_sheet
+from app.qinsi_goods_import import read_product_sheet
 
 
 BASE_HEADERS = {
@@ -139,15 +140,15 @@ def _quantity(value: str | None) -> int | None:
     if not text:
         return None
     try:
-        number = float(text)
-    except ValueError as exc:
+        number = Decimal(text)
+    except InvalidOperation as exc:
         raise ValueError("账面数量不是整数") from exc
-    if not number.is_integer():
+    if not number.is_finite() or number != number.to_integral_value():
         raise ValueError("账面数量不是整数")
     return int(number)
 
 
-def _product_fields(raw: dict[str, str]) -> tuple[str | None, str | None, str | None, str | None]:
+def _product_fields(raw: dict[str, str | None]) -> tuple[str | None, str | None, str | None, str | None]:
     name = _text(raw.get("名称（必填）") or raw.get("名称(必填)"))
     code = _text(raw.get("货号（必填且唯一）") or raw.get("货号(必填且唯一)"))
     jan = _text(raw.get("条码"))
@@ -155,17 +156,17 @@ def _product_fields(raw: dict[str, str]) -> tuple[str | None, str | None, str | 
     return name, code, jan, internal_sku
 
 
-def _inventory_entries(raw: dict[str, str]) -> list[tuple[str | None, str | None]]:
+def _inventory_entries(raw: dict[str, str | None]) -> list[tuple[str | None, str | None]]:
     explicit_warehouse = _text(raw.get("盘点仓库:"))
-    counted = raw.get("盘点库存数量", "")
-    current = raw.get("当前库存（导入时不需要录入）", "")
+    counted = raw.get("盘点库存数量") or ""
+    current = raw.get("当前库存（导入时不需要录入）") or ""
     if explicit_warehouse:
         return [(explicit_warehouse, counted or current)]
     dynamic = [(header.strip(), value) for header, value in raw.items() if header not in BASE_HEADERS and header.strip()]
     populated = [(header, value) for header, value in dynamic if (value or "").strip()]
     if populated:
         return populated
-    if len(dynamic) == 1 and (counted or current).strip():
+    if len(dynamic) == 1 and (counted or current or "").strip():
         return [(dynamic[0][0], counted or current)]
     return [(dynamic[0][0] if len(dynamic) == 1 else None, counted or current)]
 
@@ -431,32 +432,60 @@ def _aware(value: datetime) -> datetime:
 def latest_inventory_for_product(
     session: Session, product_id: int, *, now: datetime | None = None,
 ) -> ProductInventoryView:
+    return latest_inventory_for_products(session, [product_id], now=now)[product_id]
+
+
+def latest_inventory_for_products(
+    session: Session, product_ids: list[int], *, now: datetime | None = None,
+) -> dict[int, ProductInventoryView]:
     settings = inventory_settings()
-    snapshot = session.scalar(
-        select(QinsiInventorySnapshot)
-        .join(QinsiInventorySnapshotLine, QinsiInventorySnapshotLine.snapshot_id == QinsiInventorySnapshot.id)
+    if not product_ids:
+        return {}
+    records = session.execute(
+        select(QinsiInventorySnapshotLine, QinsiInventorySnapshot)
+        .join(QinsiInventorySnapshot, QinsiInventorySnapshot.id == QinsiInventorySnapshotLine.snapshot_id)
         .where(
-            QinsiInventorySnapshotLine.product_id == product_id,
-            QinsiInventorySnapshotLine.matching_status == "matched",
-        )
-        .order_by(func.coalesce(QinsiInventorySnapshot.data_at, QinsiInventorySnapshot.imported_at).desc(), QinsiInventorySnapshot.id.desc())
-        .limit(1)
-    )
-    if snapshot is None:
-        return ProductInventoryView(None, (), None, None, False, settings.stale_hours)
-    lines = list(session.scalars(
-        select(QinsiInventorySnapshotLine)
-        .where(
-            QinsiInventorySnapshotLine.snapshot_id == snapshot.id,
-            QinsiInventorySnapshotLine.product_id == product_id,
+            QinsiInventorySnapshotLine.product_id.in_(product_ids),
             QinsiInventorySnapshotLine.matching_status == "matched",
         )
         .options(selectinload(QinsiInventorySnapshotLine.warehouse))
-    ))
+        .order_by(
+            func.coalesce(QinsiInventorySnapshot.data_at, QinsiInventorySnapshot.imported_at).desc(),
+            QinsiInventorySnapshot.id.desc(),
+            QinsiInventorySnapshotLine.id,
+        )
+    ).all()
+    grouped: dict[int, list[tuple[QinsiInventorySnapshotLine, QinsiInventorySnapshot]]] = {
+        product_id: [] for product_id in product_ids
+    }
+    for line, snapshot in records:
+        if line.product_id in grouped:
+            grouped[line.product_id].append((line, snapshot))
+    return {
+        product_id: _inventory_view_from_records(grouped[product_id], settings, now=now)
+        for product_id in product_ids
+    }
+
+
+def _inventory_view_from_records(records, settings, *, now: datetime | None = None) -> ProductInventoryView:
+    if not records:
+        return ProductInventoryView(None, (), None, None, False, settings.stale_hours)
+    snapshot = records[0][1]
     quantities: dict[int, tuple[Location, int]] = {}
+    selected_snapshot_by_warehouse: dict[int, int] = {}
+    selected_times: list[datetime] = []
     review_needed = False
-    for line in lines:
-        if line.warehouse is None or line.quantity is None:
+    for line, line_snapshot in records:
+        if line.warehouse is None:
+            review_needed = True
+            continue
+        selected_snapshot_id = selected_snapshot_by_warehouse.get(line.warehouse.id)
+        if selected_snapshot_id is not None and selected_snapshot_id != line_snapshot.id:
+            continue
+        if selected_snapshot_id is None:
+            selected_snapshot_by_warehouse[line.warehouse.id] = line_snapshot.id
+            selected_times.append(line_snapshot.data_at or line_snapshot.imported_at)
+        if line.quantity is None:
             review_needed = True
             continue
         previous = quantities.get(line.warehouse.id, (line.warehouse, 0))
@@ -466,7 +495,7 @@ def latest_inventory_for_product(
         for warehouse, quantity in sorted(quantities.values(), key=lambda value: (value[0].sort_order, value[0].id))
     )
     total = sum(item.quantity for item in warehouses)
-    data_time = snapshot.data_at or snapshot.imported_at
+    data_time = min(selected_times) if selected_times else (snapshot.data_at or snapshot.imported_at)
     current = now or datetime.now(timezone.utc)
     stale = _aware(current) - _aware(data_time) > timedelta(hours=settings.stale_hours)
     return ProductInventoryView(snapshot, warehouses, total, data_time, stale, settings.stale_hours, review_needed)

@@ -62,10 +62,11 @@ def test_analytics_and_traceable_detail_pages_return_200_with_distinct_price_sou
         checked_at=datetime(2026, 7, 16, 5, 0, tzinfo=timezone.utc),
         total_price=100, status="success", result_count=1, marketplace="manual", seller="线上店",
     ))
+    snapshot_at = datetime.now(timezone.utc)
     snapshot = QinsiInventorySnapshot(
         batch_no="ANALYTICS-LOW", original_filename="low.xlsx", file_hash="analytics-low",
-        file_content=b"snapshot", imported_at=datetime(2026, 7, 16, 6, 0, tzinfo=timezone.utc),
-        data_at=datetime(2026, 7, 16, 6, 0, tzinfo=timezone.utc), status="completed",
+        file_content=b"snapshot", imported_at=snapshot_at,
+        data_at=snapshot_at, status="completed",
         total_rows=1, success_rows=1,
     )
     db.add(snapshot)
@@ -90,6 +91,20 @@ def test_analytics_and_traceable_detail_pages_return_200_with_distinct_price_sou
     assert "采购次数与数量趋势" in dashboard.text and "整单优惠不分摊" in dashboard.text
     assert "低库存或达价关注商品候选" in dashboard.text and "选择门店并生成候选" in dashboard.text
     assert f'/restock-lists/{active_list.id}/items' in dashboard.text
+    purchase_batch = db.scalar(select(PurchaseBatch))
+    saved = http.post(
+        f"/purchase-batches/{purchase_batch.id}/metadata",
+        data={"operator_name": "采购员甲", "note": "现场折扣说明"},
+        follow_redirects=False,
+    )
+    assert saved.status_code == 303
+    filtered = http.get(
+        "/purchase-analytics?range=custom&start_date=2026-07-16&end_date=2026-07-16"
+        "&operator=%E9%87%87%E8%B4%AD%E5%91%98%E7%94%B2&notes=%E6%8A%98%E6%89%A3"
+    )
+    assert filtered.status_code == 200
+    assert "采购明细" in filtered.text and "采购员甲" in filtered.text and "现场折扣说明" in filtered.text
+    assert "按商品" in filtered.text and "按小票 / 采购批次" in filtered.text and "按采购人员" in filtered.text
     candidate_page = http.get(f"/restock-lists/new?source=purchase_analysis&product_id={product.id}")
     assert candidate_page.status_code == 200 and f'name="product_id" value="{product.id}"' in candidate_page.text
     bucket = "2026-07-16"

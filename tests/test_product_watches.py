@@ -6,13 +6,15 @@ import pytest
 from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
 
+import app.main as main_module
+
 from app.models import (
     Location, Marketplace, PriceSearchRun, Product, ProductOffer, ProductWatchConfig,
     ProductWatchRecommendation, PurchaseBatch, PurchaseBatchItem, Receipt, ReceiptBatch, ReceiptItem,
 )
 from app.watch_service import (
     accept_recommendations, add_watch, bulk_enable_watches, calculate_recommended_target,
-    generate_watch_recommendations, refresh_recommended_target, set_watch_enabled, update_watch,
+    generate_watch_recommendations, refresh_recommended_target, remove_watch, set_watch_enabled, update_watch,
 )
 
 
@@ -186,3 +188,43 @@ def test_update_frequency_restock_and_pause(db_session):
     paused = set_watch_enabled(db_session, product.id, False)
     assert (config.frequency_tier, config.monitor_restock) == ("urgent", True)
     assert paused.enabled is False and paused.pause_reason == "user_paused"
+
+
+def test_watch_decimal_price_and_remove_are_idempotent(db_session):
+    product = make_product(db_session, "13", purchase_price=1200)
+    db_session.commit()
+    product_id = product.id
+    db_session.expire_all()
+    config = add_watch(db_session, product_id)
+    assert config.recommended_target_price == 1200
+    assert remove_watch(db_session, product_id) is True
+    assert remove_watch(db_session, product_id) is False
+
+
+def test_watch_ajax_success_duplicate_and_remove(client):
+    http, db, _ = client
+    product = make_product(db, "14", purchase_price=700)
+    db.commit()
+    headers = {"X-Requested-With": "fetch"}
+    first = http.post("/watched-products/add", data={"product_id": product.id}, headers=headers)
+    duplicate = http.post("/watched-products/add", data={"product_id": product.id}, headers=headers)
+    removed = http.post(f"/watched-products/{product.id}/remove", data={}, headers=headers)
+    repeated = http.post(f"/watched-products/{product.id}/remove", data={}, headers=headers)
+    assert first.json() == {"ok": True, "message": "已关注"}
+    assert duplicate.json() == {"ok": True, "message": "已关注"}
+    assert removed.json() == {"ok": True, "message": "已取消关注"}
+    assert repeated.json() == {"ok": True, "message": "当前未关注"}
+
+
+def test_watch_ajax_database_error_is_masked(client, monkeypatch):
+    http, db, _ = client
+    product = make_product(db, "15", purchase_price=700)
+    db.commit()
+    monkeypatch.setattr(main_module, "add_watch", lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("private traceback")))
+    # Unexpected programming errors remain visible to test infrastructure; database errors are the user-facing case.
+    from sqlalchemy.exc import OperationalError
+    monkeypatch.setattr(main_module, "add_watch", lambda *_args, **_kwargs: (_ for _ in ()).throw(OperationalError("stmt", {}, Exception("db"))))
+    response = http.post("/watched-products/add", data={"product_id": product.id}, headers={"X-Requested-With": "fetch"})
+    assert response.status_code == 503
+    assert response.json() == {"ok": False, "message": "关注保存失败，请稍后重试"}
+    assert "stmt" not in response.text and "private traceback" not in response.text

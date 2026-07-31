@@ -1,0 +1,157 @@
+{% extends "base.html" %}
+{% block title %}现场扫码 · Japan Buying Agent{% endblock %}
+{% block content %}
+<section class="field-hero">
+  <div>
+    <span class="badge">现场极速模式</span>
+    <h1>扫码采购</h1>
+    <p>本地 JAN 先查；拍完吊牌并写入本机草稿即可继续。上传、OCR、AI 和平台查询均在后台处理。</p>
+  </div>
+  {% if selected_batch %}
+  <div class="field-batch-chip">
+    <strong>{{ selected_batch.batch_no }}</strong>
+    <span>{{ selected_batch.store.display_name if selected_batch.store else '未填写门店' }} · {{ selected_batch.operator_name }}</span>
+    <form method="post" action="/field-purchase/batches/{{ selected_batch.id }}/store" class="field-store-update">
+      <select name="store_id" aria-label="补充门店">
+        <option value="">门店稍后补充</option>
+        {% for store in stores %}<option value="{{ store.id }}"{% if selected_batch.store_id == store.id %} selected{% endif %}>{{ store.display_name }}</option>{% endfor %}
+      </select>
+      <button type="submit" class="secondary compact">保存门店</button>
+    </form>
+    <form method="post" action="/field-purchase/batches/{{ selected_batch.id }}/complete" onsubmit="localStorage.removeItem('jba.currentBatch')"><button type="submit" class="secondary compact">结束批次</button></form>
+  </div>
+  {% endif %}
+</section>
+
+{% if error %}<div class="error" role="alert">{{ error }}</div>{% endif %}
+
+{% if not selected_batch %}
+<section class="card">
+  <h2>开始现场采购批次</h2>
+  <form class="form-grid" method="post" action="/field-purchase/batches">
+    <input type="hidden" name="client_request_id" class="js-client-request-id">
+    <label>门店（可稍后补充）
+      <select name="store_id">
+        <option value="">未填写</option>
+        {% for store in stores %}<option value="{{ store.id }}">{{ store.display_name }}</option>{% endfor %}
+      </select>
+    </label>
+    <label>采购人员<input name="operator_name" maxlength="128" required autocomplete="name"></label>
+    <button class="full" type="submit">创建批次并开始扫码</button>
+  </form>
+  {% if active_batches %}
+  <h3>继续未结束批次</h3>
+  <div class="field-batch-list">
+    {% for batch in active_batches %}
+    <a class="row" href="/field-purchase?batch_id={{ batch.id }}">
+      <span><strong>{{ batch.batch_no }}</strong><small>{{ batch.store.display_name if batch.store else '未填写门店' }} · {{ batch.operator_name }}</small></span>
+      <span class="badge">{{ batch.items|length }} 种</span>
+    </a>
+    {% endfor %}
+  </div>
+  {% endif %}
+</section>
+{% endif %}
+<div id="fieldPurchaseApp"
+     data-batch-id="{{ selected_batch.id if selected_batch else '' }}"
+     data-batch-no="{{ selected_batch.batch_no if selected_batch else '' }}"
+     data-operator="{{ selected_batch.operator_name if selected_batch else '' }}"
+     data-dev-mode="{{ 'true' if request.query_params.get('debug') == '1' else 'false' }}">
+  <section class="field-scan-grid">
+    <div class="card field-scanner-card">
+      <div class="field-camera-stage" id="fieldCameraStage">
+        <video id="fieldCamera" playsinline muted autoplay aria-label="JAN 扫码摄像头"></video>
+        <div id="fieldScanGuide" class="field-scan-guide" aria-label="将条码放入此框"></div>
+        <p id="fieldCameraPlaceholder">点击“开始扫码”，将 JAN 放入框内</p>
+      </div>
+      <div class="field-camera-actions">
+        <button id="fieldStartCamera" type="button">开始扫码</button>
+        <button id="fieldStopCamera" type="button" class="secondary" disabled>停止</button>
+      </div>
+      <details class="camera-advanced">
+        <summary>切换镜头 / 高级设置</summary>
+        <select id="fieldCameraSelect" aria-label="切换摄像头" title="切换摄像头" hidden></select>
+        <div class="field-camera-tools">
+          <button id="fieldTorch" type="button" class="secondary compact" hidden>补光灯</button>
+          <button id="fieldZoomOut" type="button" class="secondary compact" hidden>缩小</button>
+          <button id="fieldZoomReset" type="button" class="secondary compact" hidden>1×</button>
+          <button id="fieldZoomIn" type="button" class="secondary compact" hidden>放大</button>
+        </div>
+      </details>
+      <p id="fieldScannerStatus" class="muted" role="status">相机默认后置主摄、1×，也可手动输入。</p>
+      <div class="button-row">
+        <button id="fieldRefreshCameraDiagnostic" type="button" class="secondary compact" hidden>刷新诊断</button>
+        <button id="fieldCopyCameraDiagnostic" type="button" class="secondary compact" hidden>复制安全诊断</button>
+      </div>
+      <pre id="fieldCameraDebug" class="camera-debug" hidden></pre>
+    </div>
+
+    <div class="field-action-column">
+      <form id="fieldManualForm" class="card stack">
+        <label>JAN
+          <input id="fieldJanInput" inputmode="numeric" pattern="[0-9]*" maxlength="13" autocomplete="off" placeholder="扫描或手动输入">
+        </label>
+        <button type="submit">查询本地商品</button>
+        <div class="button-row">
+          <button id="fieldRetryScan" type="button" class="secondary">重扫</button>
+          <button id="fieldOcrMode" type="button" class="secondary">拍吊牌识别 JAN</button>
+          <button id="fieldNoJan" type="button" class="secondary">无 JAN 商品</button>
+        </div>
+      </form>
+
+      <section id="fieldResult" class="card field-result" aria-live="polite">
+        <h2>等待扫码</h2>
+        <p class="muted">现场查询只访问本地数据库，不等待平台或 AI。</p>
+      </section>
+
+      <section id="fieldNewDraft" class="card stack" hidden>
+        <div>
+          <span class="badge">新商品</span>
+          <h2>先拍吊牌，其他可稍后补</h2>
+          <p id="fieldDraftIdentity" class="muted"></p>
+        </div>
+        <label class="tag-photo-picker">📷 拍摄吊牌（必拍）
+          <input id="fieldTagPhoto" type="file" accept="image/jpeg,image/png,image/webp,image/heic,image/heif" capture="environment" hidden>
+        </label>
+        <div id="fieldTagPreview" class="field-tag-preview" hidden>
+          <button id="fieldTagPreviewOpen" type="button" class="tag-preview-image" aria-label="查看吊牌大图"><img id="fieldTagPreviewImage" alt="吊牌缩略图"></button>
+          <div><strong id="fieldTagFileName"></strong><small id="fieldTagFileInfo"></small><div class="button-row"><button id="fieldTagRetake" type="button" class="secondary compact">重拍</button><button id="fieldTagDelete" type="button" class="secondary compact">删除</button></div></div>
+        </div>
+        <label>商品名（可稍后）<input id="fieldDraftName" maxlength="128"></label>
+        <label>采购价（日元，可稍后）<input id="fieldDraftPrice" type="number" min="0" inputmode="numeric"></label>
+        <p id="fieldDraftStatus" class="muted" role="status">照片可靠写入本机前不能进入下一件。</p>
+      </section>
+
+      <div class="field-next-bar">
+        <label class="inline-check"><input id="fieldAutoNext" type="checkbox"> 自动继续</label>
+        <div><button id="fieldNext" type="button" disabled>下一件</button><p id="fieldNextReason" class="muted">尚未可靠保存采购事实或新品草稿。</p></div>
+      </div>
+    </div>
+  </section>
+
+  <section class="card">
+    <div class="section-head">
+        <div><h2>{{ '当前批次暂无商品' if selected_batch and not selected_batch.items else ('尚未建立采购批次' if not selected_batch else '本批次') }}</h2><p class="muted">{{ selected_batch.items|length if selected_batch else 0 }} 种商品</p></div>
+      {% if selected_batch and selected_batch.items %}
+      <div class="button-row"><button id="fieldCacheBatchImages" type="button" class="secondary compact">下载本批次商品图供离线查看</button><button id="fieldCancelBatchImages" type="button" class="secondary compact" hidden>取消</button><button id="fieldRetryBatchImages" type="button" class="secondary compact" hidden>重试失败</button><span id="fieldPendingCount" class="badge">待同步 0</span></div>
+      {% else %}
+      <div class="button-row field-empty-actions"><button type="button" class="secondary compact" onclick="document.getElementById('fieldStartCamera')?.click()">{{ '开始扫码' if selected_batch else '创建采购批次并开始扫码' }}</button><span id="fieldPendingCount" class="badge" hidden>待同步 0</span></div>
+      {% endif %}
+    </div>
+    <p id="fieldBatchImageCacheStatus" class="muted" role="status">{{ '当前批次没有商品。' if selected_batch and not selected_batch.items else ('尚未建立采购批次。' if not selected_batch else '') }}</p>
+    <div id="fieldBatchItems" class="field-item-list">
+      {% for item in (selected_batch.items if selected_batch else []) %}
+      {% set item_image = item.product.preferred_image_url if item.product else '' %}
+      <div class="row field-batch-item" data-server-item="{{ item.id }}" data-jan="{{ item.jan or '' }}" data-product-id="{{ item.product.id if item.product else '' }}" data-product-name="{{ item.product.display_name if item.product else '' }}" data-image-url="{{ item_image or '' }}">
+        <span><strong>{{ item.product.display_name if item.product else (item.jan or ('草稿 #' ~ item.temporary_id[-6:])) }}</strong><small>{{ item.jan or ('草稿 #' ~ item.temporary_id[-6:]) }} · {{ item.status }}</small></span>
+        <span class="badge">×{{ item.quantity }}</span>
+      </div>
+      {% else %}<p class="muted">尚未扫码。</p>{% endfor %}
+    </div>
+  </section>
+</div>
+
+<script src="/static/camera_adapter.js" defer></script>
+<script src="/static/vendor/zxing/zxing-browser-0.2.0.min.js" defer></script>
+<script src="/static/field_purchase.js?buildVersion=field-iphone-p0-20260726-2" defer></script>
+{% endblock %}

@@ -36,6 +36,45 @@
   <div class="section-head"><h2>GPT 识别任务</h2>{% if batch.receipts %}<a class="button" href="/receipts/{{ batch.id }}/review">进入人工确认</a>{% endif %}</div>
   {% if gpt_jobs %}<p>此批次属于以下任务：</p><div class="button-row">{% for job in gpt_jobs %}<a class="button secondary" href="/gpt-jobs/{{ job.id }}">{{ job.job_no }}</a>{% endfor %}</div>{% else %}<p class="muted">请从小票历史选择批次下载识别 ZIP，系统将创建独立 GPT 识别任务。</p><a class="button secondary" href="/receipts">前往小票历史</a>{% endif %}
 </section>
+{% if receipt_summaries %}
+<section class="card table-wrap">
+  <div class="section-head"><h2>单票和整批汇总</h2><span class="badge">{{ batch_summary.kind_count }} 种 / {{ batch_summary.quantity }} 件 / ¥{{ '{:,}'.format(batch_summary.amount) }}</span></div>
+  {% for summary in receipt_summaries %}
+  <details {% if loop.first %}open{% endif %}>
+    <summary>{{ summary.receipt.purchased_at|tokyo_datetime if summary.receipt.purchased_at else '日期未知' }} · {{ summary.receipt.raw_store_name or '门店未识别' }} · {{ summary.kind_count }} 种 / {{ summary.quantity }} 件 / ¥{{ '{:,}'.format(summary.amount) }}</summary>
+    <table><thead><tr><th>JAN</th><th>原始名</th><th>数量</th><th>金额</th></tr></thead><tbody>{% for row in summary.rows %}<tr><td>{{ row.jan }}</td><td>{{ row.name }}</td><td>{{ row.quantity }}</td><td>¥{{ '{:,}'.format(row.amount) }}</td></tr>{% endfor %}</tbody></table>
+  </details>
+  {% endfor %}
+  <details>
+    <summary>整批按 JAN 汇总</summary>
+    <table><thead><tr><th>JAN</th><th>代表原始名</th><th>数量</th><th>金额</th></tr></thead><tbody>{% for row in batch_summary.rows %}<tr><td>{{ row.jan }}</td><td>{{ row.name }}</td><td>{{ row.quantity }}</td><td>¥{{ '{:,}'.format(row.amount) }}</td></tr>{% endfor %}</tbody></table>
+  </details>
+</section>
+{% endif %}
+<section class="card table-wrap">
+  <div class="section-head"><h2>小票商品行</h2></div>
+  <table>
+    <thead><tr><th>小票</th><th>原始简称</th><th>数量</th><th>单价</th><th>折扣</th><th>行金额</th><th>匹配商品</th><th>状态</th></tr></thead>
+    <tbody>
+    {% for receipt in batch.receipts %}
+      {% for item in receipt.items %}
+      <tr id="receipt-item-{{ item.id }}">
+        <td>{{ receipt.purchased_at|tokyo_datetime if receipt.purchased_at else '日期未知' }}<small>{{ receipt.raw_store_name or '门店未识别' }}</small></td>
+        <td><a href="/receipts/{{ batch.id }}/review?receipt_id={{ receipt.id }}#receipt-item-{{ item.id }}">{{ item.raw_name }}</a><small>{{ item.recognized_name or '—' }}</small></td>
+        <td>{{ item.quantity }}</td>
+        <td>{{ item.unit_price if item.unit_price is not none else '—' }}</td>
+        <td>{{ item.discount_amount }}</td>
+        <td>{{ item.line_total if item.line_total is not none else '—' }}</td>
+        <td>{% if item.product %}<a href="/products/{{ item.product.id }}">{{ item.product.display_name or item.product.name_cn or item.product.internal_sku }}</a>{% else %}<span class="muted">未匹配</span>{% endif %}</td>
+        <td>{{ item.match_status }} / {{ item.review_status }}</td>
+      </tr>
+      {% endfor %}
+    {% else %}
+      <tr><td colspan="8">尚未导入小票商品行。</td></tr>
+    {% endfor %}
+    </tbody>
+  </table>
+</section>
 {% if batch.recognition_runs %}<section class="card"><h2>历史 AI 原始返回</h2>{% for run in batch.recognition_runs|sort(attribute='created_at', reverse=true) %}<details><summary>第 {{ loop.revindex }} 次 · {{ run.created_at|tokyo_datetime(true) }} · {{ ai_status_cn.get(run.status, '状态未知') }}</summary><pre>{{ run.raw_response_json }}</pre></details>{% endfor %}</section>{% endif %}
 {% set confirmed = batch.status == 'confirmed' or (batch.receipts and batch.receipts[0].confirmation_status == 'confirmed') %}
 {% if not confirmed %}<form method="post" action="/receipts/{{ batch.id }}/delete" onsubmit="return confirm('删除这个未确认批次及其图片？')"><button class="danger" type="submit">删除未确认批次</button></form>{% endif %}

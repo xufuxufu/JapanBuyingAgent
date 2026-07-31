@@ -1,0 +1,44 @@
+{% extends "base.html" %}
+{% block title %}平台配置状态 · Japan Buying Agent{% endblock %}
+{% block content %}
+<div class="section-head"><div><h1>平台配置状态</h1><p class="muted">凭证只从服务端环境变量读取；本页永远不回显完整 Key。</p></div></div>
+{% if message %}<div class="{{ 'success' if test_status == 'success' else 'warning' }} message">{{ message }}</div>{% endif %}
+{% include "_rakuten_ip_status.html" %}
+<section class="card table-wrap">
+  <table>
+    <thead><tr><th>Provider</th><th>配置</th><th>测试结果</th><th>最后成功</th><th>HTTP / 数量</th><th>来源/末4位</th><th>脱敏状态</th><th>请求数量</th><th></th></tr></thead>
+    <tbody>
+      {% for row in rows %}
+      <tr>
+        <td><strong>{{ row.display_name }}</strong><small>{{ row.implementation_status }}</small></td>
+        <td><span class="badge state-{{ 'success' if row.configured else 'unconfigured' }}">{{ '已配置' if row.configured else '未配置' }}</span></td>
+        <td>{% if not row.configured %}未配置{% elif row.last_test_status == 'success' %}API验证成功{% elif row.last_test_status == 'empty' %}API验证成功（无结果）{% elif row.last_test_status == 'unauthorized' %}未授权{% elif row.last_test_status == 'insufficient_balance' %}余额不足{% elif row.last_test_status == 'rate_limited' %}限流{% elif row.last_test_status == 'timeout' %}超时{% elif row.last_test_status == 'network_error' %}网络错误{% elif row.last_test_status %}调用失败{% else %}已配置但未测试{% endif %}</td>
+        <td>{{ row.last_success_at|tokyo_datetime if row.last_success_at else '—' }}</td>
+        <td>{{ row.last_http_status or '—' }} / {{ row.last_result_count }}</td>
+        <td>{{ row.credential_hint or '—' }}</td>
+        <td>
+          {{ row.recent_error or ('API未配置，已保留手动核对/平台搜索链接' if not row.configured else '—') }}
+          {% if row.code == 'rakuten' %}
+          <small>applicationIdPresent={{ row.application_id_present }} / length={{ row.application_id_length }}</small>
+          <small>accessKeyPresent={{ row.access_key_present }} / length={{ row.access_key_length }}</small>
+          <small>endpoint={{ row.item_search_endpoint }}</small>
+          <small>apiVersion={{ row.item_search_api_version }}</small>
+          {% elif row.code == 'deepseek' %}
+          <small>变量={{ row.credential_variable or '—' }}</small>
+          <small>来源={{ row.credential_source or '—' }}</small>
+          <small>模型={{ row.configured_model or 'deepseek-chat' }}</small>
+          <small>测试时间={{ row.last_tested_at|tokyo_datetime if row.last_tested_at else '未测试' }}</small>
+          {% endif %}
+        </td>
+        <td>{{ row.request_count }}</td>
+        <td><form method="post" action="/platform-config/{{ row.code }}/test"><button class="secondary compact" type="submit">{{ '测试 Rakuten Item Search（三项认证诊断）' if row.code == 'rakuten' else ('真实测试 DeepSeek' if row.code == 'deepseek' else '测试连接') }}</button></form></td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</section>
+<section class="card">
+  <h2>安全说明</h2>
+  <p>未配置时返回 <code>UNCONFIGURED</code>，不是系统错误。DeepSeek 未配置时显示未配置，不会 500。Amazon 仅预留 Creators API；当前不会抓取 Amazon 网页，未授权时只提供 <code>SEARCH_ONLY</code> 搜索链接并标记 JAN 未验证。</p>
+</section>
+{% endblock %}

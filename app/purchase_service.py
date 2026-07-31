@@ -5,6 +5,7 @@ from sqlalchemy.orm import Session, selectinload
 
 from app.location_service import (
     DEFAULT_PHYSICAL_LOCATION_CODE, QINSI_NO_BARCODE_LOCATION_CODE,
+    QINSI_NEW_JAPAN_WAREHOUSE_CODE,
     get_location_by_code, initialize_default_locations,
 )
 from app.models import Location, Product, PurchaseBatch, PurchaseBatchItem, Receipt
@@ -69,7 +70,9 @@ def ensure_purchase_batch_for_receipt(
         _active_location(session, settings.qinsi_target_warehouse_id, qinsi=True)
         if settings.qinsi_target_warehouse_id else None
     )
-    jan_target = _active_location(session, default_initial.id, qinsi=True)
+    jan_target = _active_location(
+        session, get_location_by_code(session, QINSI_NEW_JAPAN_WAREHOUSE_CODE).id, qinsi=True,
+    )
     no_jan_target = _active_location(
         session, get_location_by_code(session, QINSI_NO_BARCODE_LOCATION_CODE).id, qinsi=True,
     )
@@ -111,6 +114,10 @@ def ensure_purchase_batch_for_receipt(
             qinsi_target_warehouse_id=target.id,
             target_warehouse_overridden=bool(override_id),
         ))
+    if any((session.get(Product, item.product_id).status or "").startswith("new_") for item in active_items):
+        receipt.batch.product_status = "blocked_by_new_products"
+    else:
+        receipt.batch.product_status = "matched"
     session.flush()
     return purchase_batch
 

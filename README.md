@@ -33,3 +33,10 @@ HEIC is accepted only when the installed Pillow build has a compatible HEIC deco
 6. Final confirmation locks editing/deletion and records any confirmation warning. It does not update inventory.
 
 Status definitions are in `docs/RECEIPT_STATUS_FLOW.md`.
+
+## 2026-07-26 concentrated fix status
+
+- Implemented and automatically verified: field purchase iPhone P0 state fixes, receipt/product traceability entry points, and Rakuten/Yahoo provider stabilization. See `docs/13_CONCENTRATED_FIX_ACCEPTANCE_20260726.md`.
+- iPhone real-device status: the reported 2026-07-26 failures were reproduced from user evidence and fixed in code, but still require iPhone re-validation on the deployed 8020 page.
+- Receipt traceability: product detail uses real `ReceiptItem.product_id` and `PurchaseBatchItem.receipt_item_id` links. `/tasks` now exposes a visible receipt entry; unmatched lines remain unmatched and are not fabricated by fuzzy matching.
+- Rakuten provider: default JAN lookup uses Item Search `keyword=JAN`; Product Search is independent and only enabled by `JBA_RAKUTEN_PRODUCT_SEARCH_ENABLED=true`. 403, 429, empty results, and timeout are distinct states.

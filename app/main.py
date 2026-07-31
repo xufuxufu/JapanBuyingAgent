@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import asyncio
 import io
 import json
+import os
+import time
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal, ROUND_HALF_UP
 from difflib import SequenceMatcher
@@ -12,23 +15,50 @@ from fastapi import BackgroundTasks, Depends, FastAPI, File, Form, HTTPException
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, PlainTextResponse, RedirectResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
-from pydantic import ValidationError
+from pydantic import BaseModel, Field, ValidationError
 from sqlalchemy import func, or_, select, text
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.orm import Session, selectinload
 
-from app.config import PREVIEW_DIR, PRODUCT_IMAGE_DIR, PROJECT_ROOT, ensure_data_directories
-from app.db import SessionLocal, get_db
-from app.models import ImportJob, ImportRow, Product, ProductAlias, ProductWatchConfig, ProductWatchSnapshot, PurchaseBatch, PurchaseBatchItem, QinsiPurchaseExportJob, Receipt, ReceiptBatch, ReceiptImage, ReceiptItem, RestockList, RestockListItem, Store, StoreBrand, ZipPackageItem, ZipPackageJob
-from app.analytics_service import analytics_dashboard, resolve_date_range
+from app.config import PREVIEW_DIR, PRODUCT_IMAGE_DIR, PROJECT_ROOT, QINSI_PRODUCT_IMAGE_DIR, TAG_EVIDENCE_DIR, default_role, ensure_data_directories, get_deepseek_config, is_testing
+from app.db import SessionLocal, engine, get_db
+from app.models import DurableBackgroundJob, EnrichmentAuditLog, FieldPurchaseItem, PlatformProviderState, Product, ProductAlias, ProductEnrichmentCandidate, ProductWatchConfig, ProductWatchSnapshot, PurchaseBatch, PurchaseBatchItem, QinsiExportJob, QinsiGoodsImportRow, QinsiImportBatch, QinsiPurchaseExportJob, Receipt, ReceiptBatch, ReceiptImage, ReceiptItem, RestockList, RestockListItem, Store, StoreBrand, TagEvidence, ZipPackageItem, ZipPackageJob
+from app.analytics_service import analytics_dashboard, procurement_data, resolve_date_range
 from app.product_matching import bind_product, create_product_from_item, match_batch, match_date, match_receipt, normalize_alias
 from app.product_identity import create_product_record, format_product_display_name, normalize_product_name, update_product_identifiers
+from app.product_admin import (
+    EDITABLE_PRODUCT_STATUSES,
+    archive_product,
+    delete_product_if_allowed,
+    product_associations,
+    restore_product,
+    update_product_master,
+)
 from app.price_service import build_lookup_view, query_prices, recent_price_lookup_histories
 from app.product_enrichment import (
     accept_task, bind_task_to_existing, enrichment_summary_for_receipt, get_task,
-    list_review_tasks, process_enrichment_task, safe_trigger_receipt_items,
+    list_review_tasks, process_enrichment_task, process_price_lookup_enrichment,
+    safe_trigger_receipt_items, translate_candidate,
+)
+from app.field_purchase import (
+    assign_field_item_jan, bind_field_item_to_product, bulk_edit_field_items, complete_field_batch, confirm_field_item,
+    create_field_batch, create_new_product_draft,
+    get_field_batch, get_field_item, list_active_field_batches, list_field_review_items,
+    process_durable_job, process_pending_jobs, product_lookup_payload,
+    record_ambiguous_scan_for_review, record_existing_scan,
+    retry_field_items, save_field_product_image, update_field_batch_store, update_field_item,
 )
 from app.location_service import get_default_physical_location, initialize_default_locations, list_locations
+from app.local_product import resolve_local_product_by_jan
+from app.jan_governance import build_jan_governance_rows, export_jan_governance_report
+from app.product_image_localization import (
+    image_localization_dashboard, product_display_image, queue_missing_product_images,
+    preferred_product_image_url, queue_product_image_localization, retry_failed_product_images,
+)
+from app.image_localization_worker import (
+    start_image_localization_worker, stop_image_localization_worker,
+    wake_image_localization_worker,
+)
 from app.monitor_scheduler import scheduler_running, start_monitor_scheduler, stop_monitor_scheduler
 from app.monitor_service import (
     NOTIFICATION_TYPE_LABELS, archive_read_notifications, bulk_mark_notifications_read,
@@ -37,14 +67,21 @@ from app.monitor_service import (
 )
 from app.purchase_service import get_purchase_batch, list_purchase_batches
 from app.qinsi_export import (
-    confirm_qinsi_export, generate_purchase_batch_exports, get_qinsi_export_job,
-    list_qinsi_export_jobs, purchase_item_export_states, retry_failed_qinsi_lines,
+    QINSI_PRODUCT_EXPORTABLE_STATUSES,
+    cancel_qinsi_export_confirmation, cancel_qinsi_product_export_confirmation,
+    confirm_qinsi_export, confirm_qinsi_product_export, create_qinsi_product_export,
+    generate_merged_purchase_batch_export, generate_purchase_batch_exports, get_qinsi_export_job, get_qinsi_product_export_job,
+    list_qinsi_export_jobs, list_qinsi_product_export_jobs, purchase_item_export_states,
+    qinsi_product_export_rows, retry_failed_qinsi_lines,
 )
-from app.qinsi_import import confirm_import, create_import_preview
+from app.qinsi_goods_import import (
+    create_import_batch, process_queued_confirmation, process_queued_import,
+    queue_import_confirmation,
+)
 from app.qinsi_inventory import (
     INVENTORY_STATUS_LABELS, MATCH_METHOD_LABELS, MATCH_STATUS_LABELS,
     available_qinsi_warehouses, create_inventory_snapshot, get_inventory_snapshot,
-    ignore_snapshot_lines, inventory_settings, latest_inventory_for_product,
+    ignore_snapshot_lines, inventory_settings, latest_inventory_for_product, latest_inventory_for_products,
     latest_snapshot_statistics, list_inventory_snapshots, manual_match_line,
     map_line_warehouse, purchase_assistance, retry_snapshot_matching,
     update_product_low_stock_threshold, watched_inventory_status_distribution,
@@ -58,10 +95,19 @@ from app.restock_service import (
     recent_lists_for_store, restock_candidates, trace_rows, update_restock_item,
     update_restock_list_status,
 )
+from app.provider_config import diagnostic_summary, provider_status_rows, test_provider_connection
+from app.rakuten_ip_monitor import rakuten_public_ip_status
+from app.product_translation_service import (
+    count_missing_chinese_name_products,
+    product_display_label,
+    is_missing_chinese_name,
+    translate_missing_chinese_names,
+    translate_product_chinese_name,
+)
 from app.watch_service import (
     FREQUENCY_HOURS, REASON_LABELS, accept_recommendations, add_watch, bulk_enable_watches,
     generate_watch_recommendations, get_watch, ignore_recommendation, list_watch_groups,
-    set_watch_enabled, update_watch,
+    remove_watch, set_watch_enabled, update_watch,
 )
 from app.services import (
     amount_warnings, apply_item_draft, confirm_receipt, create_recognition_zip, download_gpt_job_zip,
@@ -80,14 +126,20 @@ GPT_JOB_STATUS_CN = {"zip_ready": "ZIP已就绪", "zip_downloaded": "ZIP已下�
 RECEIPT_STATUS_CN = {"pending": "待确认", "confirmed": "已确认", "reviewed": "已审核"}
 ITEM_STATUS_CN = {"pending": "待确认", "reviewed": "已复核", "confirmed": "已确认", "ignored": "已忽略"}
 MATCH_STATUS_CN = {"unmatched": "未匹配", "matched_existing": "已有商品", "new_product": "新商品", "needs_review": "待确认", "conflict": "冲突", "invalid_jan": "JAN无效"}
-IMPORT_STATUS_CN = {"previewed": "待确认导入", "completed": "导入完成", "completed_with_issues": "导入完成（有冲突或错误）", "ready": "可导入", "warning": "警告", "skipped": "跳过", "conflict": "冲突", "error": "错误", "imported": "成功"}
+IMPORT_STATUS_CN = {
+    "queued": "等待解析", "parsing": "解析中", "previewed": "待确认导入", "importing": "导入中",
+    "completed": "导入完成", "completed_with_issues": "导入完成（有冲突或错误）",
+    "failed": "失败", "obsolete": "已废弃", "new": "新增", "update": "更新",
+    "unchanged": "无变化", "skipped": "跳过", "conflict": "冲突", "error": "错误",
+    "imported_new": "已新增", "imported_updated": "已更新",
+}
 BATCH_STATUS_CN = {"uploaded": "已上传", "processing": "处理中", "ready": "图片就绪", "review": "待审核", "confirmed": "已确认", "failed": "失败", "deleted": "已删除"}
 PREPROCESS_STATUS_CN = {"previewed": "待处理", "processing": "处理中", "processed": "处理完成", "fallback": "已回退原图", "failed": "处理失败"}
 AI_STATUS_CN = {"accepted": "已接受", "imported": "已导入", "failed": "失败", "error": "错误"}
 LOCATION_TYPE_CN = {"qinsi_warehouse": "秦丝仓库", "local_physical": "本地物理位置", "transit": "在途位置", "system_status": "系统状态"}
 PURCHASE_STATUS_CN = {"confirmed": "已确认", "pending_qinsi_submission": "待提交秦丝", "cancelled": "已取消"}
 QINSI_EXPORT_STATUS_CN = {"generated": "已导出待确认", "imported": "全部导入成功", "partially_failed": "部分失败", "failed": "全部失败", "cancelled": "已取消"}
-QINSI_EXPORT_TYPE_CN = {"new_product": "新商品导入", "restock": "已有商品补货"}
+QINSI_EXPORT_TYPE_CN = {"new_product": "新商品导入", "restock": "采购单商品导入"}
 QINSI_LINE_STATUS_CN = {"generated": "待确认", "imported": "已提交秦丝", "failed": "失败待重试", "cancelled": "已取消"}
 QINSI_SNAPSHOT_STATUS_CN = {"completed": "导入完成", "completed_with_issues": "导入完成（需处理）", "failed": "导入失败"}
 PURCHASE_EXPORT_STATE_CN = {"pending": "待导出", "awaiting_confirmation": "已导出待确认", "failed_retry": "失败待重试", "submitted": "已提交秦丝"}
@@ -98,6 +150,20 @@ PRICE_PROVIDER_STATUS_CN = {
 PRICE_COMPARISON_CN = {
     "store_cheaper": "店内更便宜", "online_cheaper": "线上更便宜", "same": "价格相同",
 }
+
+
+class FieldExistingScanInput(BaseModel):
+    batch_id: int = Field(gt=0)
+    jan: str = Field(min_length=1, max_length=32)
+    quantity: int = Field(default=1, ge=1, le=999)
+    client_request_id: str = Field(min_length=1, max_length=100)
+    selected_product_id: int | None = Field(default=None, gt=0)
+    review_only: bool = False
+
+
+class FieldAutoBatchInput(BaseModel):
+    client_request_id: str = Field(min_length=1, max_length=100)
+    operator_name: str = Field(default="现场采购", min_length=1, max_length=128)
 
 
 def tokyo_datetime(value: datetime, seconds: bool = False) -> str:
@@ -123,16 +189,64 @@ def _nav_unread_count() -> int:
 
 
 templates.env.globals["nav_unread_count"] = _nav_unread_count
+templates.env.globals["product_image_url"] = preferred_product_image_url
+templates.env.globals["product_display_image"] = product_display_image
+
+
+NAV_PERMISSIONS = {
+    "admin": {"field", "purchase", "products", "tasks", "qinsi", "analytics"},
+    "buyer": {"field", "purchase", "products", "tasks"},
+    "reviewer": {"products", "tasks"},
+    "viewer": {"products", "analytics"},
+}
+
+
+def _nav_can(section: str) -> bool:
+    return section in NAV_PERMISSIONS.get(default_role(), set())
+
+
+templates.env.globals["nav_can"] = _nav_can
+
+
+def _translation_user_message(status: str, error: str | None = None) -> str:
+    text = error or ""
+    folded = text.casefold()
+    if status == "rate_limited" or "限流" in text or "rate" in folded:
+        return "中文名生成服务暂时繁忙，请稍后重试"
+    if "未配置" in text or "unconfigured" in folded:
+        return "中文名生成服务未配置，请到平台配置页检查"
+    if "超时" in text or "timeout" in folded:
+        return "中文名生成服务超时，请稍后重试"
+    if "网络" in text or "network" in folded:
+        return "中文名生成服务连接失败，请稍后重试"
+    if "缺少可翻译" in text:
+        return "缺少可翻译的日文名，请先补全日文名"
+    if status == "skipped":
+        return text or "当前商品暂不需要生成中文名"
+    return "中文名生成失败，请稍后重试或手动编辑"
 
 
 @app.on_event("startup")
 async def start_price_monitor() -> None:
+    if is_testing():
+        return
+    asyncio.create_task(
+        asyncio.to_thread(
+            process_pending_jobs,
+            engine,
+            20,
+            job_type="FIELD_PRODUCT_ENRICHMENT",
+        )
+    )
+    start_image_localization_worker(engine)
     start_monitor_scheduler()
 
 
 @app.on_event("shutdown")
 async def stop_price_monitor() -> None:
-    await stop_monitor_scheduler()
+    if not is_testing():
+        await asyncio.to_thread(stop_image_localization_worker)
+        await stop_monitor_scheduler()
 
 
 @app.middleware("http")
@@ -385,7 +499,325 @@ def health(db: Session = Depends(get_db)):
 def home(request: Request, db: Session = Depends(get_db)):
     recent = list(db.scalars(batch_query().order_by(ReceiptBatch.created_at.desc()).limit(5)).unique())
     pending = db.scalar(select(func.count()).select_from(Receipt).where(Receipt.confirmation_status != "confirmed")) or 0
-    return templates.TemplateResponse(request, "home.html", {"recent": recent, "pending": pending, "batch_status_cn": BATCH_STATUS_CN})
+    return templates.TemplateResponse(request, "home.html", {
+        "recent": recent, "pending": pending, "batch_status_cn": BATCH_STATUS_CN,
+        "rakuten_ip_status": rakuten_public_ip_status(),
+    })
+
+
+@app.get("/more", response_class=HTMLResponse)
+def more_page(request: Request):
+    return templates.TemplateResponse(request, "more.html", {})
+
+
+@app.get("/platform-config", response_class=HTMLResponse)
+def platform_config_page(
+    request: Request,
+    message: str = Query(""),
+    test_status: str = Query(""),
+    db: Session = Depends(get_db),
+):
+    return templates.TemplateResponse(request, "platform_config.html", {
+        "rows": provider_status_rows(db),
+        "message": message,
+        "test_status": test_status,
+        "rakuten_ip_status": rakuten_public_ip_status(),
+    })
+
+
+@app.post("/rakuten-ip/recheck")
+def rakuten_ip_recheck(return_to: str = Form("/platform-config")):
+    status = rakuten_public_ip_status(force=True)
+    target = return_to if return_to.startswith("/") and not return_to.startswith("//") else "/platform-config"
+    if status.status == "matched":
+        message = f"Rakuten出口IP正常：{status.configured_ip}"
+    elif status.status == "mismatched":
+        message = "Rakuten许可IP与当前公网IP不一致，Rakuten查询可能失败。"
+    elif status.status == "not_configured":
+        message = "Rakuten许可IP未配置。"
+    else:
+        message = "Rakuten出口IP检测失败，请稍后重试。"
+    separator = "&" if "?" in target else "?"
+    return RedirectResponse(f"{target}{separator}message={quote(message)}", status_code=303)
+
+
+@app.post("/platform-config/{provider_code}/test")
+def platform_config_test(provider_code: str, db: Session = Depends(get_db)):
+    try:
+        response = test_provider_connection(db, provider_code)
+    except LookupError as exc:
+        raise HTTPException(404, str(exc)) from exc
+    diagnostics = diagnostic_summary(response)
+    if response.status == "success":
+        message = f"测试成功：返回 {len(response.offers)} 条结果"
+    elif response.status == "empty":
+        message = "测试完成：认证有效，但该 JAN 暂无结果"
+    else:
+        message = response.message or "测试连接已完成"
+    if diagnostics:
+        message = f"{message}；{diagnostics}"
+    return RedirectResponse(
+        f"/platform-config?test_status={quote(response.status)}&message={quote(message)}",
+        status_code=303,
+    )
+
+
+@app.get("/field-purchase", response_class=HTMLResponse)
+def field_purchase_page(
+    request: Request,
+    batch_id: int | None = Query(None),
+    db: Session = Depends(get_db),
+):
+    active_batches = list_active_field_batches(db)
+    selected_batch = None
+    error = None
+    if batch_id is not None:
+        try:
+            selected_batch = get_field_batch(db, batch_id)
+        except LookupError as exc:
+            error = str(exc)
+    elif active_batches:
+        selected_batch = get_field_batch(db, active_batches[0].id)
+    stores = list(db.scalars(select(Store).where(Store.is_active.is_(True)).order_by(Store.name)))
+    return templates.TemplateResponse(request, "field_purchase.html", {
+        "active_batches": active_batches,
+        "selected_batch": selected_batch,
+        "stores": stores,
+        "error": error,
+    })
+
+
+@app.post("/field-purchase/batches")
+def field_purchase_create_batch(
+    store_id: str = Form(""),
+    operator_name: str = Form(...),
+    client_request_id: str = Form(...),
+    db: Session = Depends(get_db),
+):
+    try:
+        selected_store_id = int(store_id) if store_id.strip() else None
+        batch = create_field_batch(
+            db,
+            store_id=selected_store_id,
+            operator_name=operator_name,
+            client_request_id=client_request_id,
+        )
+    except (TypeError, ValueError) as exc:
+        db.rollback()
+        raise HTTPException(422, str(exc)) from exc
+    return RedirectResponse(f"/field-purchase?batch_id={batch.id}", status_code=303)
+
+
+@app.post("/api/field-purchase/batches/auto", status_code=201)
+def api_field_purchase_auto_batch(
+    data: FieldAutoBatchInput,
+    db: Session = Depends(get_db),
+):
+    try:
+        batch = create_field_batch(
+            db,
+            store_id=None,
+            operator_name=data.operator_name,
+            client_request_id=data.client_request_id,
+        )
+    except ValueError as exc:
+        db.rollback()
+        raise HTTPException(422, str(exc)) from exc
+    return {
+        "id": batch.id,
+        "batch_no": batch.batch_no,
+        "operator_name": batch.operator_name,
+        "store_id": None,
+    }
+
+
+@app.post("/field-purchase/batches/{batch_id}/store")
+def field_purchase_update_batch_store(
+    batch_id: int,
+    store_id: str = Form(""),
+    return_to: str = Form(""),
+    db: Session = Depends(get_db),
+):
+    try:
+        selected_store_id = int(store_id) if store_id.strip() else None
+        update_field_batch_store(db, batch_id, store_id=selected_store_id)
+    except LookupError as exc:
+        raise HTTPException(404, str(exc)) from exc
+    except (TypeError, ValueError) as exc:
+        db.rollback()
+        raise HTTPException(422, str(exc)) from exc
+    safe_return = (
+        return_to
+        if return_to.startswith("/") and not return_to.startswith("//")
+        else f"/field-purchase?batch_id={batch_id}"
+    )
+    return RedirectResponse(safe_return, status_code=303)
+
+
+@app.post("/field-purchase/batches/{batch_id}/complete")
+def field_purchase_complete_batch(batch_id: int, db: Session = Depends(get_db)):
+    try:
+        complete_field_batch(db, batch_id)
+    except LookupError as exc:
+        raise HTTPException(404, str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(422, str(exc)) from exc
+    return RedirectResponse("/field-purchase", status_code=303)
+
+
+@app.get("/api/field-purchase/lookup")
+def api_field_purchase_lookup(
+    code: str = Query(""),
+    batch_id: int | None = Query(None),
+    request_id: str = Query(""),
+    db: Session = Depends(get_db),
+):
+    jan_hint = (code or "").strip()[:13]
+    request_hint = (request_id or "")[-12:]
+    started = time.perf_counter()
+    logger.info(
+        "field_purchase_lookup stage='start' jan=%r batch_id=%r request_suffix=%r endpoint=%r",
+        jan_hint, batch_id, request_hint, "/api/field-purchase/lookup",
+    )
+    try:
+        payload = product_lookup_payload(db, code, batch_id)
+    except Exception as exc:
+        elapsed_ms = int((time.perf_counter() - started) * 1000)
+        logger.exception(
+            "field_purchase_lookup stage='failed' jan=%r batch_id=%r request_suffix=%r elapsed_ms=%r http_status=500 result_state='error' error=%s",
+            jan_hint, batch_id, request_hint, elapsed_ms, type(exc).__name__,
+        )
+        raise HTTPException(500, "本地商品查询失败，请重试") from exc
+    elapsed_ms = int((time.perf_counter() - started) * 1000)
+    logger.info(
+        "field_purchase_lookup stage='done' jan=%r batch_id=%r request_suffix=%r endpoint=%r elapsed_ms=%r http_status=200 result_state=%r match_source=%r",
+        jan_hint, batch_id, request_hint, "/api/field-purchase/lookup", elapsed_ms, payload.get("status"), payload.get("match_source"),
+    )
+    return payload
+
+
+@app.post("/api/field-purchase/scans")
+def api_field_purchase_existing_scan(
+    data: FieldExistingScanInput,
+    db: Session = Depends(get_db),
+):
+    jan_hint = (data.jan or "").strip()[:13]
+    request_hint = data.client_request_id[-12:]
+    logger.info(
+        "field_purchase_scan stage='start' batch_id=%r jan=%r request_suffix=%r review_only=%r",
+        data.batch_id, jan_hint, request_hint, data.review_only,
+    )
+    try:
+        if data.review_only:
+            payload = record_ambiguous_scan_for_review(
+                db,
+                batch_id=data.batch_id,
+                jan=data.jan,
+                client_request_id=data.client_request_id,
+                quantity=data.quantity,
+            )
+        else:
+            payload = record_existing_scan(
+                db,
+                batch_id=data.batch_id,
+                jan=data.jan,
+                client_request_id=data.client_request_id,
+                quantity=data.quantity,
+                selected_product_id=data.selected_product_id,
+            )
+    except LookupError as exc:
+        db.rollback()
+        logger.warning("field_purchase_scan stage='not_found' batch_id=%r jan=%r request_suffix=%r exc=%s", data.batch_id, jan_hint, request_hint, type(exc).__name__)
+        raise HTTPException(404, str(exc)) from exc
+    except ValueError as exc:
+        db.rollback()
+        logger.warning("field_purchase_scan stage='invalid' batch_id=%r jan=%r request_suffix=%r exc=%s", data.batch_id, jan_hint, request_hint, type(exc).__name__)
+        raise HTTPException(422, str(exc)) from exc
+    except Exception as exc:
+        db.rollback()
+        logger.exception("field_purchase_scan stage='failed' batch_id=%r jan=%r request_suffix=%r exc=%s", data.batch_id, jan_hint, request_hint, type(exc).__name__)
+        raise HTTPException(500, "采购事实保存失败，请重试") from exc
+    logger.info("field_purchase_scan stage='done' batch_id=%r jan=%r request_suffix=%r item_id=%r status=%r", data.batch_id, jan_hint, request_hint, payload.get("item_id"), payload.get("status"))
+    return payload
+
+
+@app.post("/api/field-purchase/drafts", status_code=201)
+async def api_field_purchase_new_draft(
+    background_tasks: BackgroundTasks,
+    tag_photo: UploadFile = File(...),
+    batch_id: int = Form(...),
+    client_request_id: str = Form(...),
+    jan: str = Form(""),
+    temporary_id: str = Form(""),
+    name: str = Form(""),
+    unit_price: str = Form(""),
+    quantity: int = Form(1),
+    db: Session = Depends(get_db),
+):
+    try:
+        price = int(unit_price) if unit_price.strip() else None
+    except ValueError as exc:
+        raise HTTPException(422, "价格必须为整数日元") from exc
+    content = await tag_photo.read()
+    jan_hint = (jan or "").strip()[:13]
+    request_hint = client_request_id[-12:]
+    logger.info(
+        "field_purchase_draft stage='start' batch_id=%r jan=%r temporary_id=%r request_suffix=%r bytes=%r content_type=%r",
+        batch_id, jan_hint, (temporary_id or "")[:24], request_hint, len(content), (tag_photo.content_type or "")[:60],
+    )
+    try:
+        payload, job = create_new_product_draft(
+            db,
+            batch_id=batch_id,
+            client_request_id=client_request_id,
+            photo_content=content,
+            photo_content_type=(tag_photo.content_type or "application/octet-stream").casefold(),
+            photo_filename=tag_photo.filename or "tag-photo",
+            jan=jan,
+            temporary_id=temporary_id,
+            name=name,
+            unit_price=price,
+            quantity=quantity,
+        )
+    except LookupError as exc:
+        db.rollback()
+        logger.warning("field_purchase_draft stage='not_found' batch_id=%r jan=%r request_suffix=%r exc=%s", batch_id, jan_hint, request_hint, type(exc).__name__)
+        raise HTTPException(404, str(exc)) from exc
+    except ValueError as exc:
+        db.rollback()
+        logger.warning("field_purchase_draft stage='invalid' batch_id=%r jan=%r request_suffix=%r exc=%s", batch_id, jan_hint, request_hint, type(exc).__name__)
+        raise HTTPException(422, str(exc)) from exc
+    except Exception as exc:
+        db.rollback()
+        logger.exception("field_purchase_draft stage='failed' batch_id=%r jan=%r request_suffix=%r exc=%s", batch_id, jan_hint, request_hint, type(exc).__name__)
+        raise HTTPException(500, "吊牌服务器同步失败，请稍后重试") from exc
+    if not payload.get("replayed"):
+        background_tasks.add_task(process_durable_job, job.id, db.get_bind())
+    logger.info("field_purchase_draft stage='done' batch_id=%r jan=%r request_suffix=%r item_id=%r job_id=%r replayed=%r", batch_id, jan_hint, request_hint, payload.get("item_id"), job.id, payload.get("replayed"))
+    return payload
+
+
+@app.post("/api/background-jobs/run-pending", status_code=202)
+def api_run_pending_jobs(background_tasks: BackgroundTasks, db: Session = Depends(get_db)):
+    pending = db.scalar(
+        select(func.count())
+        .select_from(DurableBackgroundJob)
+        .where(DurableBackgroundJob.status.in_({"PENDING", "FAILED_RETRYABLE"}))
+    ) or 0
+    background_tasks.add_task(process_pending_jobs, db.get_bind(), 50)
+    return {"status": "accepted", "pending": pending}
+
+
+@app.get("/field-purchase/tag-evidence/{evidence_id}")
+def field_purchase_tag_evidence(evidence_id: int, db: Session = Depends(get_db)):
+    evidence = db.get(TagEvidence, evidence_id)
+    if evidence is None:
+        raise HTTPException(404, "吊牌证据不存在")
+    path = (PROJECT_ROOT / evidence.file_path).resolve()
+    allowed = TAG_EVIDENCE_DIR.resolve()
+    if not path.is_relative_to(allowed) or not path.is_file():
+        raise HTTPException(404, "吊牌证据文件不存在")
+    return FileResponse(path, media_type=evidence.content_type, filename=evidence.original_filename)
 
 
 @app.get("/receipts/upload", response_class=HTMLResponse)
@@ -398,12 +830,14 @@ def price_check_page(request: Request, jan: str = Query(""), db: Session = Depen
     return templates.TemplateResponse(request, "price_check.html", {
         "histories": recent_price_lookup_histories(db, jan=jan.strip() or None),
         "error": None, "jan": jan.strip(), "current_store_price": "",
+        "rakuten_ip_status": rakuten_public_ip_status(),
     })
 
 
 @app.post("/price-check", response_class=HTMLResponse)
 def price_check_submit(
-    request: Request, jan: str = Form(...), current_store_price: str = Form(""),
+    request: Request, background_tasks: BackgroundTasks,
+    jan: str = Form(...), current_store_price: str = Form(""),
     force_refresh: bool = Form(False), db: Session = Depends(get_db),
 ):
     try:
@@ -414,8 +848,21 @@ def price_check_submit(
         return templates.TemplateResponse(request, "price_check.html", {
             "histories": recent_price_lookup_histories(db), "error": _validation_message(exc),
             "jan": jan, "current_store_price": current_store_price,
+            "rakuten_ip_status": rakuten_public_ip_status(),
         }, status_code=422)
-    view = query_prices(db, lookup)
+    try:
+        local = resolve_local_product_by_jan(db, lookup.jan)
+        providers = [] if local.product is not None and not lookup.force_refresh else None
+        view = query_prices(db, lookup, providers=providers, trigger_enrichment=False)
+    except ValueError as exc:
+        return templates.TemplateResponse(request, "price_check.html", {
+            "histories": recent_price_lookup_histories(db), "error": str(exc),
+            "jan": jan, "current_store_price": current_store_price,
+            "rakuten_ip_status": rakuten_public_ip_status(),
+        }, status_code=409)
+    if local.product is None:
+        database_url = db.get_bind().url.render_as_string(hide_password=False)
+        background_tasks.add_task(process_price_lookup_enrichment, database_url, lookup.jan, view.history.id)
     return RedirectResponse(f"/price-check/results/{view.history.id}", status_code=303)
 
 
@@ -575,6 +1022,54 @@ def download_multi_batch_recognition_zip(batch_ids: list[int] = Query(...), db: 
     )
 
 
+def _receipt_item_total(item: ReceiptItem) -> int:
+    if item.line_total is not None:
+        return int(item.line_total)
+    if item.unit_price is None:
+        return 0
+    return int(item.unit_price) * int(item.quantity or 0) - int(item.discount_amount or 0)
+
+
+def _receipt_summary(receipt: Receipt) -> dict:
+    rows: dict[str, dict] = {}
+    for item in receipt.items:
+        if item.review_status == "ignored":
+            continue
+        jan = item.jan_candidate or (item.product.jan if item.product else None)
+        key = jan or f"NO-JAN-{item.id}"
+        row = rows.setdefault(key, {
+            "jan": jan or "无JAN",
+            "name": item.raw_name,
+            "quantity": 0,
+            "amount": 0,
+        })
+        row["quantity"] += item.quantity or 0
+        row["amount"] += _receipt_item_total(item)
+    return {
+        "receipt": receipt,
+        "rows": list(rows.values()),
+        "kind_count": len(rows),
+        "quantity": sum(row["quantity"] for row in rows.values()),
+        "amount": sum(row["amount"] for row in rows.values()),
+    }
+
+
+def _batch_receipt_summary(receipt_summaries: list[dict]) -> dict:
+    rows: dict[str, dict] = {}
+    for summary in receipt_summaries:
+        for item in summary["rows"]:
+            key = item["jan"] if item["jan"] != "无JAN" else f"NO-JAN-{summary['receipt'].id}-{item['name']}"
+            row = rows.setdefault(key, {"jan": item["jan"], "name": item["name"], "quantity": 0, "amount": 0})
+            row["quantity"] += item["quantity"]
+            row["amount"] += item["amount"]
+    return {
+        "rows": list(rows.values()),
+        "kind_count": len(rows),
+        "quantity": sum(row["quantity"] for row in rows.values()),
+        "amount": sum(row["amount"] for row in rows.values()),
+    }
+
+
 @app.get("/receipts/{batch_id}", response_class=HTMLResponse)
 def receipt_detail(batch_id: int, request: Request, db: Session = Depends(get_db)):
     batch = load_batch(db, batch_id)
@@ -584,9 +1079,12 @@ def receipt_detail(batch_id: int, request: Request, db: Session = Depends(get_db
     gpt_jobs = list(db.scalars(
         select(ZipPackageJob).join(ZipPackageItem).where(ZipPackageItem.batch_id == batch_id).order_by(ZipPackageJob.created_at.desc())
     ).unique())
+    receipt_summaries = [_receipt_summary(receipt) for receipt in batch.receipts]
+    batch_summary = _batch_receipt_summary(receipt_summaries)
     return templates.TemplateResponse(request, "detail.html", {
         "batch": batch, "error": None, "payload": None, "rotated": request.query_params.get("rotated"),
         "duplicate_master": master, "duplicate_links": linked, "gpt_jobs": gpt_jobs,
+        "receipt_summaries": receipt_summaries, "batch_summary": batch_summary,
         "batch_status_cn": BATCH_STATUS_CN, "preprocess_status_cn": PREPROCESS_STATUS_CN, "ai_status_cn": AI_STATUS_CN,
     })
 
@@ -691,7 +1189,9 @@ def select_image_source(batch_id: int, image_id: int, request: Request, source: 
 def review_page(batch_id: int, request: Request, receipt_id: int | None = Query(None), db: Session = Depends(get_db)):
     batch = load_batch(db, batch_id)
     receipt = current_receipt(batch, receipt_id)
-    products = list(db.scalars(select(Product).order_by(Product.name_cn, Product.id).limit(500)))
+    products = list(db.scalars(
+        select(Product).where(Product.status == "active").order_by(Product.name_cn, Product.id).limit(500)
+    ))
     product_by_id = {product.id: product for product in products}
     for item in receipt.items:
         if item.product_id and item.product_id not in product_by_id:
@@ -905,18 +1405,33 @@ def create_receipt_product(batch_id: int, item_id: int, db: Session = Depends(ge
 
 @app.get("/products/import", response_class=HTMLResponse)
 def product_import_page(request: Request, job_id: int | None = Query(None), db: Session = Depends(get_db)):
-    jobs = list(db.scalars(select(ImportJob).where(ImportJob.job_type == "qinsi_products").order_by(ImportJob.created_at.desc()).limit(20)))
-    job = db.get(ImportJob, job_id) if job_id else (jobs[0] if jobs else None)
-    rows = list(db.scalars(select(ImportRow).where(ImportRow.import_job_id == job.id, ImportRow.status != "skipped").order_by(ImportRow.row_no))) if job else []
-    inventory_headers = {"盘点库存数量", "当前库存（导入时不需要录入）", "盘点仓库:", "新日本仓库"}
+    jobs = list(db.scalars(select(QinsiImportBatch).order_by(QinsiImportBatch.created_at.desc()).limit(20)))
+    job = db.get(QinsiImportBatch, job_id) if job_id else (jobs[0] if jobs else None)
+    rows = list(db.scalars(select(QinsiGoodsImportRow).where(
+        QinsiGoodsImportRow.import_batch_id == job.id,
+        QinsiGoodsImportRow.validation_status != "skipped",
+    ).order_by(QinsiGoodsImportRow.excel_row_number))) if job else []
     for row in rows:
         raw = json.loads(row.raw_json)
-        row.display_raw_json = json.dumps({key: value for key, value in raw.items() if key not in inventory_headers}, ensure_ascii=False)
-    return templates.TemplateResponse(request, "product_import.html", {"jobs": jobs, "job": job, "rows": rows, "status_cn": IMPORT_STATUS_CN})
+        row.display_raw_json = json.dumps(raw, ensure_ascii=False, indent=2)
+        row.display_conflicts = json.loads(row.conflict_json) if row.conflict_json else []
+        row.display_warnings = json.loads(row.warnings) if row.warnings else []
+        row.display_errors = json.loads(row.errors) if row.errors else []
+    summary = json.loads(job.summary_json) if job and job.summary_json else {}
+    return templates.TemplateResponse(request, "product_import.html", {
+        "jobs": jobs, "job": job, "rows": rows, "summary": summary,
+        "status_cn": IMPORT_STATUS_CN,
+    })
 
 
 @app.post("/products/import/preview")
-async def product_import_preview(file: UploadFile | None = File(None), use_reference: str | None = Form(None), db: Session = Depends(get_db)):
+async def product_import_preview(
+    background_tasks: BackgroundTasks,
+    file: UploadFile | None = File(None),
+    use_reference: str | None = Form(None),
+    business_batch_key: str | None = Form(None),
+    db: Session = Depends(get_db),
+):
     reference_name = "goodsImportTemplate已有商品模版-可到导入到本地数据库.xlsx"
     if file and file.filename:
         filename, content = Path(file.filename).name, await file.read()
@@ -926,21 +1441,53 @@ async def product_import_preview(file: UploadFile | None = File(None), use_refer
     else:
         raise HTTPException(422, "请选择Excel文件或项目内已有商品模板")
     try:
-        job = create_import_preview(db, filename, content)
+        job, reused = create_import_batch(
+            db, filename, content, business_batch_key=business_batch_key,
+        )
     except ValueError as exc:
         raise HTTPException(422, str(exc)) from exc
+    if not reused or job.status in {"failed", "queued"}:
+        database_url = db.get_bind().url.render_as_string(hide_password=False)
+        background_tasks.add_task(process_queued_import, database_url, job.id)
     return RedirectResponse(f"/products/import?job_id={job.id}", status_code=303)
 
 
+@app.get("/products/import/{job_id}/status")
+def product_import_status(job_id: int, db: Session = Depends(get_db)):
+    job = db.get(QinsiImportBatch, job_id)
+    if not job:
+        raise HTTPException(404, "导入任务不存在")
+    return {
+        "id": job.id,
+        "status": job.status,
+        "status_label": IMPORT_STATUS_CN.get(job.status, job.status),
+        "total_rows": job.total_rows,
+        "new_count": job.new_count,
+        "update_count": job.update_count,
+        "unchanged_count": job.unchanged_count,
+        "skipped_count": job.skipped_count,
+        "conflict_count": job.conflict_count,
+        "error_count": job.error_count,
+        "warning_count": job.warning_count,
+        "error_message": job.error_message,
+    }
+
+
 @app.post("/products/import/{job_id}/confirm")
-def product_import_confirm(job_id: int, db: Session = Depends(get_db)):
-    job = db.get(ImportJob, job_id)
+def product_import_confirm(
+    job_id: int,
+    background_tasks: BackgroundTasks,
+    db: Session = Depends(get_db),
+):
+    job = db.get(QinsiImportBatch, job_id)
     if not job:
         raise HTTPException(404, "导入任务不存在")
     try:
-        confirm_import(db, job)
+        queue_import_confirmation(db, job)
     except ValueError as exc:
         raise HTTPException(409, str(exc)) from exc
+    database_url = db.get_bind().url.render_as_string(hide_password=False)
+    background_tasks.add_task(process_queued_confirmation, database_url, job.id)
     return RedirectResponse(f"/products/import?job_id={job.id}", status_code=303)
 
 
@@ -951,18 +1498,172 @@ def product_match_by_date(purchased_date: date = Form(...), rematch: bool = Form
 
 
 @app.get("/products", response_class=HTMLResponse)
-def products_page(request: Request, q: str = Query(""), db: Session = Depends(get_db)):
+def products_page(
+    request: Request, q: str = Query(""), page: int = Query(1, ge=1),
+    page_size: int = Query(100, ge=20, le=200), status: str = Query(""), db: Session = Depends(get_db),
+):
     query = select(
         Product,
         func.count(ReceiptItem.id),
         func.coalesce(func.sum(ReceiptItem.quantity), 0),
         func.max(Receipt.purchased_at),
     ).outerjoin(ReceiptItem, ReceiptItem.product_id == Product.id).outerjoin(Receipt, Receipt.id == ReceiptItem.receipt_id)
+    filters = []
     if q.strip():
         value = f"%{q.strip()}%"
-        query = query.where(or_(Product.internal_sku.like(value), Product.jan.like(value), Product.qinsi_product_code.like(value), Product.name_cn.like(value)))
-    rows = db.execute(query.group_by(Product.id).order_by(Product.updated_at.desc())).all()
-    return templates.TemplateResponse(request, "products.html", {"rows": rows, "q": q, "matched_date": request.query_params.get("matched_date")})
+        filters.append(or_(
+            Product.internal_sku.like(value), Product.jan.like(value),
+            Product.qinsi_product_code.like(value), Product.name_cn.like(value),
+            Product.name_ja.like(value), Product.display_name.like(value),
+        ))
+    product_status_labels = {
+        "active": "普通商品",
+        "new_pending_completion": "新商品待补全",
+        "new_pending_review": "新商品待人工确认",
+        "pending_qinsi_product_import": "待导入秦丝商品库",
+        "qinsi_product_imported": "已导入秦丝商品库",
+        "archived": "已停用/归档",
+    }
+    if status.strip():
+        filters.append(Product.status == status.strip())
+    else:
+        filters.append(Product.status != "archived")
+    if filters:
+        query = query.where(*filters)
+    total = db.scalar(select(func.count(Product.id)).where(*filters)) or 0
+    raw_rows = db.execute(
+        query.group_by(Product.id).order_by(Product.updated_at.desc(), Product.id.desc())
+        .offset((page - 1) * page_size).limit(page_size)
+    ).all()
+    inventories = latest_inventory_for_products(db, [row[0].id for row in raw_rows])
+    rows = [(product, count, quantity, latest, inventories[product.id]) for product, count, quantity, latest in raw_rows]
+    association_by_id = {product.id: product_associations(db, product) for product, _, _, _, _ in rows}
+    page_count = max(1, (total + page_size - 1) // page_size)
+    return templates.TemplateResponse(request, "products.html", {
+        "rows": rows, "q": q, "page": page, "page_size": page_size,
+        "page_count": page_count, "total": total,
+        "matched_date": request.query_params.get("matched_date"),
+        "status": status, "product_status_labels": product_status_labels,
+        "editable_product_statuses": EDITABLE_PRODUCT_STATUSES,
+        "association_by_id": association_by_id,
+        "qinsi_product_exportable_statuses": QINSI_PRODUCT_EXPORTABLE_STATUSES,
+        "qinsi_product_exports": list_qinsi_product_export_jobs(db)[:10],
+        "message": request.query_params.get("message"),
+        "error": request.query_params.get("error"),
+        "missing_chinese_name_count": count_missing_chinese_name_products(db),
+        "product_display_label": product_display_label,
+        "is_missing_chinese_name": is_missing_chinese_name,
+    })
+
+
+@app.post("/products/{product_id}/generate-chinese-name")
+def product_generate_chinese_name(
+    product_id: int,
+    return_to: str = Form(""),
+    confirm_overwrite: bool = Form(False),
+    db: Session = Depends(get_db),
+):
+    product = db.get(Product, product_id)
+    if product is None:
+        raise HTTPException(404, "商品不存在")
+    if product.name_cn and not is_missing_chinese_name(product) and not confirm_overwrite:
+        result_message = "已有中文名，请二次确认后覆盖"
+        target = return_to if return_to.startswith("/") and not return_to.startswith("//") else f"/products/{product_id}"
+        separator = "&" if "?" in target else "?"
+        return RedirectResponse(f"{target}{separator}error={quote(result_message)}", status_code=303)
+    result = translate_product_chinese_name(db, product, force=True, overwrite_existing=confirm_overwrite)
+    if result.status == "success":
+        db.commit()
+        message = "已生成中文名"
+    else:
+        db.commit()
+        message = _translation_user_message(result.status, result.error)
+    target = return_to if return_to.startswith("/") and not return_to.startswith("//") else f"/products/{product_id}"
+    separator = "&" if "?" in target else "?"
+    key = "message" if result.status == "success" else "error"
+    return RedirectResponse(f"{target}{separator}{key}={quote(message)}", status_code=303)
+
+
+@app.post("/products/generate-chinese-names")
+async def products_generate_chinese_names(request: Request, db: Session = Depends(get_db)):
+    form = await request.form()
+    selected = {int(value) for value in form.getlist("product_ids") if str(value).isdigit()}
+    result = translate_missing_chinese_names(db, product_ids=selected or None, force=True)
+    text = (
+        f"候选{result.candidate_count}，成功{result.success_count}，"
+        f"失败{result.failed_count}，跳过{result.skipped_count}"
+    )
+    if result.stopped_reason:
+        text = f"{text}；已停止：{_translation_user_message('rate_limited', result.stopped_reason)}"
+    return RedirectResponse(f"/products?message={quote(text)}", status_code=303)
+
+
+@app.post("/products/qinsi-new-exports")
+async def products_qinsi_new_export(request: Request, db: Session = Depends(get_db)):
+    form = await request.form()
+    product_ids = {int(value) for value in form.getlist("product_ids") if str(value).isdigit()}
+    try:
+        job = create_qinsi_product_export(db, product_ids)
+    except ValueError as exc:
+        db.rollback()
+        raise HTTPException(409, str(exc)) from exc
+    return RedirectResponse(f"/qinsi-product-exports/{job.id}", status_code=303)
+
+
+def _qinsi_product_export_or_404(db: Session, job_id: int) -> QinsiExportJob:
+    job = get_qinsi_product_export_job(db, job_id)
+    if job is None:
+        raise HTTPException(404, "秦丝新商品导出记录不存在")
+    return job
+
+
+@app.get("/qinsi-product-exports/{job_id}", response_class=HTMLResponse)
+def qinsi_product_export_detail(job_id: int, request: Request, db: Session = Depends(get_db)):
+    job = _qinsi_product_export_or_404(db, job_id)
+    return templates.TemplateResponse(request, "qinsi_product_export_detail.html", {
+        "job": job,
+        "rows": qinsi_product_export_rows(db, job.id),
+    })
+
+
+@app.get("/qinsi-product-exports/{job_id}/download")
+def qinsi_product_export_download(job_id: int, db: Session = Depends(get_db)):
+    job = _qinsi_product_export_or_404(db, job_id)
+    if not job.file_content:
+        raise HTTPException(404, "秦丝新商品导出文件不存在")
+    return StreamingResponse(
+        io.BytesIO(job.file_content),
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": f"attachment; filename*=UTF-8''{quote(job.export_filename or 'qinsi_new_products.xlsx')}"},
+    )
+
+
+@app.post("/qinsi-product-exports/{job_id}/confirm")
+def qinsi_product_export_confirm(
+    job_id: int,
+    actor_name: str = Form("人工确认"),
+    db: Session = Depends(get_db),
+):
+    job = _qinsi_product_export_or_404(db, job_id)
+    try:
+        confirm_qinsi_product_export(db, job, actor_name=actor_name)
+    except ValueError as exc:
+        raise HTTPException(409, str(exc)) from exc
+    return RedirectResponse(f"/qinsi-product-exports/{job_id}", status_code=303)
+
+
+@app.post("/qinsi-product-exports/{job_id}/cancel-confirmation")
+def qinsi_product_export_cancel_confirmation(
+    job_id: int,
+    actor_name: str = Form("管理员"),
+    db: Session = Depends(get_db),
+):
+    job = _qinsi_product_export_or_404(db, job_id)
+    try:
+        cancel_qinsi_product_export_confirmation(db, job, actor_name=actor_name)
+    except ValueError as exc:
+        raise HTTPException(409, str(exc)) from exc
+    return RedirectResponse(f"/qinsi-product-exports/{job_id}", status_code=303)
 
 
 @app.get("/product-images/{product_id}")
@@ -980,9 +1681,130 @@ def product_main_image(product_id: int, db: Session = Depends(get_db)):
     return FileResponse(resolved)
 
 
+@app.get("/product-local-images/{product_id}")
+def product_localized_image(product_id: int, db: Session = Depends(get_db)):
+    product = db.get(Product, product_id)
+    if product is None or not product.local_image_path:
+        raise HTTPException(404, "本地化商品图片不存在")
+    path = Path(product.local_image_path)
+    if not path.is_absolute():
+        path = PROJECT_ROOT / path
+    resolved = path.resolve()
+    if not resolved.is_relative_to(QINSI_PRODUCT_IMAGE_DIR.resolve()) or not resolved.is_file():
+        raise HTTPException(404, "本地化商品图片不存在")
+    return FileResponse(resolved)
+
+
+@app.get("/jan-governance", response_class=HTMLResponse)
+def jan_governance_page(request: Request, db: Session = Depends(get_db)):
+    rows, _ = build_jan_governance_rows(db)
+    return templates.TemplateResponse(request, "jan_governance.html", {
+        "rows": rows,
+        "message": request.query_params.get("message"),
+    })
+
+
+@app.post("/jan-governance/export")
+def jan_governance_export(db: Session = Depends(get_db)):
+    report = export_jan_governance_report(db, apply_safe_fixes=True)
+    message = (
+        f"冲突/异常 {report.conflict_count} 行；自动修复 {report.auto_fixed_count} 条；"
+        f"CSV：{report.csv_path.resolve()}"
+    )
+    return RedirectResponse(f"/jan-governance?message={quote(message)}", status_code=303)
+
+
+@app.get("/product-image-localization", response_class=HTMLResponse)
+def product_image_localization_page(request: Request, db: Session = Depends(get_db)):
+    return templates.TemplateResponse(request, "product_image_localization.html", {
+        "dashboard": image_localization_dashboard(db),
+        "message": request.query_params.get("message"),
+    })
+
+
+@app.get("/api/product-image-localization/status")
+def product_image_localization_status(db: Session = Depends(get_db)):
+    dashboard = image_localization_dashboard(db)
+    dashboard.pop("recent_jobs", None)
+    return dashboard
+
+
+def _image_localization_json(session: Session) -> dict:
+    dashboard = image_localization_dashboard(session)
+    dashboard.pop("recent_jobs", None)
+    return dashboard
+
+
+@app.post("/product-image-localization/queue")
+def product_image_localization_queue(
+    request: Request,
+    db: Session = Depends(get_db),
+):
+    count = queue_missing_product_images(db)
+    if count:
+        wake_image_localization_worker()
+    if "application/json" in request.headers.get("accept", ""):
+        return JSONResponse(
+            {
+                "status": "accepted",
+                "queued": count,
+                "dashboard": _image_localization_json(db),
+            },
+            status_code=202,
+        )
+    return RedirectResponse(
+        f"/product-image-localization?message={quote(f'已新增 {count} 个图片任务')}",
+        status_code=303,
+    )
+
+
+@app.post("/product-image-localization/retry-failed")
+def product_image_localization_retry_failed(
+    request: Request,
+    db: Session = Depends(get_db),
+):
+    count = retry_failed_product_images(db)
+    if count:
+        wake_image_localization_worker()
+    if "application/json" in request.headers.get("accept", ""):
+        return JSONResponse(
+            {
+                "status": "accepted",
+                "queued": count,
+                "dashboard": _image_localization_json(db),
+            },
+            status_code=202,
+        )
+    return RedirectResponse(
+        f"/product-image-localization?message={quote(f'已重试 {count} 个失败任务')}",
+        status_code=303,
+    )
+
+
+@app.get("/tasks", response_class=HTMLResponse)
 @app.get("/product-enrichment", response_class=HTMLResponse)
-def product_enrichment_page(request: Request, db: Session = Depends(get_db)):
-    return templates.TemplateResponse(request, "product_enrichment.html", {"tasks": list_review_tasks(db)})
+def product_enrichment_page(
+    request: Request,
+    missing: str = Query(""),
+    low_confidence: bool = Query(False),
+    failed: bool = Query(False),
+    db: Session = Depends(get_db),
+):
+    filters = {
+        "missing": missing if missing in {"name", "price", "image"} else "",
+        "low_confidence": low_confidence,
+        "failed": failed,
+    }
+    return templates.TemplateResponse(request, "product_enrichment.html", {
+        "tasks": list_review_tasks(db),
+        "field_items": list_field_review_items(
+            db,
+            missing=filters["missing"] or None,
+            low_confidence=low_confidence,
+            failed=failed,
+        ),
+        "filters": filters,
+    })
 
 
 @app.post("/product-enrichment/batch-accept")
@@ -1048,6 +1870,297 @@ def product_enrichment_existing(task_id: int, product_id: int = Form(...), db: S
     return RedirectResponse(f"/products/{product.id}", status_code=303)
 
 
+@app.post("/product-enrichment/{task_id}/candidates/{candidate_id}/reject")
+def product_enrichment_reject_candidate(
+    task_id: int,
+    candidate_id: int,
+    return_to: str = Form("/product-enrichment"),
+    db: Session = Depends(get_db),
+):
+    task = get_task(db, task_id)
+    candidate = db.scalar(
+        select(ProductEnrichmentCandidate).where(
+            ProductEnrichmentCandidate.id == candidate_id,
+            ProductEnrichmentCandidate.task_id == task.id,
+        )
+    )
+    if candidate is None:
+        raise HTTPException(404, "候选不存在")
+    before = {"selected": candidate.selected, "source_url": candidate.source_url}
+    candidate.selected = False
+    db.add(EnrichmentAuditLog(
+        enrichment_task_id=task.id,
+        action="REJECT_CANDIDATE",
+        actor="人工审核",
+        before_json=json.dumps(before, ensure_ascii=False),
+        after_json=json.dumps({"selected": False}, ensure_ascii=False),
+    ))
+    db.commit()
+    safe_return = return_to if return_to.startswith("/") and not return_to.startswith("//") else "/product-enrichment"
+    return RedirectResponse(safe_return, status_code=303)
+
+
+@app.get("/field-purchase/items/{item_id}/review", response_class=HTMLResponse)
+def field_purchase_item_review(item_id: int, request: Request, db: Session = Depends(get_db)):
+    try:
+        item = get_field_item(db, item_id)
+    except LookupError as exc:
+        raise HTTPException(404, str(exc)) from exc
+    stores = list(db.scalars(select(Store).where(Store.is_active.is_(True)).order_by(Store.name)))
+    resolution = resolve_local_product_by_jan(db, item.jan) if item.jan else None
+    jan_candidates = list(resolution.candidate_products) if resolution and resolution.is_conflict else []
+    return templates.TemplateResponse(
+        request,
+        "field_purchase_review.html",
+        {"item": item, "stores": stores, "jan_candidates": jan_candidates, "error": None},
+    )
+
+
+@app.post("/field-purchase/items/{item_id}/bind")
+def field_purchase_item_bind(
+    item_id: int,
+    product_id: int = Form(...),
+    actor: str = Form("人工审核"),
+    db: Session = Depends(get_db),
+):
+    try:
+        bind_field_item_to_product(db, item_id, product_id, actor=actor)
+    except LookupError as exc:
+        db.rollback()
+        raise HTTPException(404, str(exc)) from exc
+    except ValueError as exc:
+        db.rollback()
+        raise HTTPException(422, str(exc)) from exc
+    return RedirectResponse("/product-enrichment", status_code=303)
+
+
+@app.post("/field-purchase/items/{item_id}/jan")
+def field_purchase_item_assign_jan(
+    item_id: int,
+    jan: str = Form(...),
+    actor: str = Form("人工审核"),
+    db: Session = Depends(get_db),
+):
+    try:
+        item = assign_field_item_jan(db, item_id, jan, actor=actor)
+    except LookupError as exc:
+        db.rollback()
+        raise HTTPException(404, str(exc)) from exc
+    except ValueError as exc:
+        db.rollback()
+        raise HTTPException(422, str(exc)) from exc
+    return RedirectResponse(f"/field-purchase/items/{item.id}/review", status_code=303)
+
+
+@app.post("/field-purchase/items/{item_id}/review")
+async def field_purchase_item_update(
+    item_id: int,
+    product_image: UploadFile | None = File(None),
+    name_cn: str = Form(""),
+    name_ja: str = Form(""),
+    unit_price: str = Form(""),
+    brand: str = Form(""),
+    category: str = Form(""),
+    unit_name: str = Form(""),
+    actor: str = Form("人工审核"),
+    db: Session = Depends(get_db),
+):
+    try:
+        price = int(unit_price) if unit_price.strip() else None
+        if price is not None and price < 0:
+            raise ValueError
+    except ValueError as exc:
+        raise HTTPException(422, "价格必须为非负整数日元") from exc
+    try:
+        update_field_item(
+            db,
+            item_id,
+            actor=actor,
+            name_cn=name_cn,
+            name_ja=name_ja,
+            unit_price=price,
+            brand=brand,
+            category=category,
+            unit_name=unit_name,
+        )
+    except LookupError as exc:
+        raise HTTPException(404, str(exc)) from exc
+    if product_image is not None and product_image.filename:
+        try:
+            save_field_product_image(
+                db,
+                item_id,
+                actor=actor,
+                content=await product_image.read(),
+                content_type=(product_image.content_type or "application/octet-stream").casefold(),
+                original_filename=product_image.filename,
+            )
+        except ValueError as exc:
+            db.rollback()
+            raise HTTPException(422, str(exc)) from exc
+    return RedirectResponse(f"/field-purchase/items/{item_id}/review", status_code=303)
+
+
+@app.post("/field-purchase/items/{item_id}/candidates/{candidate_id}/select")
+def field_purchase_item_select_candidate(
+    item_id: int,
+    candidate_id: int,
+    db: Session = Depends(get_db),
+):
+    item = get_field_item(db, item_id)
+    candidate = db.get(ProductEnrichmentCandidate, candidate_id)
+    if candidate is None or item.enrichment_task_id != candidate.task_id:
+        raise HTTPException(404, "线上资料候选不存在")
+    task = get_task(db, candidate.task_id)
+    before = {
+        "name_ja": item.name_ja,
+        "unit_price": item.unit_price,
+        "selected_candidate_id": next((row.id for row in task.candidates if row.selected), None),
+    }
+    for row in task.candidates:
+        row.selected = row.id == candidate.id
+    if candidate.name_ja and not item.name_ja:
+        item.name_ja = candidate.name_ja[:128]
+    if candidate.item_price is not None and item.unit_price is None:
+        item.unit_price = candidate.item_price
+    selected = {
+        "jan": candidate.jan,
+        "name_ja": candidate.name_ja,
+        "image_url": candidate.image_url,
+        "source_url": candidate.source_url,
+        "platform": candidate.platform,
+        "item_price": candidate.item_price,
+        "shipping_price": candidate.shipping_price,
+        "total_price": candidate.total_price,
+        "seller": candidate.provider_summary_json,
+    }
+    task.selected_data_json = json.dumps(selected, ensure_ascii=False, default=str)
+    db.add(EnrichmentAuditLog(
+        field_purchase_item_id=item.id,
+        enrichment_task_id=task.id,
+        action="SELECT_CANDIDATE",
+        actor="人工审核",
+        before_json=json.dumps(before, ensure_ascii=False),
+        after_json=json.dumps({
+            "candidate_id": candidate.id,
+            "name_ja": item.name_ja,
+            "unit_price": item.unit_price,
+            "image_url": candidate.image_url,
+            "source_url": candidate.source_url,
+        }, ensure_ascii=False),
+    ))
+    db.commit()
+    return RedirectResponse(f"/field-purchase/items/{item_id}/review", status_code=303)
+
+
+@app.post("/field-purchase/items/{item_id}/ai-name")
+def field_purchase_item_ai_name(item_id: int, db: Session = Depends(get_db)):
+    item = get_field_item(db, item_id)
+    if item.enrichment_task is None:
+        return RedirectResponse(
+            f"/field-purchase/items/{item_id}/review?error={quote('请先取得线上资料候选')}",
+            status_code=303,
+        )
+    task = get_task(db, item.enrichment_task.id)
+    candidate = next((row for row in task.candidates if row.selected), None) or next(iter(task.candidates), None)
+    if candidate is None or not (candidate.name_ja or item.name_ja):
+        return RedirectResponse(
+            f"/field-purchase/items/{item_id}/review?error={quote('没有可翻译的日文商品名')}",
+            status_code=303,
+        )
+    if not candidate.name_ja and item.name_ja:
+        candidate.name_ja = item.name_ja
+    result = translate_candidate(db, task, candidate)
+    if result is None:
+        db.commit()
+        status = task.deepseek_status or "未配置"
+        return RedirectResponse(
+            f"/field-purchase/items/{item_id}/review?error={quote('AI生成中文名未完成：' + status)}",
+            status_code=303,
+        )
+    before = {"name_cn": item.name_cn, "name_ja": item.name_ja}
+    item.name_cn = result.name_cn[:128]
+    item.name_ja = result.name_ja[:128]
+    if item.status not in {"CONFIRMED", "FAILED_MANUAL"}:
+        item.status = "READY" if item.name_cn and item.name_ja else "NEEDS_REVIEW"
+    db.add(EnrichmentAuditLog(
+        field_purchase_item_id=item.id,
+        enrichment_task_id=task.id,
+        action="MANUAL_EDIT",
+        actor="DeepSeek",
+        before_json=json.dumps(before, ensure_ascii=False),
+        after_json=json.dumps({"name_cn": item.name_cn, "name_ja": item.name_ja}, ensure_ascii=False),
+        source="ai_translation",
+    ))
+    db.commit()
+    return RedirectResponse(f"/field-purchase/items/{item_id}/review", status_code=303)
+
+
+@app.post("/field-purchase/items/{item_id}/confirm")
+def field_purchase_item_confirm(
+    item_id: int,
+    request: Request,
+    actor: str = Form("人工审核"),
+    db: Session = Depends(get_db),
+):
+    try:
+        product = confirm_field_item(db, item_id, actor=actor)
+    except LookupError as exc:
+        raise HTTPException(404, str(exc)) from exc
+    except ValueError as exc:
+        db.rollback()
+        item = get_field_item(db, item_id)
+        stores = list(db.scalars(select(Store).where(Store.is_active.is_(True)).order_by(Store.name)))
+        resolution = resolve_local_product_by_jan(db, item.jan) if item.jan else None
+        jan_candidates = list(resolution.candidate_products) if resolution and resolution.is_conflict else []
+        return templates.TemplateResponse(
+            request,
+            "field_purchase_review.html",
+            {"item": item, "stores": stores, "jan_candidates": jan_candidates, "error": str(exc)},
+            status_code=422,
+        )
+    return RedirectResponse(f"/products/{product.id}", status_code=303)
+
+
+@app.get("/field-purchase/items/{item_id}/image")
+def field_purchase_item_image(item_id: int, db: Session = Depends(get_db)):
+    item = db.get(FieldPurchaseItem, item_id)
+    if item is None or not item.product_image_path:
+        raise HTTPException(404, "商品照片不存在")
+    path = (PROJECT_ROOT / item.product_image_path).resolve()
+    if not path.is_relative_to(TAG_EVIDENCE_DIR.resolve()) or not path.is_file():
+        raise HTTPException(404, "商品照片不存在")
+    return FileResponse(path)
+
+
+@app.post("/field-purchase/items/batch")
+async def field_purchase_items_batch(
+    request: Request,
+    background_tasks: BackgroundTasks,
+    db: Session = Depends(get_db),
+):
+    form = await request.form()
+    item_ids = {int(value) for value in form.getlist("item_ids") if str(value).isdigit()}
+    action = str(form.get("action") or "")
+    actor = str(form.get("actor") or "批量审核")
+    if action == "edit":
+        bulk_edit_field_items(
+            db,
+            item_ids,
+            actor=actor,
+            brand=str(form.get("brand") or ""),
+            category=str(form.get("category") or ""),
+            unit_name=str(form.get("unit_name") or ""),
+        )
+    elif action == "retry":
+        job_ids = retry_field_items(db, item_ids, actor=actor)
+        for job_id in job_ids:
+            background_tasks.add_task(process_durable_job, job_id, db.get_bind())
+    else:
+        raise HTTPException(422, "不支持的批量操作")
+    return RedirectResponse("/product-enrichment", status_code=303)
+
+
 @app.get("/locations", response_class=HTMLResponse)
 def locations_page(request: Request, db: Session = Depends(get_db)):
     return templates.TemplateResponse(request, "locations.html", {
@@ -1059,10 +2172,22 @@ def locations_page(request: Request, db: Session = Depends(get_db)):
 def purchase_analytics_page(
     request: Request, range_key: str = Query("30d", alias="range"),
     start_date: date | None = Query(None), end_date: date | None = Query(None),
-    bucket: str | None = Query(None), db: Session = Depends(get_db),
+    bucket: str | None = Query(None), receipt_no: str = Query(""),
+    query_text: str = Query("", alias="query"), store_id: str = Query(""),
+    operator_name: str = Query("", alias="operator"), batch: str = Query(""),
+    status_filter: str = Query("", alias="status"), notes: str = Query(""),
+    db: Session = Depends(get_db),
 ):
     period = resolve_date_range(range_key, start_date, end_date)
     context = analytics_dashboard(db, period, selected_bucket=bucket)
+    filters = {"receipt_no": receipt_no, "query": query_text, "store_id": store_id,
+               "operator": operator_name, "batch": batch, "status": status_filter, "notes": notes}
+    context.update(procurement_data(db, period, filters))
+    context["purchase_filters"] = filters
+    context["filter_stores"] = list(db.scalars(select(Store).where(Store.is_active.is_(True)).order_by(Store.name_cn, Store.name_ja, Store.id)))
+    context["filter_operators"] = list(db.scalars(
+        select(PurchaseBatch.operator_name).where(PurchaseBatch.operator_name.is_not(None)).distinct().order_by(PurchaseBatch.operator_name)
+    ))
     context["range_options"] = (
         ("30d", "最近30天"), ("90d", "最近90天"), ("month", "本月"),
         ("last_month", "上月"), ("year", "今年"), ("custom", "自定义日期"),
@@ -1297,9 +2422,38 @@ def api_locations(db: Session = Depends(get_db)):
 
 @app.get("/purchase-batches", response_class=HTMLResponse)
 def purchase_batches_page(request: Request, db: Session = Depends(get_db)):
+    purchase_batches = list_purchase_batches(db)
+    merge_rows = []
+    for purchase_batch in purchase_batches:
+        states = purchase_item_export_states(db, purchase_batch.id)
+        pending_count = sum(states.get(item.id, "pending") == "pending" for item in purchase_batch.items)
+        blocking_count = len({
+            item.product_id for item in purchase_batch.items
+            if item.product.status != "qinsi_product_imported"
+        })
+        merge_rows.append({
+            "batch": purchase_batch,
+            "pending_count": pending_count,
+            "blocking_count": blocking_count,
+            "selectable": purchase_batch.status != "cancelled" and pending_count > 0,
+        })
     return templates.TemplateResponse(request, "purchase_batches.html", {
-        "purchase_batches": list_purchase_batches(db), "purchase_status_cn": PURCHASE_STATUS_CN,
+        "purchase_batches": purchase_batches, "merge_rows": merge_rows,
+        "purchase_status_cn": PURCHASE_STATUS_CN,
     })
+
+
+@app.post("/purchase-batches/qinsi-exports/merge")
+async def create_merged_purchase_batch_qinsi_export(request: Request, db: Session = Depends(get_db)):
+    form = await request.form()
+    try:
+        purchase_batch_ids = {int(value) for value in form.getlist("purchase_batch_ids")}
+        job = generate_merged_purchase_batch_export(db, purchase_batch_ids)
+    except LookupError as exc:
+        raise HTTPException(404, str(exc)) from exc
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(409, str(exc)) from exc
+    return RedirectResponse(f"/qinsi-exports/{job.id}", status_code=303)
 
 
 @app.get("/purchase-batches/{purchase_batch_id}", response_class=HTMLResponse)
@@ -1309,11 +2463,35 @@ def purchase_batch_detail(purchase_batch_id: int, request: Request, db: Session 
         raise HTTPException(404, "采购批次不存在")
     export_states = purchase_item_export_states(db, purchase_batch.id)
     item_states = {item.id: export_states.get(item.id, "pending") for item in purchase_batch.items}
+    blocking_products = list({
+        item.product.id: item.product for item in purchase_batch.items
+        if item.product.status != "qinsi_product_imported"
+    }.values())
+    summary = {
+        "kind_count": len({item.product.jan or item.product_id for item in purchase_batch.items}),
+        "quantity": sum(item.quantity for item in purchase_batch.items),
+        "amount": sum(item.actual_line_amount or 0 for item in purchase_batch.items),
+    }
     return templates.TemplateResponse(request, "purchase_batch_detail.html", {
         "purchase_batch": purchase_batch, "purchase_status_cn": PURCHASE_STATUS_CN,
         "item_states": item_states, "purchase_export_state_cn": PURCHASE_EXPORT_STATE_CN,
-        "pending_export_count": sum(state == "pending" for state in item_states.values()),
+        "pending_export_count": 0 if blocking_products else sum(state == "pending" for state in item_states.values()),
+        "blocking_products": blocking_products, "summary": summary,
     })
+
+
+@app.post("/purchase-batches/{purchase_batch_id}/metadata")
+def update_purchase_batch_metadata(
+    purchase_batch_id: int, operator_name: str = Form(""), note: str = Form(""),
+    db: Session = Depends(get_db),
+):
+    purchase_batch = db.get(PurchaseBatch, purchase_batch_id)
+    if purchase_batch is None:
+        raise HTTPException(404, "采购批次不存在")
+    purchase_batch.operator_name = operator_name.strip()[:128] or None
+    purchase_batch.note = note.strip()[:2000] or None
+    db.commit()
+    return RedirectResponse(f"/purchase-batches/{purchase_batch_id}?message={quote('人员与备注已保存')}", status_code=303)
 
 
 @app.post("/purchase-batches/{purchase_batch_id}/qinsi-exports")
@@ -1334,7 +2512,7 @@ def create_purchase_batch_qinsi_exports(purchase_batch_id: int, db: Session = De
 def qinsi_exports_page(request: Request, purchase_batch_id: int | None = Query(None), db: Session = Depends(get_db)):
     jobs = list_qinsi_export_jobs(db)
     if purchase_batch_id is not None:
-        jobs = [job for job in jobs if job.purchase_batch_id == purchase_batch_id]
+        jobs = [job for job in jobs if purchase_batch_id in job.selected_batch_ids]
     return templates.TemplateResponse(request, "qinsi_exports.html", {
         "jobs": jobs, "purchase_batch_id": purchase_batch_id,
         "qinsi_export_status_cn": QINSI_EXPORT_STATUS_CN, "qinsi_export_type_cn": QINSI_EXPORT_TYPE_CN,
@@ -1375,10 +2553,24 @@ async def qinsi_export_confirm(export_job_id: int, request: Request, db: Session
         confirmation = QinsiExportConfirmationInput.model_validate({
             "result": str(form.get("result") or ""),
             "failed_line_ids": {int(value) for value in form.getlist("failed_line_ids")},
+            "actor_name": str(form.get("actor_name") or job.purchase_batch.operator_name or "人工确认"),
+            "note": str(form.get("note") or "") or None,
         })
         confirm_qinsi_export(db, job, confirmation)
     except ValidationError as exc:
         raise HTTPException(422, _validation_message(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(409, str(exc)) from exc
+    return RedirectResponse(f"/qinsi-exports/{export_job_id}", status_code=303)
+
+
+@app.post("/qinsi-exports/{export_job_id}/cancel-confirmation")
+async def qinsi_export_cancel_confirmation(export_job_id: int, request: Request, db: Session = Depends(get_db)):
+    job = _qinsi_export_or_404(db, export_job_id)
+    form = await request.form()
+    actor = str(form.get("actor_name") or "管理员")
+    try:
+        cancel_qinsi_export_confirmation(db, job, actor_name=actor)
     except ValueError as exc:
         raise HTTPException(409, str(exc)) from exc
     return RedirectResponse(f"/qinsi-exports/{export_job_id}", status_code=303)
@@ -1612,7 +2804,7 @@ def watched_products_page(request: Request, db: Session = Depends(get_db)):
 
 @app.post("/watched-products/add")
 def watched_products_add(
-    product_id: int = Form(...), user_target_price: str = Form(""),
+    request: Request, product_id: int = Form(...), user_target_price: str = Form(""),
     frequency_tier: str = Form("normal"), return_to: str = Form("/watched-products"),
     db: Session = Depends(get_db),
 ):
@@ -1623,8 +2815,37 @@ def watched_products_add(
         )
     except (LookupError, ValueError) as exc:
         db.rollback()
+        if request.headers.get("x-requested-with") == "fetch":
+            return JSONResponse({"ok": False, "message": str(exc)}, status_code=422)
         return RedirectResponse(f"{_return_path(return_to)}?error={quote(str(exc))}", status_code=303)
+    except SQLAlchemyError:
+        db.rollback()
+        message = "关注保存失败，请稍后重试"
+        if request.headers.get("x-requested-with") == "fetch":
+            return JSONResponse({"ok": False, "message": message}, status_code=503)
+        return RedirectResponse(f"{_return_path(return_to)}?error={quote(message)}", status_code=303)
+    if request.headers.get("x-requested-with") == "fetch":
+        return JSONResponse({"ok": True, "message": "已关注"})
     return RedirectResponse(_return_path(return_to), status_code=303)
+
+
+@app.post("/watched-products/{product_id}/remove")
+def watched_products_remove(
+    request: Request, product_id: int, return_to: str = Form("/watched-products"),
+    db: Session = Depends(get_db),
+):
+    try:
+        removed = remove_watch(db, product_id)
+    except SQLAlchemyError:
+        db.rollback()
+        message = "取消关注失败，请稍后重试"
+        if request.headers.get("x-requested-with") == "fetch":
+            return JSONResponse({"ok": False, "message": message}, status_code=503)
+        return RedirectResponse(f"{_return_path(return_to)}?error={quote(message)}", status_code=303)
+    message = "已取消关注" if removed else "当前未关注"
+    if request.headers.get("x-requested-with") == "fetch":
+        return JSONResponse({"ok": True, "message": message})
+    return RedirectResponse(f"{_return_path(return_to)}?message={quote(message)}", status_code=303)
 
 
 @app.post("/watched-products/{product_id}/update")
@@ -1718,7 +2939,7 @@ def product_detail(product_id: int, request: Request, db: Session = Depends(get_
     if not product:
         raise HTTPException(404, "商品不存在")
     rows = db.execute(
-        select(ReceiptItem, Receipt, ReceiptBatch, ReceiptImage)
+        select(ReceiptItem, Receipt, ReceiptBatch, ReceiptImage, PurchaseBatchItem, PurchaseBatch)
         .join(Receipt, Receipt.id == ReceiptItem.receipt_id)
         .join(ReceiptBatch, ReceiptBatch.id == Receipt.batch_id)
         .outerjoin(PurchaseBatchItem, PurchaseBatchItem.receipt_item_id == ReceiptItem.id)
@@ -1737,13 +2958,13 @@ def product_detail(product_id: int, request: Request, db: Session = Depends(get_
     latest_fact = max(facts, key=lambda fact: (fact.batch.purchased_at or fact.batch.confirmed_at, fact.item.id), default=None)
     legacy_prices = []
     if not facts:
-        for item, _, _, _ in rows:
+        for item, _, _, _, _, _ in rows:
             amount = item.line_total if item.line_total is not None else (item.unit_price * item.quantity - item.discount_amount if item.unit_price is not None else None)
             if amount is not None:
                 legacy_prices.append(Decimal(amount) / item.quantity)
     stats = {
         "count": len({fact.batch.id for fact in facts}) if facts else len(rows),
-        "quantity": sum(fact.item.quantity for fact in facts) if facts else sum(item.quantity for item, _, _, _ in rows),
+        "quantity": sum(fact.item.quantity for fact in facts) if facts else sum(item.quantity for item, _, _, _, _, _ in rows),
         "latest_price": latest_fact.reference_unit_price if latest_fact else (legacy_prices[0] if legacy_prices else None),
         "latest_date": latest_fact.batch.purchased_at if latest_fact else (rows[0][1].purchased_at if rows else None),
         "minimum_price": min(prices) if prices else (min(legacy_prices) if legacy_prices else None),
@@ -1805,33 +3026,134 @@ def product_detail(product_id: int, request: Request, db: Session = Depends(get_
         "purchase_assistance": purchase_assistance(db, product, inventory=inventory),
         "inventory_status_labels": INVENTORY_STATUS_LABELS,
         "inventory_settings": inventory_settings(),
+        "product_status_labels": {
+            "active": "普通商品",
+            "new_pending_completion": "新商品待补全",
+            "new_pending_review": "新商品待人工确认",
+            "pending_qinsi_product_import": "待导入秦丝商品库",
+            "qinsi_product_imported": "已导入秦丝商品库",
+            "archived": "已停用/归档",
+        },
+        "editable_product_statuses": EDITABLE_PRODUCT_STATUSES,
+        "associations": product_associations(db, product),
+        "operation_logs": product.operation_logs[:10],
         "saved": request.query_params.get("saved"), "error": request.query_params.get("error"),
+        "message": request.query_params.get("message"),
+        "product_display_label": product_display_label,
+        "is_missing_chinese_name": is_missing_chinese_name,
     })
 
 
 @app.post("/products/{product_id}")
 def update_product_page(
-    product_id: int, name_cn: str = Form(...), name_ja: str = Form(""), jan: str | None = Form(None),
-    qinsi_product_code: str | None = Form(None), db: Session = Depends(get_db),
+    product_id: int,
+    name_cn: str = Form(""),
+    name_ja: str = Form(""),
+    jan: str | None = Form(None),
+    main_image_source_url: str = Form(""),
+    purchase_price: str = Form(""),
+    status: str = Form("active"),
+    actor: str = Form("人工操作"),
+    reason: str = Form(""),
+    db: Session = Depends(get_db),
 ):
     product = db.get(Product, product_id)
     if not product:
         raise HTTPException(404, "商品不存在")
     try:
-        update_product_identifiers(db, product, jan=jan, qinsi_product_code=qinsi_product_code)
-        product.name_cn = normalize_product_name(name_cn, "中文名") or product.name_cn
-        product.name_ja = normalize_product_name(name_ja, "日文名") or product.name_ja
-        product.display_name = format_product_display_name(product.name_cn, product.name_ja)
-        product.product_data_confirmed = True
-        product.name_locked = True
-        db.commit()
+        update_product_master(
+            db,
+            product,
+            name_cn=name_cn,
+            name_ja=name_ja,
+            jan=jan,
+            image_url=main_image_source_url,
+            purchase_price=purchase_price,
+            status=status,
+            actor=actor,
+            reason=reason,
+        )
     except ValueError as exc:
         db.rollback()
         return RedirectResponse(f"/products/{product_id}?error={quote(str(exc))}", status_code=303)
     except IntegrityError:
         db.rollback()
         return RedirectResponse(f"/products/{product_id}?error={quote('JAN或秦丝商品编码已存在，不能重复保存')}", status_code=303)
+    if main_image_source_url.strip():
+        wake_image_localization_worker()
     return RedirectResponse(f"/products/{product_id}?saved=1", status_code=303)
+
+
+@app.post("/products/{product_id}/redownload-image")
+def product_redownload_image(product_id: int, db: Session = Depends(get_db)):
+    product = db.get(Product, product_id)
+    if not product:
+        raise HTTPException(404, "商品不存在")
+    job = queue_product_image_localization(db, product, force_retry=True)
+    if job is None:
+        return RedirectResponse(
+            f"/products/{product_id}?error={quote('没有可下载的线上主图URL')}",
+            status_code=303,
+        )
+    db.commit()
+    wake_image_localization_worker()
+    return RedirectResponse(
+        f"/products/{product_id}?message={quote('已加入图片重新下载队列')}",
+        status_code=303,
+    )
+
+
+@app.post("/products/{product_id}/archive")
+def product_archive_page(
+    product_id: int,
+    actor: str = Form("人工操作"),
+    reason: str = Form(""),
+    return_to: str = Form(""),
+    db: Session = Depends(get_db),
+):
+    product = db.get(Product, product_id)
+    if not product:
+        raise HTTPException(404, "商品不存在")
+    archive_product(db, product, actor=actor, reason=reason)
+    target = return_to if return_to.startswith("/") and not return_to.startswith("//") else f"/products/{product_id}"
+    return RedirectResponse(f"{target}?message={quote('商品已停用/归档')}", status_code=303)
+
+
+@app.post("/products/{product_id}/restore")
+def product_restore_page(
+    product_id: int,
+    actor: str = Form("人工操作"),
+    reason: str = Form(""),
+    return_to: str = Form(""),
+    db: Session = Depends(get_db),
+):
+    product = db.get(Product, product_id)
+    if not product:
+        raise HTTPException(404, "商品不存在")
+    restore_product(db, product, actor=actor, reason=reason)
+    target = return_to if return_to.startswith("/") and not return_to.startswith("//") else f"/products/{product_id}"
+    return RedirectResponse(f"{target}?message={quote('商品已恢复启用')}", status_code=303)
+
+
+@app.post("/products/{product_id}/delete")
+def product_delete_page(
+    product_id: int,
+    actor: str = Form("人工操作"),
+    reason: str = Form(""),
+    confirm_delete: str = Form(""),
+    db: Session = Depends(get_db),
+):
+    product = db.get(Product, product_id)
+    if not product:
+        raise HTTPException(404, "商品不存在")
+    if confirm_delete != "1":
+        return RedirectResponse(f"/products/{product_id}?error={quote('请二次确认后再删除商品')}", status_code=303)
+    try:
+        delete_product_if_allowed(db, product, actor=actor, reason=reason)
+    except ValueError as exc:
+        db.rollback()
+        return RedirectResponse(f"/products/{product_id}?error={quote(str(exc))}", status_code=303)
+    return RedirectResponse(f"/products?message={quote('商品已物理删除')}", status_code=303)
 
 
 @app.post("/products/{product_id}/inventory-settings")
@@ -1866,18 +3188,26 @@ def api_update_product(product_id: int, data: ProductUpdateInput, db: Session = 
         raise HTTPException(404, "商品不存在")
     fields = data.model_fields_set
     try:
-        update_product_identifiers(
-            db, product,
+        if "qinsi_product_code" in fields:
+            update_product_identifiers(
+                db, product,
+                jan=data.jan if "jan" in fields else product.jan,
+                qinsi_product_code=data.qinsi_product_code,
+            )
+        update_product_master(
+            db,
+            product,
+            name_cn=data.name_cn if "name_cn" in fields else product.name_cn,
+            name_ja=data.name_ja if "name_ja" in fields else product.name_ja,
             jan=data.jan if "jan" in fields else product.jan,
-            qinsi_product_code=data.qinsi_product_code if "qinsi_product_code" in fields else product.qinsi_product_code,
+            image_url=data.main_image_source_url if "main_image_source_url" in fields else product.main_image_source_url,
+            purchase_price=data.purchase_price if "purchase_price" in fields else product.purchase_price,
+            status=data.status if "status" in fields and data.status else product.status,
+            actor="API",
+            reason="api_update",
         )
-        if "name_cn" in fields and data.name_cn:
-            product.name_cn = data.name_cn
-            product.display_name = format_product_display_name(product.name_cn, product.name_ja)
-            product.product_data_confirmed = True
-            product.name_locked = True
-        db.commit()
-        db.refresh(product)
+        if product.main_image_source_url:
+            wake_image_localization_worker()
         return product
     except ValueError as exc:
         db.rollback()

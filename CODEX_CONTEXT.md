@@ -7,7 +7,7 @@
 - 开发端口：`8020`
 - 定位：日本实体采购辅助系统；秦丝负责销售与实时可售库存。
 - 数据：项目独立 SQLite；Excel 仅用于导入、导出和字段参考。
-- 当前 migration head：`20260717_0018`
+- 当前 migration head：`20260722_0024`
 
 ## 核心业务流程
 
@@ -46,13 +46,18 @@
 - 小票服务：`app/services.py`
 - 商品身份/匹配：`app/product_identity.py`、`app/product_matching.py`
 - 采购/位置：`app/purchase_service.py`、`app/location_service.py`
-- 秦丝：`app/qinsi_import.py`、`app/qinsi_export.py`
+- 秦丝：`app/qinsi_goods_import.py`、`app/qinsi_import.py`、`app/qinsi_export.py`
 - 在线查价：`app/price_providers.py`、`app/price_service.py`
 - 商品丰富化：`app/product_enrichment.py`
 - 关注商品：`app/watch_service.py`
 - 价格监控与通知：`app/monitor_service.py`、`app/monitor_scheduler.py`
 - 秦丝库存快照与采购辅助：`app/qinsi_inventory.py`
 - 补货清单：`app/restock_service.py`
+- 现场采购/离线幂等/可恢复任务：`app/field_purchase.py`
+- 平台配置状态：`app/provider_config.py`
+- 本地 JAN 统一解析与秦丝货号派生别名：`app/local_product.py`
+- JAN 治理报告：`app/jan_governance.py`、`scripts/generate_jan_governance_report.py`
+- 秦丝商品图片本地化：`app/product_image_localization.py`
 - 页面与样式：`app/templates/`、`app/static/app.css`
 - migration：`migrations/versions/`
 - 测试：`tests/`
@@ -72,6 +77,22 @@
 - `JBA_QINSI_SNAPSHOT_EXTENSIONS`：允许扩展名，默认 `.xlsx`。
 - `JBA_QINSI_REUSE_DUPLICATE_FILE`：重复哈希复用原快照，默认启用。
 - `JBA_PURCHASE_ASSISTANCE_ENABLED`：采购辅助提示，默认启用。
+
+## 现场采购与平台配置
+
+- 现场入口：`/field-purchase`；先查 `product_barcodes/products`，不等待 OCR、AI 或平台。
+- JAN 解析状态统一为 `UNIQUE`、`NOT_FOUND`、`AMBIGUOUS`；多匹配必须人工选择或暂存审核。
+- 图片本地化任务只保存文件到 `data/products/qinsi-localized/`，页面优先本地图；现场仅缓存已扫商品或当前采购批次。
+- 手机草稿和图片任务先写 IndexedDB；服务端用 `client_request_id` 幂等。
+- 吊牌证据保存在 `data/field-purchases/tag-evidence/`，该目录被 Git 忽略。
+- 数据库任务支持 pending/running 回收与重启恢复；审核入口：`/tasks`。
+- Provider 凭证统一列在 `.env.example`；平台状态入口：`/platform-config`，不回显完整 Key。
+- 现场批次门店可稍后补充；未填写时保持 `NULL`，不创建虚假门店。
+- 2026-07-26 集中修复后：`/field-purchase` 无 batch_id 时默认使用最近 active 批次，避免页头和主体批次源不一致；前端使用 `deriveNextItemState()` 统一下一件条件。
+- 吊牌照片在 iPhone 返回网页后先写 IndexedDB，本地成功独立于服务器同步；安全诊断仅记录文件名、MIME、大小、读取/预览/IndexedDB/sync 状态和错误，不输出图片内容。
+- 本地 JAN 查询有 10 秒前端硬超时、request generation/AbortController 防旧响应覆盖；失败显示可重试，不显示新品表单。
+- Rakuten 默认只启用 Item Search `keyword=JAN`；Product Search 是显式配置能力。429 进入 cooldown 语义并不立即重试，403 是认证/权限错误，0 条是正常空结果。
+- `/tasks` 和导航已补小票记录入口；小票详情展示真实商品行，商品详情展示真实来源小票和对应采购批次。未匹配行保持未匹配，不按名称猜测回填。
 
 ## 禁止修改范围
 

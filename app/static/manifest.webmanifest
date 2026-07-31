@@ -1,0 +1,11 @@
+{
+  "name": "Japan Buying Agent",
+  "short_name": "JBA采购",
+  "lang": "zh-CN",
+  "start_url": "/field-purchase",
+  "scope": "/",
+  "display": "standalone",
+  "background_color": "#f4f7f6",
+  "theme_color": "#0b5d4b",
+  "description": "日本现场采购、离线草稿与商品补全"
+}

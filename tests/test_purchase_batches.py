@@ -50,7 +50,7 @@ def test_confirmation_creates_one_batch_and_one_detail_per_receipt_item_with_def
     assert [detail.receipt_item_id for detail in details] == [item.id for item in receipt.items]
     assert [detail.product_id for detail in details] == [product.id for product in products]
     assert all(detail.initial_location_id == locations["日本家里库存"].id for detail in details)
-    assert details[0].qinsi_target_warehouse_id == locations["日本家里库存"].id
+    assert details[0].qinsi_target_warehouse_id == locations["新日本仓库"].id
     assert details[1].qinsi_target_warehouse_id == locations["无条码商品"].id
     assert (details[0].quantity, details[0].unit_price, details[0].discount_amount, details[0].actual_line_amount) == (1, 100, 10, 90)
 

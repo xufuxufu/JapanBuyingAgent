@@ -1,17 +1,22 @@
 from __future__ import annotations
 
 import json
+import logging
 import re
+import threading
+from concurrent.futures import Future, TimeoutError as FutureTimeoutError
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+from decimal import Decimal, ROUND_HALF_UP
 
 import httpx
 from sqlalchemy import select
 from sqlalchemy.orm import Session, selectinload
 
+from app.local_product import resolve_local_product_by_jan
 from app.models import (
-    Marketplace, PriceLookupHistory, PriceProviderAttempt, PriceSearchRun,
-    Product, ProductOffer, PurchaseBatch, PurchaseBatchItem,
+    Marketplace, PlatformLookupResult, PlatformProviderState, PriceLookupHistory, PriceProviderAttempt, PriceSearchRun,
+    Product, ProductOffer, PurchaseBatch, PurchaseBatchItem, Receipt, Store,
 )
 from app.price_providers import PriceCandidate, PriceProvider, ProviderResponse, get_default_price_providers
 from app.product_identity import format_product_display_name
@@ -28,6 +33,9 @@ PROVIDER_SUMMARY_KEYS = {
     "brand", "brandName", "manufacturer", "maker", "category", "categoryName",
     "model", "modelNumber", "color", "capacity", "size", "janCode", "shopName", "seller",
 }
+PROVIDER_INFLIGHT_LOCK = threading.Lock()
+PROVIDER_INFLIGHT: dict[tuple[str, str], Future[ProviderResponse]] = {}
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True, slots=True)
@@ -36,9 +44,14 @@ class PriceLookupView:
     run: PriceSearchRun
     product: Product | None
     product_display_name: str | None
-    recent_purchase_price: int | None
+    recent_purchase_price: int | Decimal | None
+    historical_lowest_purchase_price: int | Decimal | None
+    latest_purchase_store_name: str | None
+    latest_purchase_store_address: str | None
     trusted_offers: tuple[ProductOffer, ...]
+    incomplete_offers: tuple[ProductOffer, ...]
     flagged_offers: tuple[ProductOffer, ...]
+    fallback_results: tuple[PlatformLookupResult, ...]
     attempts: tuple[PriceProviderAttempt, ...]
     current_store_price: int | None
     online_min_price: int | None
@@ -61,6 +74,38 @@ def _marketplace(session: Session, provider: PriceProvider) -> Marketplace:
     return marketplace
 
 
+def _record_provider_state(
+    session: Session,
+    provider: PriceProvider,
+    response: ProviderResponse,
+    *,
+    tested_at: datetime,
+) -> PlatformProviderState:
+    state = session.scalar(
+        select(PlatformProviderState).where(PlatformProviderState.provider_code == provider.code)
+    )
+    if state is None:
+        state = PlatformProviderState(provider_code=provider.code)
+        session.add(state)
+    state.configured = provider.is_configured()
+    state.request_count = (state.request_count or 0) + 1
+    state.last_tested_at = tested_at
+    if response.status == "success":
+        state.credentials_valid = True
+        state.last_success_at = tested_at
+        state.recent_error = None
+    elif response.status == "unconfigured":
+        state.credentials_valid = None
+        state.recent_error = "UNCONFIGURED"
+    elif response.status in {"error", "timeout"}:
+        if response.error_code == "AUTH_FAILED":
+            state.credentials_valid = False
+        state.recent_error = response.error_code or response.status.upper()
+    else:
+        state.recent_error = response.error_code
+    return state
+
+
 def _spec_tokens(value: str | None) -> set[str]:
     return {f"{number.lower()}{unit.lower()}" for number, unit in SPEC_PATTERN.findall(value or "")}
 
@@ -80,11 +125,11 @@ def _spec_status(product: Product | None, candidate: PriceCandidate) -> str:
 
 def _offer_quality(jan: str, product: Product | None, candidate: PriceCandidate) -> tuple[str, str, bool, list[str]]:
     reasons: list[str] = []
-    if candidate.jan == jan:
+    if candidate.jan == jan and candidate.jan_verified:
         jan_status = "exact"
     elif candidate.jan:
-        jan_status = "mismatch"
-        reasons.append("JAN 不一致")
+        jan_status = "mismatch" if candidate.jan != jan else "unverified"
+        reasons.append("JAN 不一致" if candidate.jan != jan else "JAN 未验证")
     else:
         jan_status = "unverified"
         reasons.append("JAN 未验证")
@@ -99,11 +144,38 @@ def _offer_quality(jan: str, product: Product | None, candidate: PriceCandidate)
     spec_status = _spec_status(product, candidate)
     if spec_status == "suspected_mismatch":
         reasons.append("数量或容量疑似不同")
-    if not candidate.shipping_known:
-        reasons.append("运费未知")
     if candidate.item_price <= 0:
         reasons.append("商品价格无效")
+    if candidate.link_type != "product":
+        reasons.append("搜索页不是商品详情页")
     return jan_status, spec_status, subscription, reasons
+
+
+def _compact_text(value: str | None) -> str:
+    return re.sub(r"[\W_]+", "", (value or "").casefold())
+
+
+def _dedupe_candidates(provider_code: str, candidates: tuple[PriceCandidate, ...]) -> tuple[PriceCandidate, ...]:
+    seen: set[tuple[str, str, str]] = set()
+    output: list[PriceCandidate] = []
+    for candidate in candidates:
+        key = (
+            provider_code,
+            (candidate.url or "").split("#", 1)[0].rstrip("/"),
+            _compact_text(candidate.seller),
+        )
+        title_key = (
+            provider_code,
+            _compact_text(candidate.title),
+            _compact_text(candidate.seller),
+            str(candidate.item_price),
+        )
+        if key in seen or title_key in seen:
+            continue
+        seen.add(key)
+        seen.add(title_key)
+        output.append(candidate)
+    return tuple(output)
 
 
 def _provider_summary(raw_data: dict) -> dict[str, object]:
@@ -128,6 +200,58 @@ def _latest_purchase_price(session: Session, product: Product | None) -> int | N
         .limit(1)
     )
     return latest if latest is not None else product.purchase_price
+
+
+def _purchase_history_summary(session: Session, product: Product | None) -> dict[str, object]:
+    if product is None:
+        return {"lowest": None, "latest_price": None, "store_name": None, "store_address": None}
+    rows = list(session.execute(
+        select(
+            PurchaseBatchItem.actual_line_amount,
+            PurchaseBatchItem.quantity,
+            PurchaseBatch.store_name,
+            PurchaseBatch.purchased_at,
+            PurchaseBatch.confirmed_at,
+            PurchaseBatchItem.id,
+            Store.name_cn,
+            Store.name_ja,
+            Store.address,
+            Receipt.raw_store_address,
+        )
+        .join(PurchaseBatch, PurchaseBatch.id == PurchaseBatchItem.purchase_batch_id)
+        .join(Receipt, Receipt.id == PurchaseBatch.receipt_id)
+        .outerjoin(Store, Store.id == PurchaseBatch.store_id)
+        .where(
+            PurchaseBatchItem.product_id == product.id,
+            PurchaseBatchItem.actual_line_amount.is_not(None),
+            PurchaseBatchItem.quantity > 0,
+            Receipt.confirmation_status == "confirmed",
+            PurchaseBatch.status != "cancelled",
+        )
+        .order_by(PurchaseBatch.purchased_at.desc(), PurchaseBatch.confirmed_at.desc(), PurchaseBatchItem.id.desc())
+    ).all())
+    if not rows:
+        return {"lowest": None, "latest_price": None, "store_name": None, "store_address": None}
+
+    def actual_unit_price(row) -> int | Decimal:
+        value = (Decimal(row.actual_line_amount) / Decimal(row.quantity)).quantize(
+            Decimal("0.01"), rounding=ROUND_HALF_UP,
+        )
+        return int(value) if value == value.to_integral_value() else value
+
+    latest = rows[0]
+    prices = [actual_unit_price(row) for row in rows]
+    latest_price = prices[0]
+    raw_store = latest.store_name
+    store_name_cn = latest.name_cn
+    store_name_ja = latest.name_ja
+    store_name = "｜".join(part for part in (store_name_cn, store_name_ja) if part) or None
+    return {
+        "lowest": min(prices),
+        "latest_price": latest_price,
+        "store_name": store_name or raw_store,
+        "store_address": latest.address or latest.raw_store_address,
+    }
 
 
 def _history(
@@ -163,6 +287,38 @@ def _cached_run(session: Session, jan: str, now: datetime) -> PriceSearchRun | N
     return next((run for run in runs if _utc(run.cache_expires_at) and _utc(run.cache_expires_at) > now), None)
 
 
+def _provider_request_id(provider: PriceProvider, jan: str, started_at: datetime) -> str:
+    return f"{provider.code}:{jan}:{int(started_at.timestamp() * 1000)}"
+
+
+def _search_provider_coalesced(provider: PriceProvider, jan: str, timeout_seconds: float) -> ProviderResponse:
+    key = (provider.code, jan)
+    owner = False
+    with PROVIDER_INFLIGHT_LOCK:
+        future = PROVIDER_INFLIGHT.get(key)
+        if future is None:
+            future = Future()
+            PROVIDER_INFLIGHT[key] = future
+            owner = True
+    if owner:
+        try:
+            response = provider.search(jan, timeout_seconds)
+        except BaseException as exc:
+            future.set_exception(exc)
+            raise
+        else:
+            future.set_result(response)
+            return response
+        finally:
+            with PROVIDER_INFLIGHT_LOCK:
+                if PROVIDER_INFLIGHT.get(key) is future:
+                    del PROVIDER_INFLIGHT[key]
+    try:
+        return future.result(timeout=max(timeout_seconds + 1.0, 1.0))
+    except FutureTimeoutError as exc:
+        raise TimeoutError(f"{provider.display_name} in-flight request timed out") from exc
+
+
 def _trigger_enrichment_for_lookup(session: Session, jan: str, history_id: int) -> None:
     try:
         from app.product_enrichment import attach_lookup_source, ensure_enrichment_task, process_enrichment_task
@@ -185,14 +341,31 @@ def query_prices(
     now: datetime | None = None,
     lookup_source: str = "manual",
     provider_timeout_seconds: float = PROVIDER_TIMEOUT_SECONDS,
+    trigger_enrichment: bool = True,
 ) -> PriceLookupView:
     now = now or datetime.now(timezone.utc)
-    product = session.scalar(select(Product).where(Product.jan == lookup.jan))
+    local_resolution = resolve_local_product_by_jan(session, lookup.jan)
+    if local_resolution.is_conflict:
+        candidates = "、".join(
+            f"{product.display_name or product.name_cn or product.name_ja or product.internal_sku}"
+            f"（{product.specification or product.model_spec or '规格未填'}；"
+            f"秦丝货号 {product.qinsi_product_code or '—'}）"
+            for product in local_resolution.candidate_products
+        )
+        raise ValueError(f"JAN 多匹配，已禁止查价自动选品：{candidates}")
+    product = local_resolution.product
     if not lookup.force_refresh:
         cached = _cached_run(session, lookup.jan, now)
         if cached is not None:
+            if product is not None and cached.product_id != product.id:
+                cached.product = product
+                cached.product_id = product.id
+                cached.is_new_candidate = False
+                for offer in cached.offers:
+                    offer.product = product
+                    offer.product_id = product.id
             history = _history(session, cached, lookup, True, lookup_source)
-            if product is None:
+            if product is None and trigger_enrichment:
                 _trigger_enrichment_for_lookup(session, lookup.jan, history.id)
             return build_lookup_view(session, history.id)
 
@@ -210,8 +383,13 @@ def query_prices(
     for provider in providers if providers is not None else get_default_price_providers():
         marketplace = _marketplace(session, provider)
         started_at = datetime.now(timezone.utc)
+        request_id = _provider_request_id(provider, lookup.jan, started_at)
         try:
-            response = provider.search(lookup.jan, provider_timeout_seconds)
+            logger.info(
+                "price_provider_request provider=%s endpoint=search request_id=%s jan=%s cache=miss",
+                provider.code, request_id, lookup.jan,
+            )
+            response = _search_provider_coalesced(provider, lookup.jan, provider_timeout_seconds)
             if response.status == "success" and not response.offers:
                 response = ProviderResponse("empty", message="Provider 返回空结果")
         except (httpx.TimeoutException, TimeoutError):
@@ -219,6 +397,13 @@ def query_prices(
         except Exception as exc:
             response = ProviderResponse("error", message=f"{provider.display_name} 查询失败：{type(exc).__name__}")
         completed_at = datetime.now(timezone.utc)
+        elapsed_ms = int((completed_at - started_at).total_seconds() * 1000)
+        logger.info(
+            "price_provider_result provider=%s endpoint=search request_id=%s jan=%s http_status=%r elapsed_ms=%s status=%s error_code=%r",
+            provider.code, request_id, lookup.jan, response.http_status, elapsed_ms,
+            response.status, response.error_code,
+        )
+        _record_provider_state(session, provider, response, tested_at=completed_at)
         attempt = PriceProviderAttempt(
             search_run_id=run.id,
             marketplace_id=marketplace.id,
@@ -231,9 +416,44 @@ def query_prices(
         )
         session.add(attempt)
         summary[provider.code] = {"status": attempt.status, "count": attempt.result_count, "message": attempt.message}
-        for candidate in response.offers:
+        if response.search_url and response.status != "success":
+            session.add(PlatformLookupResult(
+                price_search_run_id=run.id,
+                platform=provider.code,
+                jan=lookup.jan,
+                product_url=response.search_url,
+                link_type="search",
+                jan_verified=False,
+                match_type="SEARCH_ONLY",
+                confidence=0,
+                fetched_at=completed_at,
+                error_code=response.error_code or response.status.upper(),
+            ))
+        for candidate in _dedupe_candidates(provider.code, response.offers):
             jan_status, spec_status, subscription, reasons = _offer_quality(lookup.jan, product, candidate)
             total_price = candidate.item_price + candidate.shipping_price
+            unified = candidate.unified(provider.code)
+            session.add(PlatformLookupResult(
+                price_search_run_id=run.id,
+                platform=provider.code,
+                jan=candidate.jan,
+                title=candidate.title or None,
+                brand=candidate.brand,
+                price=unified["price"],
+                shipping_fee=unified["shipping_fee"],
+                total_price=unified["total_price"],
+                currency=candidate.currency,
+                availability=candidate.stock_status,
+                seller=candidate.seller,
+                product_url=candidate.url or None,
+                image_url=candidate.image_url,
+                link_type=candidate.link_type,
+                jan_verified=candidate.jan == lookup.jan and candidate.jan_verified,
+                match_type=candidate.match_type,
+                confidence=candidate.confidence,
+                fetched_at=candidate.fetched_at or completed_at,
+                error_code=candidate.error_code,
+            ))
             session.add(ProductOffer(
                 search_run_id=run.id,
                 marketplace_id=marketplace.id,
@@ -247,6 +467,7 @@ def query_prices(
                 shipping_price=candidate.shipping_price,
                 shipping_known=candidate.shipping_known,
                 total_price=total_price,
+                currency=candidate.currency,
                 stock_status=candidate.stock_status,
                 listing_type=candidate.listing_type,
                 condition=candidate.condition,
@@ -257,14 +478,25 @@ def query_prices(
                 is_trusted=not reasons,
                 exclusion_reason="；".join(reasons) if reasons else None,
                 fetched_at=completed_at,
-                raw_data_json=json.dumps(_provider_summary(candidate.raw_data), ensure_ascii=False, default=str),
+                raw_data_json=json.dumps(
+                    {
+                        **_provider_summary(candidate.raw_data),
+                        "link_type": candidate.link_type,
+                        "jan_verified": candidate.jan_verified,
+                        "match_type": candidate.match_type,
+                        "confidence": candidate.confidence,
+                        "error_code": candidate.error_code,
+                    },
+                    ensure_ascii=False,
+                    default=str,
+                ),
             ))
     run.status = "completed"
     run.completed_at = datetime.now(timezone.utc)
     run.provider_summary_json = json.dumps(summary, ensure_ascii=False)
     session.commit()
     history = _history(session, run, lookup, False, lookup_source)
-    if product is None:
+    if product is None and trigger_enrichment:
         _trigger_enrichment_for_lookup(session, lookup.jan, history.id)
     return build_lookup_view(session, history.id)
 
@@ -278,27 +510,52 @@ def build_lookup_view(session: Session, history_id: int) -> PriceLookupView:
             selectinload(PriceLookupHistory.search_run).selectinload(PriceSearchRun.product),
             selectinload(PriceLookupHistory.search_run).selectinload(PriceSearchRun.offers).selectinload(ProductOffer.marketplace),
             selectinload(PriceLookupHistory.search_run).selectinload(PriceSearchRun.provider_attempts),
+            selectinload(PriceLookupHistory.search_run).selectinload(PriceSearchRun.platform_results),
         )
     )
     if history is None:
         raise LookupError("查价历史不存在")
     run = history.search_run
     product = run.product
-    trusted = tuple(sorted((offer for offer in run.offers if offer.is_trusted), key=lambda item: (item.total_price, item.item_price, item.id))[:MAX_TRUSTED_RESULTS])
-    flagged = tuple(sorted((offer for offer in run.offers if not offer.is_trusted), key=lambda item: (item.total_price, item.id)))
+    def offer_sort_key(offer: ProductOffer) -> tuple[int, int, int]:
+        return (offer.total_price or 10**12, offer.item_price or 10**12, offer.id)
+
+    trusted = tuple(sorted((
+        offer for offer in run.offers
+        if offer.is_trusted and offer.shipping_known and offer.stock_status in {"in_stock", "limited"}
+    ), key=offer_sort_key)[:MAX_TRUSTED_RESULTS])
+    trusted_ids = {offer.id for offer in trusted}
+    incomplete = tuple(sorted((
+        offer for offer in run.offers
+        if offer.is_trusted
+        and offer.id not in trusted_ids
+        and (
+            not offer.shipping_known
+            or offer.stock_status == "unknown"
+            or offer.jan_match_status != "exact"
+            or offer.spec_match_status == "unknown"
+        )
+    ), key=offer_sort_key))
+    flagged = tuple(sorted((offer for offer in run.offers if not offer.is_trusted), key=offer_sort_key))
     online_min = trusted[0].total_price if trusted else None
     difference = history.current_store_price - online_min if history.current_store_price is not None and online_min is not None else None
     comparison = None
     if difference is not None:
         comparison = "store_cheaper" if difference < 0 else ("online_cheaper" if difference > 0 else "same")
+    purchase_history = _purchase_history_summary(session, product)
     return PriceLookupView(
         history=history,
         run=run,
         product=product,
         product_display_name=format_product_display_name(product.name_cn, product.name_ja) if product else None,
-        recent_purchase_price=_latest_purchase_price(session, product),
+        recent_purchase_price=purchase_history["latest_price"],
+        historical_lowest_purchase_price=purchase_history["lowest"],
+        latest_purchase_store_name=purchase_history["store_name"],
+        latest_purchase_store_address=purchase_history["store_address"],
         trusted_offers=trusted,
+        incomplete_offers=incomplete,
         flagged_offers=flagged,
+        fallback_results=tuple(item for item in run.platform_results if item.link_type == "search"),
         attempts=tuple(run.provider_attempts),
         current_store_price=history.current_store_price,
         online_min_price=online_min,

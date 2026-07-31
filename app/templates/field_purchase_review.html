@@ -1,0 +1,96 @@
+{% extends "base.html" %}
+{% block title %}现场草稿审核 · Japan Buying Agent{% endblock %}
+{% block content %}
+<div class="section-head"><div><h1>{{ item.jan or ('草稿 #' ~ item.temporary_id[-6:]) }}</h1><p class="muted">{{ item.batch.batch_no }} · {{ item.batch.store.display_name if item.batch.store else '未填写门店' }} · {{ item.captured_by }} · ×{{ item.quantity }}{% if not item.jan %} · 内部草稿编号，不是 JAN/SKU{% endif %}</p></div><a class="button secondary" href="/product-enrichment">返回待补全</a></div>
+{% if error %}<div class="error">{{ error }}</div>{% endif %}
+<section class="review-layout field-review-layout">
+  <div>
+    <section class="card">
+      <h2>采购批次门店</h2>
+      <form method="post" action="/field-purchase/batches/{{ item.batch.id }}/store" class="form-grid">
+        <input type="hidden" name="return_to" value="/field-purchase/items/{{ item.id }}/review">
+        <label class="full">门店（可稍后补充）
+          <select name="store_id">
+            <option value="">未填写</option>
+            {% for store in stores %}<option value="{{ store.id }}"{% if item.batch.store_id == store.id %} selected{% endif %}>{{ store.display_name }}</option>{% endfor %}
+          </select>
+        </label>
+        <button class="full secondary" type="submit">保存门店</button>
+      </form>
+    </section>
+    <section class="card">
+      <h2>人工资料</h2>
+      {% if not item.jan %}
+      <form class="form-grid" method="post" action="/field-purchase/items/{{ item.id }}/jan">
+        <label>后续取得的 JAN<input name="jan" inputmode="numeric" pattern="[0-9]*" maxlength="13" required></label>
+        <input type="hidden" name="actor" value="人工审核">
+        <button type="submit">合并 JAN，不重复建品</button>
+      </form>
+      {% endif %}
+      <form class="form-grid" method="post" action="/field-purchase/items/{{ item.id }}/review" enctype="multipart/form-data">
+        <label>中文名<input name="name_cn" maxlength="128" value="{{ item.name_cn or '' }}"></label>
+        <label>日文名<input name="name_ja" maxlength="128" value="{{ item.name_ja or '' }}"></label>
+        <label>采购价（日元）<input name="unit_price" type="number" min="0" value="{{ item.unit_price if item.unit_price is not none else '' }}"></label>
+        <label>品牌<input name="brand" maxlength="128" value="{{ item.brand or '' }}"></label>
+        <label>分类<input name="category" maxlength="128" value="{{ item.category or '' }}"></label>
+        <label>单位<input name="unit_name" maxlength="128" value="{{ item.unit_name or '' }}"></label>
+        <label class="full">商品照片（可后补）<input name="product_image" type="file" accept="image/jpeg,image/png,image/webp,image/heic,image/heif"></label>
+        <label class="full">审核人<input name="actor" maxlength="128" value="人工审核"></label>
+        <button class="full" type="submit">保存人工修改</button>
+      </form>
+      <form method="post" action="/field-purchase/items/{{ item.id }}/confirm"><input type="hidden" name="actor" value="人工审核"><button type="submit">确认并关联正式商品</button></form>
+    </section>
+
+    <section class="card">
+      <h2>线上资料候选</h2>
+      {% if jan_candidates %}
+      <p class="warning">此 JAN 多匹配，必须人工选择；系统不会自动选第一条或建立新品。</p>
+      <div class="candidate-grid">
+        {% for candidate in jan_candidates %}
+        <article class="card">
+          {% if candidate.preferred_image_url %}<img class="candidate-image" src="{{ candidate.preferred_image_url }}" alt="{{ candidate.display_name or candidate.internal_sku }}">{% endif %}
+          <h3>{{ candidate.display_name or candidate.name_cn or candidate.name_ja or candidate.internal_sku }}</h3>
+          <p>{{ candidate.specification or candidate.model_spec or '规格未填写' }}</p>
+          <p>秦丝货号：{{ candidate.qinsi_product_code or '—' }}</p>
+          <form method="post" action="/field-purchase/items/{{ item.id }}/bind">
+            <input type="hidden" name="product_id" value="{{ candidate.id }}">
+            <input type="hidden" name="actor" value="人工审核">
+            <button type="submit">选择此商品</button>
+          </form>
+        </article>
+        {% endfor %}
+      </div>
+      {% endif %}
+      <div class="candidate-grid">
+        {% if item.enrichment_task %}
+        {% for candidate in item.enrichment_task.candidates %}
+        <article class="card">
+          {% if candidate.image_url %}<img class="candidate-image" src="{{ candidate.image_url }}" alt="{{ candidate.name_ja or item.jan }}">{% endif %}
+          <h3>{{ candidate.name_ja or '名称待补' }}</h3>
+          <p>{{ candidate.platform }} · {{ candidate.total_price if candidate.total_price is not none else '价格未知' }}円</p>
+          <p>可信度 {{ '%.0f'|format(candidate.score * 100) }}% · {{ '已选择' if candidate.selected else '未选择' }}</p>
+          <p class="muted">{{ candidate.platform }} · {{ candidate.item_price if candidate.item_price is not none else '价格未知' }}円 · 运费{{ candidate.shipping_price if candidate.shipping_price is not none else '未知' }}</p>
+          <div class="button-row">
+            <a href="{{ candidate.source_url }}" target="_blank" rel="noreferrer">详情来源</a>
+            <form method="post" action="/field-purchase/items/{{ item.id }}/candidates/{{ candidate.id }}/select"><button type="submit" class="compact">选择写入草稿</button></form>
+            <form method="post" action="/product-enrichment/{{ item.enrichment_task.id }}/candidates/{{ candidate.id }}/reject"><input type="hidden" name="return_to" value="/field-purchase/items/{{ item.id }}/review"><button type="submit" class="secondary compact">拒绝候选</button></form>
+          </div>
+        </article>
+        {% else %}<p>暂无平台候选；可直接人工填写并确认。</p>{% endfor %}
+        {% else %}<p>无 JAN 商品不会伪造平台匹配；请人工填写。</p>{% endif %}
+      </div>
+      {% if item.enrichment_task %}<form method="post" action="/field-purchase/items/{{ item.id }}/ai-name"><button type="submit" class="secondary">AI生成中文名</button></form>{% endif %}
+    </section>
+  </div>
+  <aside class="review-images">
+    {% if item.product_image_path %}<section class="card"><h2>商品照片</h2><img src="/field-purchase/items/{{ item.id }}/image" alt="商品照片"></section>{% endif %}
+    <section class="card"><h2>吊牌证据</h2>
+      {% for evidence in item.tag_evidence %}
+      <figure><a href="/field-purchase/tag-evidence/{{ evidence.id }}" target="_blank"><img src="/field-purchase/tag-evidence/{{ evidence.id }}" alt="吊牌原图"></a><figcaption>{{ evidence.original_filename }} · OCR {{ evidence.ocr_status }}{% if evidence.ocr_confidence is not none %} · {{ '%.0f'|format(evidence.ocr_confidence * 100) }}%{% endif %}</figcaption></figure>
+      {% if evidence.ocr_text %}<details><summary>OCR 原文</summary><pre>{{ evidence.ocr_text }}</pre></details>{% else %}<p class="muted">OCR 尚未配置或未返回原文。</p>{% endif %}
+      {% else %}<p class="error">缺少吊牌证据。</p>{% endfor %}
+    </section>
+    <section class="card"><h2>审计记录</h2>{% for audit in item.audit_logs|reverse %}<p><strong>{{ audit.action }}</strong><small>{{ audit.actor }} · {{ audit.created_at|tokyo_datetime }}</small></p>{% else %}<p class="muted">暂无人工修改。</p>{% endfor %}</section>
+  </aside>
+</section>
+{% endblock %}

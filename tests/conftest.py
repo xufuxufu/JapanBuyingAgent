@@ -1,22 +1,37 @@
 from __future__ import annotations
 
 import io
+import os
+import shutil
 
 import pytest
 from fastapi.testclient import TestClient
 from PIL import Image
 from sqlalchemy.orm import sessionmaker
 
+os.environ["JBA_TESTING"] = "1"
+
 from app.db import Base, build_engine, get_db
 from app.main import app
 import app.main as main_module
 import app.services as services
+import app.field_purchase as field_purchase
+
+
+@pytest.fixture(scope="session")
+def db_template(tmp_path_factory):
+    path = tmp_path_factory.mktemp("database-template") / "schema.sqlite3"
+    engine = build_engine(f"sqlite:///{path.as_posix()}")
+    Base.metadata.create_all(engine)
+    engine.dispose()
+    return path
 
 
 @pytest.fixture
-def db_session(tmp_path):
-    engine = build_engine(f"sqlite:///{(tmp_path / 'test.sqlite3').as_posix()}")
-    Base.metadata.create_all(engine)
+def db_session(tmp_path, db_template):
+    path = tmp_path / "test.sqlite3"
+    shutil.copy2(db_template, path)
+    engine = build_engine(f"sqlite:///{path.as_posix()}")
     Session = sessionmaker(bind=engine, expire_on_commit=False)
     with Session() as session:
         yield session
@@ -33,6 +48,11 @@ def client(db_session, tmp_path, monkeypatch):
     monkeypatch.setattr(services, "ORIGINAL_DIR", original)
     monkeypatch.setattr(services, "PREVIEW_DIR", preview)
     monkeypatch.setattr(main_module, "PROJECT_ROOT", tmp_path)
+    tag_evidence = tmp_path / "field-purchases" / "tag-evidence"
+    tag_evidence.mkdir(parents=True)
+    monkeypatch.setattr(main_module, "TAG_EVIDENCE_DIR", tag_evidence)
+    monkeypatch.setattr(field_purchase, "PROJECT_ROOT", tmp_path)
+    monkeypatch.setattr(field_purchase, "TAG_EVIDENCE_DIR", tag_evidence)
 
     def override_db():
         yield db_session

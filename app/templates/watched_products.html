@@ -5,7 +5,7 @@
   <div class="watch-card-head">
     {% if group == 'recommended' %}<input type="checkbox" name="recommendation_ids" value="{{ row.recommendation.id }}" form="batch-accept">
     {% else %}<input type="checkbox" name="product_ids" value="{{ row.product.id }}" form="batch-enable">{% endif %}
-    {% if row.product.main_image_path %}<img src="/product-images/{{ row.product.id }}" alt="商品主图" loading="lazy">{% elif row.product.main_image_source_url %}<img src="{{ row.product.main_image_source_url }}" alt="商品主图" loading="lazy">{% else %}<div class="watch-image-empty">暂无图</div>{% endif %}
+    {% if row.product.preferred_image_url %}<img src="{{ row.product.preferred_image_url }}" alt="商品主图" loading="lazy">{% else %}<div class="watch-image-empty">暂无图</div>{% endif %}
     <div><h3><a href="/products/{{ row.product.id }}">{{ row.product.display_name or row.product.name_cn or row.product.name_ja or '待补商品名' }}</a></h3><p class="muted">JAN {{ row.product.jan or '—' }}</p></div>
   </div>
   <div class="watch-price-grid">

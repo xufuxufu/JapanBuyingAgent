@@ -1,0 +1,9 @@
+{% extends "base.html" %}
+{% block title %}JAN 治理 · Japan Buying Agent{% endblock %}
+{% block content %}
+<div class="section-head"><div><h1>JAN 治理</h1><p class="muted">只自动补确定的一对一 `/合法JAN` 别名；其他问题供人工在线修改秦丝。</p></div><form method="post" action="/jan-governance/export"><button type="submit">安全修复并导出 CSV</button></form></div>
+{% if message %}<div class="success message">{{ message }}</div>{% endif %}
+<section class="card table-wrap"><table><thead><tr><th>JAN</th><th>本地商品</th><th>秦丝货号</th><th>秦丝条码</th><th>冲突类型</th><th>建议 JAN</th><th>建议动作</th></tr></thead><tbody>
+{% for row in rows %}<tr><td>{{ row.jan }}</td><td>{{ row.local_product }}</td><td>{{ row.qinsi_product_code or '—' }}</td><td>{{ row.qinsi_barcode or '—' }}</td><td><span class="badge warning">{{ row.conflict_type }}</span></td><td>{{ row.suggested_jan or '—' }}</td><td>{{ row.suggested_action }}</td></tr>{% else %}<tr><td colspan="7">当前没有 JAN 冲突或异常。</td></tr>{% endfor %}
+</tbody></table></section>
+{% endblock %}

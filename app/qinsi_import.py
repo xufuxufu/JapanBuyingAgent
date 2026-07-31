@@ -36,7 +36,6 @@ HEADER_MAP = {
     "库位": "location_code",
     "状态": "status",
 }
-SUSPICIOUS_184_HEADERS = {"商品规格", "型号规格", "单位", "启用批次", "商品备注", "产地", "适用年龄", "库位"}
 PRODUCT_FIELDS = tuple(dict.fromkeys(HEADER_MAP.values()))
 
 
@@ -107,11 +106,6 @@ def _cell_value(cell: ET.Element, shared: list[str], formats: dict[int, str]) ->
     if cell_type == "s":
         try:
             resolved = shared[int(raw)]
-            # The supplied QinSi workbook contains cells encoded as shared-string
-            # index 184 whose resolved string is blank. Project analysis identifies
-            # these as the suspicious shifted value 184; retain it for quarantine.
-            if raw == "184" and resolved == "":
-                resolved = "184"
             return ParsedCell(resolved, cell_type)
         except (ValueError, IndexError) as exc:
             raise ValueError("Excel共享字符串索引损坏") from exc
@@ -174,17 +168,18 @@ def _identifier(value: str, label: str) -> str | None:
     return value
 
 
-def _money(value: str, label: str) -> int | None:
+def _money(value: str, label: str) -> Decimal | None:
     value = value.strip()
     if not value:
         return None
     try:
         number = Decimal(value.replace(",", ""))
     except InvalidOperation as exc:
-        raise ValueError(f"{label}不是整数日元") from exc
-    if number != number.to_integral_value():
-        raise ValueError(f"{label}必须是整数日元")
-    return int(number)
+        raise ValueError(f"{label}不是有效数值") from exc
+    rounded = number.quantize(Decimal("0.01"))
+    if rounded != number:
+        raise ValueError(f"{label}最多支持2位小数")
+    return rounded
 
 
 def _mapped_row(raw: dict[str, str]) -> tuple[dict, list[str], list[str]]:
@@ -213,9 +208,6 @@ def _mapped_row(raw: dict[str, str]) -> tuple[dict, list[str], list[str]]:
                     errors.append(f"状态值无效：{value}")
             else:
                 mapped[field] = value or None
-    for header in SUSPICIOUS_184_HEADERS:
-        if raw.get(header, "").strip() == "184":
-            warnings.append(f"{header}出现可疑值184，已原样保留且未猜测修复")
     return {field: mapped.get(field) for field in PRODUCT_FIELDS}, warnings, errors
 
 
@@ -332,3 +324,13 @@ def confirm_import(session: Session, job: ImportJob) -> ImportJob:
         raise
     session.refresh(job)
     return job
+
+
+# Public QinSi goods-import APIs use the maintained openpyxl implementation.
+# The legacy XML helpers above remain temporarily for migration compatibility only.
+from app.qinsi_goods_import import (  # noqa: E402,F401
+    confirm_import,
+    create_import_preview,
+    parse_qinsi_workbook,
+    read_product_sheet,
+)

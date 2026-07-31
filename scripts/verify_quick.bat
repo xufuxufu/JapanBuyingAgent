@@ -13,14 +13,17 @@ echo [verify_quick] Compiling key Python files...
   app\main.py app\models.py app\schemas.py app\services.py ^
   app\product_identity.py app\product_matching.py app\purchase_service.py ^
   app\location_service.py app\qinsi_import.py app\qinsi_export.py ^
-  app\price_providers.py app\price_service.py app\product_enrichment.py app\store_service.py app\analytics_service.py ^
+  app\price_providers.py app\price_service.py app\product_enrichment.py app\provider_config.py app\field_purchase.py app\local_product.py app\store_service.py app\analytics_service.py ^
   app\watch_service.py app\monitor_service.py app\monitor_scheduler.py app\qinsi_inventory.py app\restock_service.py migrations\env.py ^
   migrations\versions\20260716_0013_store_traceability.py ^
   migrations\versions\20260716_0014_product_enrichment.py ^
   migrations\versions\20260716_0015_product_watch_mvp.py ^
   migrations\versions\20260716_0016_price_monitor_notifications.py ^
   migrations\versions\20260716_0017_qinsi_inventory_snapshots.py ^
-  migrations\versions\20260717_0018_store_restock_lists.py || exit /b 1
+  migrations\versions\20260717_0018_store_restock_lists.py ^
+  migrations\versions\20260720_0019_qinsi_goods_import.py ^
+  migrations\versions\20260720_0020_field_purchase_offline_jobs.py ^
+  migrations\versions\20260720_0021_qinsi_derived_barcodes_optional_field_store.py || exit /b 1
 
 if not "%~1"=="" (
   echo [verify_quick] Running targeted tests: %*

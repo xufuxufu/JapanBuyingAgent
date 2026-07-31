@@ -8,7 +8,7 @@ import re
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 import httpx
 from PIL import Image
@@ -17,13 +17,15 @@ from sqlalchemy import delete, func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, selectinload
 
-from app.config import PRODUCT_IMAGE_DIR, PROJECT_ROOT
+from app.config import PRODUCT_IMAGE_DIR, PROJECT_ROOT, get_deepseek_config
+from app.deepseek_service import DeepSeekServiceError, translate_name_with_deepseek
+from app.db import build_engine
 from app.models import (
-    PriceLookupHistory, PriceSearchRun, Product, ProductEnrichmentCandidate,
+    EnrichmentAuditLog, FieldPurchaseItem, PriceLookupHistory, PriceSearchRun, Product, ProductEnrichmentCandidate,
     ProductEnrichmentSource, ProductEnrichmentTask, ProductMatchLog,
     ProductOffer, ProductTranslationCache, ReceiptItem,
 )
-from app.product_identity import assert_jan_available, format_product_display_name
+from app.product_identity import assert_jan_available, format_product_display_name, normalize_product_name_whitespace
 from app.product_matching import validate_jan
 
 
@@ -33,6 +35,36 @@ PACKAGE_PATTERN = re.compile(r"(?i)(\d+\s*(?:個|本|袋|包|箱|セット|パ�
 MODEL_PATTERN = re.compile(r"(?i)\b(?=[A-Z0-9_-]*[A-Z])(?=[A-Z0-9_-]*\d)[A-Z0-9][A-Z0-9_-]{2,24}\b")
 COLOR_WORDS = ("ブラック", "ホワイト", "レッド", "ブルー", "グリーン", "ピンク", "パープル", "黒", "白", "赤", "青", "緑", "粉色", "黑色", "白色")
 SEVERE_WARNING_PATTERN = re.compile(r"冲突|不一致|编造|不同规格|严重", re.IGNORECASE)
+MISSING_PRODUCT_NAME_SUFFIX = "缺商品"
+DEEPSEEK_TRANSLATION_PROMPT = """你是一名日本药妆/日用品w玩偶等跨境电商商品标题翻译专家。请按以下规则将日文商品名翻译成中文：
+
+1. 品牌名使用官方通用中文译名（如「ラックス」→「力士」）。
+2. 角色/联名名使用官方中文译名（如「クロミ」→「酷洛米」）。
+3. 功效描述意译为主，不逐字硬翻，符合中文美妆日化表达习惯。
+4. 必须明确写出商品品类（如洗发露、护发素、沐浴露、洗面奶、面膜、套装等），方便搜索命中。
+5. 结构统一为：「品牌×角色（如有） 功效 品类1＋品类2 套装（数量）」，语序自然通顺。
+6. 括号精简，不堆砌日文原词，除非必要。
+7. 输出格式：只输出「中文翻译结果｜日文原商品名」，中间用英文竖线 | 分隔，竖线两侧不加空格。中文必须放在竖线前面。
+8. 整条输出（含中文、竖线、日文）总长度不超过 128 个字符，中文翻译部分在保证品类明确的前提下尽量精简。
+
+输出示例：
+
+输入：
+
+(企画品)ラックス スーパーリッチシャイン ストレートビューティー SP＆CD クロミコラボ ( 1セット )/ ラックス(LUX)
+
+输出：
+
+力士×酷洛米超润光泽直发顺滑洗发露＋护发素套装1套|(企画品)ラックス スーパーリッチシャイン ストレートビューティー SP＆CD クロミコラボ ( 1セット )/ ラックス(LUX)
+
+注意：
+
+* 最终分隔符实际使用英文半角竖线|
+* 总长度后端必须再次校验，不只依赖模型
+* DeepSeek失败不得阻止商品保存
+* 保留原始日文名name_ja
+* 中文部分单独保存name_zh
+* 展示名由name_zh + "|" + name_ja生成"""
 SUMMARY_KEYS = {
     "brand", "brandName", "manufacturer", "maker", "category", "categoryName",
     "model", "modelNumber", "color", "capacity", "size", "janCode", "shopName", "seller",
@@ -67,22 +99,23 @@ class EnrichmentSettings:
 
 
 def get_enrichment_settings() -> EnrichmentSettings:
-    key = os.getenv("DEEPSEEK_API_KEY", "").strip()
+    deepseek = get_deepseek_config()
     return EnrichmentSettings(
         enabled=_env_bool("JBA_PRODUCT_ENRICHMENT_ENABLED", True),
-        deepseek_enabled=_env_bool("JBA_DEEPSEEK_ENABLED", bool(key)) and bool(key),
+        deepseek_enabled=deepseek.configured,
         image_download_enabled=_env_bool("JBA_PRODUCT_IMAGE_DOWNLOAD_ENABLED", True),
         auto_create_enabled=_env_bool("JBA_AUTO_CREATE_PRODUCT_ENABLED", False),
         max_translation_batch=_env_int("JBA_MAX_TRANSLATION_BATCH", 20, 1, 100),
         max_retries=_env_int("JBA_ENRICHMENT_MAX_RETRIES", 3, 0, 10),
-        deepseek_api_key=key,
-        deepseek_base_url=os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com/v1").strip().rstrip("/"),
-        deepseek_model=os.getenv("DEEPSEEK_MODEL", "deepseek-chat").strip() or "deepseek-chat",
+        deepseek_api_key=deepseek.api_key,
+        deepseek_base_url=deepseek.base_url,
+        deepseek_model=deepseek.model,
     )
 
 
 class DeepSeekProductName(BaseModel):
     model_config = ConfigDict(extra="forbid")
+    schema_version: Literal["1.0"] = "1.0"
     name_cn: str = Field(min_length=1, max_length=128)
     name_ja: str = Field(min_length=1, max_length=128)
     brand_cn: str = Field(default="", max_length=128)
@@ -151,9 +184,8 @@ def ensure_enrichment_task(
     session: Session, jan: str | None, trigger_source: str, *,
     source_type: str | None = None, source_id: int | None = None, commit: bool = True,
 ) -> ProductEnrichmentTask | None:
-    settings = get_enrichment_settings()
     jan = (jan or "").strip()
-    if not settings.enabled or not validate_jan(jan):
+    if not validate_jan(jan):
         return None
     existing_product = session.scalar(select(Product).where(Product.jan == jan))
     if existing_product is not None:
@@ -209,7 +241,7 @@ def attach_lookup_source(session: Session, task: ProductEnrichmentTask, history_
 
 
 def _candidate_from_offer(task: ProductEnrichmentTask, offer: ProductOffer) -> ProductEnrichmentCandidate | None:
-    if offer.jan != task.jan or offer.jan_match_status != "exact":
+    if offer.jan not in {None, task.jan}:
         return None
     condition = (offer.condition or "").casefold()
     if condition in {"used", "中古", "second_hand"} or offer.is_subscription or offer.listing_type != "single":
@@ -217,11 +249,18 @@ def _candidate_from_offer(task: ProductEnrichmentTask, offer: ProductOffer) -> P
     summary = _safe_summary(offer.raw_data_json)
     fields = _title_fields(offer.title or "", summary)
     warnings = _json_list(None)
+    if offer.jan_match_status != "exact":
+        warnings.append("JAN 未验证，需人工核对")
     if offer.spec_match_status == "suspected_mismatch":
         warnings.append("规格疑似不一致")
-    score = .55 + (.1 if offer.image_url else 0) + (.1 if offer.shipping_known else 0) + (.1 if offer.stock_status != "out_of_stock" else 0)
+    score = (
+        (.55 if offer.jan_match_status == "exact" else .25)
+        + (.1 if offer.image_url else 0)
+        + (.1 if offer.shipping_known else 0)
+        + (.1 if offer.stock_status != "out_of_stock" else 0)
+    )
     return ProductEnrichmentCandidate(
-        task_id=task.id, jan=task.jan, name_ja=(offer.title or "").strip() or None,
+        task_id=task.id, jan=task.jan, name_ja=normalize_product_name_whitespace(offer.title),
         image_url=offer.image_url, source_url=offer.url, platform=offer.marketplace.code,
         item_price=offer.item_price, shipping_price=offer.shipping_price,
         total_price=offer.total_price, fetched_at=offer.fetched_at, score=min(score, 1.0),
@@ -274,6 +313,40 @@ def _parse_json_object(value: str) -> dict[str, Any]:
     return parsed
 
 
+def _truncate_pipe_display(name_cn: str, name_ja: str, limit: int = 128) -> tuple[str, str]:
+    name_cn = normalize_product_name_whitespace(name_cn) or ""
+    name_ja = normalize_product_name_whitespace(name_ja) or ""
+    raw = f"{name_cn}|{name_ja}"
+    if len(raw) <= limit:
+        return name_cn, name_ja
+    ja_budget = min(len(name_ja), max(0, limit // 2))
+    cn_budget = limit - 1 - ja_budget
+    if cn_budget < 1:
+        cn_budget = 1
+        ja_budget = limit - 2
+    return name_cn[:cn_budget].rstrip(), name_ja[:ja_budget].rstrip()
+
+
+def _parse_deepseek_translation(content: str, original_name_ja: str) -> DeepSeekProductName:
+    value = re.sub(r"^```(?:text)?\s*|\s*```$", "", content.strip(), flags=re.IGNORECASE)
+    if "|" not in value:
+        raise ValueError("DeepSeek response missing pipe separator")
+    name_cn, returned_ja = (normalize_product_name_whitespace(part) or "" for part in value.split("|", 1))
+    if not name_cn:
+        raise ValueError("DeepSeek response missing Chinese name")
+    name_ja = normalize_product_name_whitespace(original_name_ja) or returned_ja
+    name_cn, name_ja = _truncate_pipe_display(name_cn, name_ja)
+    return DeepSeekProductName(
+        schema_version="1.0",
+        name_cn=name_cn,
+        name_ja=name_ja,
+        brand_cn="",
+        category_cn="",
+        confidence=0.9 if len(f"{name_cn}|{name_ja}") <= 128 else 0.75,
+        warnings=[],
+    )
+
+
 def _append_required(value: str, required: list[str], limit: int = 128) -> str:
     missing = [item for item in required if item.casefold() not in value.casefold()]
     if not missing:
@@ -304,38 +377,17 @@ def translate_candidate(
     if cached is not None:
         task.deepseek_status = "completed_cached"
         return DeepSeekProductName.model_validate_json(cached.response_json)
-    structured = {
-        "jan": task.jan, "name_ja": name_ja, "brand": candidate.brand,
-        "manufacturer": candidate.manufacturer, "category": candidate.category,
-        "specification": candidate.specification, "capacity": candidate.capacity,
-        "color": candidate.color, "model_number": candidate.model_number,
-        "package_count": candidate.package_count,
-    }
-    prompt = (
-        "根据输入的结构化日本商品字段生成中文商品名。只输出合法 JSON，键必须为 "
-        "name_cn,name_ja,brand_cn,category_cn,confidence,warnings。不得编造；不确定的专有名词保留原文；"
-        "型号、数字、容量、尺寸、颜色和数量不得丢失；name_cn/name_ja 各不超过128字符。\n"
-        + json.dumps(structured, ensure_ascii=False)
-    )
-    payload = {
-        "model": settings.deepseek_model,
-        "messages": [
-            {"role": "system", "content": "你是日本商品主数据翻译助手，只输出 JSON。"},
-            {"role": "user", "content": prompt},
-        ],
-        "temperature": 0.1,
-        "response_format": {"type": "json_object"},
-    }
-    headers = {"Authorization": f"Bearer {settings.deepseek_api_key}", "Content-Type": "application/json"}
     try:
-        if client is None:
-            with httpx.Client(timeout=35) as http:
-                response = http.post(f"{settings.deepseek_base_url}/chat/completions", headers=headers, json=payload)
-        else:
-            response = client.post(f"{settings.deepseek_base_url}/chat/completions", headers=headers, json=payload, timeout=35)
-        response.raise_for_status()
-        content = response.json()["choices"][0]["message"]["content"]
-        result = DeepSeekProductName.model_validate(_parse_json_object(str(content)))
+        translated = translate_name_with_deepseek(name_ja, client=client, config=get_deepseek_config(), timeout_seconds=10)
+        result = DeepSeekProductName(
+            schema_version="1.0",
+            name_cn=translated.name_cn,
+            name_ja=translated.name_ja,
+            brand_cn="",
+            category_cn="",
+            confidence=0.9 if len(f"{translated.name_cn}|{translated.name_ja}") <= 128 else 0.75,
+            warnings=[],
+        )
         required = [
             value for value in (candidate.model_number, candidate.capacity, candidate.color, candidate.package_count)
             if value
@@ -345,7 +397,11 @@ def translate_candidate(
         if any(value.casefold() not in name_ja.casefold() for value in required):
             name_ja = _append_required(name_ja, required)
         result = result.model_copy(update={"name_cn": name_cn, "name_ja": name_ja})
-    except (httpx.HTTPError, KeyError, TypeError, ValueError, ValidationError, json.JSONDecodeError) as exc:
+    except DeepSeekServiceError as exc:
+        task.deepseek_status = "pending_configuration" if exc.category == "unconfigured" else "failed"
+        task.last_error = exc.message
+        return None
+    except (ValidationError, json.JSONDecodeError) as exc:
         task.deepseek_status = "failed"
         task.last_error = f"DeepSeek {type(exc).__name__}"
         return None
@@ -464,6 +520,32 @@ def _bind_sources(session: Session, task: ProductEnrichmentTask, product: Produc
     receipts = set()
     sources = list(session.scalars(select(ProductEnrichmentSource).where(ProductEnrichmentSource.task_id == task.id)))
     for source in sources:
+        if source.source_type == "field_purchase_item":
+            field_item = session.get(FieldPurchaseItem, source.source_id)
+            if field_item is not None and field_item.product_id in {None, product.id}:
+                field_item.product_id = product.id
+                field_item.status = "CONFIRMED"
+                field_item.confirmed_at = datetime.now(timezone.utc)
+                session.add(EnrichmentAuditLog(
+                    field_purchase_item_id=field_item.id,
+                    enrichment_task_id=task.id,
+                    action="BIND_EXISTING",
+                    actor="system",
+                    after_json=json.dumps({"product_id": product.id}, ensure_ascii=False),
+                    source="background_job",
+                ))
+            continue
+        if source.source_type == "price_lookup":
+            history = session.get(PriceLookupHistory, source.source_id)
+            if history is not None:
+                history.product_id = product.id
+                if history.search_run is not None:
+                    history.search_run.product_id = product.id
+                    history.search_run.is_new_candidate = False
+                    for offer in history.search_run.offers:
+                        if offer.product_id is None:
+                            offer.product_id = product.id
+            continue
         if source.source_type != "receipt_item":
             continue
         item = session.get(ReceiptItem, source.source_id)
@@ -496,18 +578,40 @@ def create_product_from_task(
 ) -> Product:
     existing = session.scalar(select(Product).where(Product.jan == task.jan))
     if existing is not None:
+        if manual:
+            manual_cn = normalize_product_name_whitespace(re.sub(r"\|+", "·", name_cn or "")) or existing.name_cn
+            manual_ja = normalize_product_name_whitespace(re.sub(r"\|+", "·", name_ja or "")) or existing.name_ja
+            if manual_cn or manual_ja:
+                manual_cn, manual_ja = _truncate_pipe_display(
+                    manual_cn or task.jan, manual_ja or MISSING_PRODUCT_NAME_SUFFIX,
+                )
+                existing.name_cn = manual_cn
+                existing.name_ja = manual_ja
+                existing.display_name = format_product_display_name(existing.name_cn, existing.name_ja)
+                existing.product_data_confirmed = True
+                existing.name_locked = True
+                existing.status = "new_pending_review"
         task.product_id = existing.id
         _bind_sources(session, task, existing)
         return existing
     payload = json.loads(task.selected_data_json or "{}")
     translation = payload.get("translation") or {}
-    chosen_cn = (name_cn or translation.get("name_cn") or "").strip()
-    chosen_ja = (name_ja or translation.get("name_ja") or payload.get("name_ja") or "").strip()
-    if not chosen_cn or not chosen_ja:
-        raise ValueError("创建商品前必须确认中日文名称")
+    chosen_cn = normalize_product_name_whitespace(re.sub(r"\|+", "·", name_cn or translation.get("name_cn") or "")) or None
+    chosen_ja = normalize_product_name_whitespace(re.sub(r"\|+", "·", name_ja or translation.get("name_ja") or payload.get("name_ja") or "")) or ""
+    if not chosen_cn and not chosen_ja:
+        chosen_cn = None
+        chosen_ja = MISSING_PRODUCT_NAME_SUFFIX
+    elif not chosen_ja:
+        chosen_ja = task.jan
+    if chosen_cn:
+        chosen_cn, chosen_ja = _truncate_pipe_display(chosen_cn, chosen_ja)
+    else:
+        chosen_ja = chosen_ja[:128]
+    status = "new_pending_review" if chosen_cn and chosen_ja != MISSING_PRODUCT_NAME_SUFFIX else "new_pending_completion"
     product = Product(
-        jan=assert_jan_available(session, task.jan), name_cn=chosen_cn[:128], name_ja=chosen_ja[:128],
-        display_name=format_product_display_name(chosen_cn[:128], chosen_ja[:128]),
+        jan=assert_jan_available(session, task.jan), name_cn=chosen_cn, name_ja=chosen_ja,
+        display_name=f"{task.jan}|{MISSING_PRODUCT_NAME_SUFFIX}" if status == "new_pending_completion"
+        else format_product_display_name(chosen_cn, chosen_ja),
         brand=(translation.get("brand_cn") or payload.get("brand") or None),
         manufacturer=payload.get("manufacturer"), category=(translation.get("category_cn") or payload.get("category") or None),
         specification=payload.get("specification"), capacity=payload.get("capacity"), color=payload.get("color"),
@@ -519,9 +623,19 @@ def create_product_from_task(
         main_image_downloaded_at=datetime.now(timezone.utc) if payload.get("local_image") else None,
         product_data_confirmed=manual, name_locked=manual, main_image_locked=manual and bool(payload.get("image_url")),
         purchase_price=payload.get("item_price"), source="product_enrichment", product_origin="enrichment",
+        status=status if not manual else "new_pending_review",
     )
     session.add(product)
     session.flush()
+    if not manual and product.status != "qinsi_product_imported":
+        from app.product_translation_service import auto_translate_new_product_once
+
+        translation_result = auto_translate_new_product_once(session, product)
+        if translation_result.status == "success":
+            task.deepseek_status = "completed"
+        elif translation_result.status in {"failed", "rate_limited"}:
+            task.deepseek_status = "failed"
+            task.last_error = translation_result.error or "翻译失败，可重试"
     task.product_id = product.id
     _bind_sources(session, task, product)
     return product
@@ -534,6 +648,16 @@ def process_enrichment_task(
 ) -> ProductEnrichmentTask:
     settings = get_enrichment_settings()
     if not settings.enabled:
+        product = session.scalar(select(Product).where(Product.jan == task.jan))
+        if product is None:
+            create_product_from_task(session, task)
+        else:
+            task.product_id = product.id
+            _bind_sources(session, task, product)
+        task.status = "completed_with_warnings"
+        task.completed_at = datetime.now(timezone.utc)
+        task.warnings_json = json.dumps(["商品资料丰富化已关闭，已保存缺资料商品"], ensure_ascii=False)
+        session.commit()
         return task
     if task.retry_count >= settings.max_retries and not force:
         task.status = "failed"
@@ -569,11 +693,13 @@ def process_enrichment_task(
             candidates = aggregate_candidates(session, task, run)
         if not candidates:
             warnings.append("Provider 未返回 JAN 精确一致的可信新品候选")
-            task.status = "needs_review"
             task.confidence = 0
             task.deepseek_status = "skipped_no_candidate"
             task.image_status = "missing"
             task.warnings_json = json.dumps(warnings, ensure_ascii=False)
+            create_product_from_task(session, task)
+            task.status = "completed_with_warnings"
+            task.completed_at = datetime.now(timezone.utc)
             session.commit()
             return task
         selected = next(item for item in candidates if item.selected)
@@ -605,14 +731,11 @@ def process_enrichment_task(
             task.confidence >= .85 and not severe and translation is not None
             and bool((translation.name_ja or selected.name_ja).strip()) and bool(image or selected.image_url)
         )
-        if high_confidence and settings.auto_create_enabled:
-            create_product_from_task(session, task)
-            task.status = "completed_with_warnings" if warnings else "completed"
-            task.completed_at = datetime.now(timezone.utc)
-        else:
-            if high_confidence and not settings.auto_create_enabled:
-                warnings.append("高置信度自动建品开关关闭，等待人工批量接受")
-            task.status = "needs_review"
+        create_product_from_task(session, task)
+        if high_confidence and not settings.auto_create_enabled:
+            warnings.append("高置信度自动建品开关关闭，已保存为待人工确认商品")
+        task.status = "completed_with_warnings" if warnings or not high_confidence else "completed"
+        task.completed_at = datetime.now(timezone.utc)
         task.warnings_json = json.dumps(list(dict.fromkeys(warnings)), ensure_ascii=False) if warnings else None
         session.commit()
         session.refresh(task)
@@ -621,9 +744,16 @@ def process_enrichment_task(
         session.rollback()
         task = session.get(ProductEnrichmentTask, task.id)
         task.retry_count += 1
-        task.status = "failed" if task.retry_count >= settings.max_retries else "needs_review"
+        try:
+            create_product_from_task(session, task)
+            task.status = "completed_with_warnings"
+            task.completed_at = datetime.now(timezone.utc)
+        except Exception:
+            session.rollback()
+            task = session.get(ProductEnrichmentTask, task.id)
+            task.status = "failed" if task.retry_count >= settings.max_retries else "needs_review"
         task.last_error = f"{type(exc).__name__}"
-        task.warnings_json = json.dumps(["商品资料丰富化失败，主流程未受影响"], ensure_ascii=False)
+        task.warnings_json = json.dumps(["商品资料丰富化失败，已优先保存缺资料商品"], ensure_ascii=False)
         session.commit()
         return task
 
@@ -639,6 +769,19 @@ def safe_trigger_receipt_items(session: Session, items: list[ReceiptItem], trigg
         return []
 
 
+def process_price_lookup_enrichment(database_url: str, jan: str, history_id: int) -> None:
+    engine = build_engine(database_url)
+    with Session(engine) as session:
+        task = ensure_enrichment_task(
+            session, jan, "price_lookup", source_type="price_lookup", source_id=history_id,
+        )
+        if task is None:
+            return
+        attach_lookup_source(session, task, history_id)
+        session.commit()
+        process_enrichment_task(session, task)
+
+
 def accept_task(
     session: Session, task_id: int, *, name_cn: str | None = None,
     name_ja: str | None = None, candidate_id: int | None = None,
@@ -648,8 +791,16 @@ def accept_task(
         candidate = next((item for item in task.candidates if item.id == candidate_id), None)
         if candidate is None:
             raise ValueError("主图候选不存在")
+        before = {str(item.id): item.selected for item in task.candidates}
         for item in task.candidates:
             item.selected = item.id == candidate_id
+        session.add(EnrichmentAuditLog(
+            enrichment_task_id=task.id,
+            action="SELECT_CANDIDATE",
+            actor="人工审核",
+            before_json=json.dumps(before, ensure_ascii=False),
+            after_json=json.dumps({"candidate_id": candidate_id}, ensure_ascii=False),
+        ))
         payload = json.loads(task.selected_data_json or "{}")
         payload.update(_selected_payload(candidate, None, None))
         task.selected_data_json = json.dumps(payload, ensure_ascii=False)

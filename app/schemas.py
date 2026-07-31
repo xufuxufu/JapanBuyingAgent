@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 from datetime import datetime
+from decimal import Decimal
+from decimal import Decimal
+from decimal import Decimal
 from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
@@ -242,8 +245,12 @@ class ProductUpdateInput(BaseModel):
     jan: str | None = None
     qinsi_product_code: str | None = None
     name_cn: str | None = Field(default=None, min_length=1, max_length=128)
+    name_ja: str | None = Field(default=None, max_length=128)
+    main_image_source_url: str | None = None
+    purchase_price: str | None = None
+    status: str | None = None
 
-    @field_validator("jan", "qinsi_product_code", mode="before")
+    @field_validator("jan", "qinsi_product_code", "main_image_source_url", "purchase_price", "status", mode="before")
     @classmethod
     def validate_identifiers(cls, value):
         if value is None or value == "":
@@ -264,6 +271,9 @@ class ProductOutput(BaseModel):
     display_name: str | None
     main_image_path: str | None
     main_image_source_url: str | None
+    image_url: str | None
+    purchase_price: Decimal | None
+    status: str
     product_data_confirmed: bool
     product_origin: str
 
@@ -309,6 +319,8 @@ class QinsiExportConfirmationInput(BaseModel):
     model_config = ConfigDict(extra="forbid")
     result: Literal["all_success", "partial_failure", "all_failed"]
     failed_line_ids: set[int] = Field(default_factory=set)
+    actor_name: str = Field(default="人工确认", min_length=1, max_length=128)
+    note: str | None = Field(default=None, max_length=1000)
 
     @field_validator("failed_line_ids")
     @classmethod
@@ -338,8 +350,8 @@ class PriceLookupInput(BaseModel):
         if not isinstance(value, str):
             raise ValueError("JAN 必须是字符串")
         jan = value.strip()
-        if not jan.isdigit() or len(jan) not in {8, 12, 13, 14}:
-            raise ValueError("JAN 必须为 8、12、13 或 14 位数字")
+        if not jan.isdigit() or len(jan) not in {8, 13}:
+            raise ValueError("JAN 必须为 8 或 13 位数字")
         digits = [int(char) for char in jan]
         weighted = sum(digit * (3 if (len(digits) - index) % 2 == 0 else 1) for index, digit in enumerate(digits[:-1]))
         if (10 - weighted % 10) % 10 != digits[-1]:

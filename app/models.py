@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import json
 from datetime import datetime, timezone
+from decimal import Decimal
 
-from sqlalchemy import Boolean, CheckConstraint, DateTime, Float, ForeignKey, Index, Integer, LargeBinary, String, Text, UniqueConstraint, text
+from sqlalchemy import Boolean, CheckConstraint, DateTime, Float, ForeignKey, Index, Integer, LargeBinary, Numeric, String, Text, UniqueConstraint, text
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.db import Base
@@ -242,12 +244,35 @@ class Product(Base):
     package_count: Mapped[str | None] = mapped_column(String(64))
     specification: Mapped[str | None] = mapped_column(String(255))
     model_spec: Mapped[str | None] = mapped_column(String(255))
-    purchase_price: Mapped[int | None] = mapped_column(Integer)
-    sale_price: Mapped[int | None] = mapped_column(Integer)
-    minimum_sale_price: Mapped[int | None] = mapped_column(Integer)
+    purchase_price: Mapped[Decimal | None] = mapped_column(Numeric(18, 2))
+    sale_price: Mapped[Decimal | None] = mapped_column(Numeric(18, 2))
+    minimum_sale_price: Mapped[Decimal | None] = mapped_column(Numeric(18, 2))
     image_url: Mapped[str | None] = mapped_column(Text)
+    display_image_url: Mapped[str | None] = mapped_column(Text)
+    local_image_path: Mapped[str | None] = mapped_column(Text)
+    image_sha256: Mapped[str | None] = mapped_column(String(64), index=True)
+    image_localization_status: Mapped[str | None] = mapped_column(String(30), index=True)
+    image_localization_source_url: Mapped[str | None] = mapped_column(Text)
+    image_localized_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    image_localization_error: Mapped[str | None] = mapped_column(Text)
     location_code: Mapped[str | None] = mapped_column(String(100))
-    status: Mapped[str] = mapped_column(String(20), default="active", nullable=False)
+    unit_name: Mapped[str | None] = mapped_column(String(128))
+    qinsi_sort_order: Mapped[int | None] = mapped_column(Integer)
+    qinsi_points_enabled: Mapped[bool | None] = mapped_column(Boolean)
+    inventory_warning_lower: Mapped[Decimal | None] = mapped_column(Numeric(18, 3))
+    inventory_warning_upper: Mapped[Decimal | None] = mapped_column(Numeric(18, 3))
+    shelf_life_days: Mapped[int | None] = mapped_column(Integer)
+    batch_enabled: Mapped[bool | None] = mapped_column(Boolean)
+    expiration_warning_days: Mapped[int | None] = mapped_column(Integer)
+    product_note: Mapped[str | None] = mapped_column(Text)
+    origin_place: Mapped[str | None] = mapped_column(String(255))
+    applicable_age: Mapped[str | None] = mapped_column(String(255))
+    weight_kg: Mapped[Decimal | None] = mapped_column(Numeric(18, 3))
+    serial_number_enabled: Mapped[bool | None] = mapped_column(Boolean)
+    qinsi_brand_master_id: Mapped[int | None] = mapped_column(ForeignKey("qinsi_master_values.id", ondelete="SET NULL"))
+    qinsi_category_master_id: Mapped[int | None] = mapped_column(ForeignKey("qinsi_master_values.id", ondelete="SET NULL"))
+    qinsi_unit_master_id: Mapped[int | None] = mapped_column(ForeignKey("qinsi_master_values.id", ondelete="SET NULL"))
+    status: Mapped[str] = mapped_column(String(30), default="active", nullable=False)
     source: Mapped[str] = mapped_column(String(50), default="manual", nullable=False)
     product_origin: Mapped[str] = mapped_column(String(20), default="manual", nullable=False)
     low_stock_threshold: Mapped[int | None] = mapped_column(Integer)
@@ -261,7 +286,19 @@ class Product(Base):
     watch_notifications: Mapped[list[ProductWatchNotification]] = relationship(back_populates="product")
     qinsi_inventory_lines: Mapped[list[QinsiInventorySnapshotLine]] = relationship(back_populates="product")
     qinsi_product_mappings: Mapped[list[QinsiProductMapping]] = relationship(back_populates="product")
+    barcodes: Mapped[list[ProductBarcode]] = relationship(back_populates="product", cascade="all, delete-orphan")
     restock_list_items: Mapped[list[RestockListItem]] = relationship(back_populates="product")
+    field_purchase_items: Mapped[list[FieldPurchaseItem]] = relationship(back_populates="product")
+    serials: Mapped[list[ProductSerial]] = relationship(back_populates="product", cascade="all, delete-orphan")
+    operation_logs: Mapped[list[ProductOperationLog]] = relationship(back_populates="product", order_by="ProductOperationLog.created_at.desc()")
+
+    @property
+    def preferred_image_url(self) -> str | None:
+        if self.display_image_url:
+            return self.display_image_url
+        if self.main_image_path and self.id:
+            return f"/product-images/{self.id}"
+        return self.main_image_source_url or self.image_url
 
 
 class ProductAlias(Base):
@@ -274,6 +311,24 @@ class ProductAlias(Base):
     confirmed: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
     created_from_item_id: Mapped[int | None] = mapped_column(ForeignKey("receipt_items.id", ondelete="SET NULL"))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
+
+
+class ProductOperationLog(Base):
+    __tablename__ = "product_operation_logs"
+    __table_args__ = (
+        CheckConstraint("action IN ('edit','archive','restore','delete')", name="ck_product_operation_logs_action"),
+        Index("ix_product_operation_logs_product_created", "product_id", "created_at"),
+    )
+    id: Mapped[int] = mapped_column(primary_key=True)
+    product_id: Mapped[int | None] = mapped_column(ForeignKey("products.id", ondelete="SET NULL"), index=True)
+    internal_sku: Mapped[str] = mapped_column(String(32), nullable=False)
+    action: Mapped[str] = mapped_column(String(20), nullable=False, index=True)
+    actor: Mapped[str] = mapped_column(String(128), nullable=False)
+    reason: Mapped[str | None] = mapped_column(Text)
+    before_json: Mapped[str | None] = mapped_column(Text)
+    after_json: Mapped[str | None] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
+    product: Mapped[Product | None] = relationship(back_populates="operation_logs")
 
 
 class StoreBrand(Base):
@@ -319,6 +374,7 @@ class Store(Base):
     receipts: Mapped[list[Receipt]] = relationship(back_populates="store")
     purchase_batches: Mapped[list[PurchaseBatch]] = relationship(back_populates="store")
     restock_lists: Mapped[list[RestockList]] = relationship(back_populates="store")
+    field_purchase_batches: Mapped[list[FieldPurchaseBatch]] = relationship(back_populates="store")
 
     @property
     def display_name(self) -> str:
@@ -375,6 +431,8 @@ class PurchaseBatch(Base):
     purchased_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     store_name: Mapped[str | None] = mapped_column(String(255))
     store_id: Mapped[int | None] = mapped_column(ForeignKey("stores.id", ondelete="SET NULL"), index=True)
+    operator_name: Mapped[str | None] = mapped_column(String(128), index=True)
+    note: Mapped[str | None] = mapped_column(Text)
     confirmed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     status: Mapped[str] = mapped_column(String(30), default="confirmed", nullable=False, index=True)
     default_initial_location_id: Mapped[int] = mapped_column(ForeignKey("locations.id", ondelete="RESTRICT"), nullable=False)
@@ -505,6 +563,7 @@ class QinsiPurchaseExportJob(Base):
     selection_key: Mapped[str] = mapped_column(String(160), unique=True, nullable=False)
     export_type: Mapped[str] = mapped_column(String(20), nullable=False, index=True)
     purchase_batch_id: Mapped[int] = mapped_column(ForeignKey("purchase_batches.id", ondelete="RESTRICT"), nullable=False, index=True)
+    selected_batch_ids_json: Mapped[str | None] = mapped_column(Text)
     qinsi_target_warehouse_id: Mapped[int] = mapped_column(ForeignKey("locations.id", ondelete="RESTRICT"), nullable=False)
     parent_export_job_id: Mapped[int | None] = mapped_column(ForeignKey("qinsi_purchase_export_jobs.id", ondelete="RESTRICT"), index=True)
     filename: Mapped[str] = mapped_column(String(255), nullable=False)
@@ -512,6 +571,10 @@ class QinsiPurchaseExportJob(Base):
     status: Mapped[str] = mapped_column(String(30), default="generated", nullable=False, index=True)
     line_count: Mapped[int] = mapped_column(Integer, nullable=False)
     confirmed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    confirmed_by: Mapped[str | None] = mapped_column(String(128))
+    confirmation_note: Mapped[str | None] = mapped_column(Text)
+    cancelled_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    cancelled_by: Mapped[str | None] = mapped_column(String(128))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow, nullable=False)
     purchase_batch: Mapped[PurchaseBatch] = relationship(back_populates="qinsi_export_jobs")
@@ -520,6 +583,15 @@ class QinsiPurchaseExportJob(Base):
     lines: Mapped[list[QinsiPurchaseExportLine]] = relationship(
         back_populates="export_job", cascade="all, delete-orphan", order_by="QinsiPurchaseExportLine.row_no",
     )
+
+    @property
+    def selected_batch_ids(self) -> list[int]:
+        try:
+            values = json.loads(self.selected_batch_ids_json or "[]")
+        except (TypeError, ValueError):
+            values = []
+        batch_ids = [int(value) for value in values if str(value).isdigit()]
+        return batch_ids or [self.purchase_batch_id]
 
 
 class QinsiPurchaseExportLine(Base):
@@ -595,6 +667,11 @@ class QinsiInventorySnapshot(Base):
     file_content: Mapped[bytes] = mapped_column(LargeBinary, nullable=False)
     imported_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
     data_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    source_system: Mapped[str] = mapped_column(String(30), default="qinsi", nullable=False)
+    snapshot_type: Mapped[str] = mapped_column(String(30), default="counted_inventory", nullable=False)
+    source_import_batch_id: Mapped[int | None] = mapped_column(
+        ForeignKey("qinsi_import_batches.id", ondelete="SET NULL"), unique=True,
+    )
     total_rows: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     success_rows: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     unmatched_rows: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
@@ -627,6 +704,7 @@ class QinsiInventorySnapshotLine(Base):
     internal_sku: Mapped[str | None] = mapped_column(String(32))
     raw_warehouse_name: Mapped[str | None] = mapped_column(String(255))
     quantity: Mapped[int | None] = mapped_column(Integer)
+    current_quantity: Mapped[Decimal | None] = mapped_column(Numeric(18, 3))
     raw_summary_json: Mapped[str] = mapped_column(Text, nullable=False)
     product_id: Mapped[int | None] = mapped_column(ForeignKey("products.id", ondelete="SET NULL"))
     warehouse_id: Mapped[int | None] = mapped_column(ForeignKey("locations.id", ondelete="SET NULL"))
@@ -669,6 +747,368 @@ class InventoryTransaction(Base):
     quantity: Mapped[int] = mapped_column(Integer, nullable=False)
     unit_cost: Mapped[int | None] = mapped_column(Integer)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
+
+
+class QinsiImportBatch(Base):
+    __tablename__ = "qinsi_import_batches"
+    __table_args__ = (
+        Index("uq_qinsi_import_batches_file_hash", "file_hash", unique=True),
+        Index("ix_qinsi_import_batches_business_batch", "business_batch_key"),
+    )
+    id: Mapped[int] = mapped_column(primary_key=True)
+    business_batch_key: Mapped[str | None] = mapped_column(String(100))
+    source_system: Mapped[str] = mapped_column(String(30), default="qinsi", nullable=False)
+    original_filename: Mapped[str] = mapped_column(String(255), nullable=False)
+    file_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    file_content: Mapped[bytes] = mapped_column(LargeBinary, nullable=False)
+    status: Mapped[str] = mapped_column(String(30), nullable=False)
+    parse_version: Mapped[int] = mapped_column(Integer, default=2, nullable=False)
+    total_rows: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    new_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    update_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    unchanged_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    skipped_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    conflict_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    error_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    warning_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    success_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    summary_json: Mapped[str | None] = mapped_column(Text)
+    error_message: Mapped[str | None] = mapped_column(Text)
+    imported_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
+    confirmed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow, nullable=False)
+    rows: Mapped[list[QinsiGoodsImportRow]] = relationship(
+        back_populates="batch", cascade="all, delete-orphan", order_by="QinsiGoodsImportRow.excel_row_number",
+    )
+
+
+class QinsiGoodsImportRow(Base):
+    __tablename__ = "qinsi_goods_import_rows"
+    __table_args__ = (
+        UniqueConstraint("import_batch_id", "excel_row_number", name="uq_qinsi_goods_rows_batch_row"),
+        Index("ix_qinsi_goods_rows_code", "qinsi_product_code"),
+        Index("ix_qinsi_goods_rows_barcode", "barcode"),
+        Index("ix_qinsi_goods_rows_status", "import_batch_id", "validation_status"),
+    )
+    id: Mapped[int] = mapped_column(primary_key=True)
+    import_batch_id: Mapped[int] = mapped_column(
+        ForeignKey("qinsi_import_batches.id", ondelete="CASCADE"), nullable=False,
+    )
+    source_file_name: Mapped[str] = mapped_column(String(255), nullable=False)
+    sheet_name: Mapped[str] = mapped_column(String(100), default="商品导入", nullable=False)
+    excel_row_number: Mapped[int] = mapped_column(Integer, nullable=False)
+    qinsi_product_code: Mapped[str | None] = mapped_column(String(100))
+    barcode: Mapped[str | None] = mapped_column(String(100))
+    parsed_data: Mapped[str] = mapped_column(Text, nullable=False)
+    raw_json: Mapped[str] = mapped_column(Text, nullable=False)
+    validation_status: Mapped[str] = mapped_column(String(30), nullable=False)
+    warnings: Mapped[str | None] = mapped_column(Text)
+    errors: Mapped[str | None] = mapped_column(Text)
+    conflict_json: Mapped[str | None] = mapped_column(Text)
+    product_id: Mapped[int | None] = mapped_column(ForeignKey("products.id", ondelete="SET NULL"))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
+    batch: Mapped[QinsiImportBatch] = relationship(back_populates="rows")
+    product: Mapped[Product | None] = relationship()
+
+    @property
+    def row_no(self) -> int:
+        return self.excel_row_number
+
+    @property
+    def status(self) -> str:
+        return self.validation_status
+
+    @property
+    def parsed_json(self) -> str:
+        return self.parsed_data
+
+    @property
+    def warnings_json(self) -> str | None:
+        return self.warnings
+
+    @property
+    def error_message(self) -> str | None:
+        if self.errors:
+            try:
+                return "；".join(json.loads(self.errors))
+            except (TypeError, ValueError):
+                return self.errors
+        if self.conflict_json:
+            try:
+                return "；".join(item.get("message", "") for item in json.loads(self.conflict_json) if item.get("message"))
+            except (TypeError, ValueError):
+                return self.conflict_json
+        return None
+
+
+class QinsiMasterValue(Base):
+    __tablename__ = "qinsi_master_values"
+    __table_args__ = (
+        UniqueConstraint("source_system", "master_type", "source_name", name="uq_qinsi_master_source_name"),
+        Index("ix_qinsi_master_type_active", "master_type", "is_active"),
+    )
+    id: Mapped[int] = mapped_column(primary_key=True)
+    master_type: Mapped[str] = mapped_column(String(40), nullable=False)
+    source_name: Mapped[str] = mapped_column(String(255), nullable=False)
+    normalized_name: Mapped[str] = mapped_column(String(255), nullable=False)
+    source_system: Mapped[str] = mapped_column(String(30), default="qinsi", nullable=False)
+    is_active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+    first_import_batch_id: Mapped[int | None] = mapped_column(
+        ForeignKey("qinsi_import_batches.id", ondelete="SET NULL"),
+    )
+    last_seen_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow, nullable=False)
+
+
+class ProductBarcode(Base):
+    __tablename__ = "product_barcodes"
+    __table_args__ = (
+        Index("uq_product_barcodes_barcode", "barcode", unique=True),
+        UniqueConstraint("product_id", "barcode", name="uq_product_barcode_product_value"),
+    )
+    id: Mapped[int] = mapped_column(primary_key=True)
+    product_id: Mapped[int] = mapped_column(ForeignKey("products.id", ondelete="CASCADE"), nullable=False)
+    barcode: Mapped[str] = mapped_column(String(100), nullable=False)
+    source_system: Mapped[str] = mapped_column(String(30), default="qinsi", nullable=False)
+    is_primary: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow, nullable=False)
+    product: Mapped[Product] = relationship(back_populates="barcodes")
+
+
+class FieldPurchaseBatch(Base):
+    __tablename__ = "field_purchase_batches"
+    __table_args__ = (
+        CheckConstraint("status IN ('ACTIVE','COMPLETED','CANCELLED')", name="ck_field_purchase_batches_status"),
+    )
+    id: Mapped[int] = mapped_column(primary_key=True)
+    batch_no: Mapped[str] = mapped_column(String(50), unique=True, nullable=False)
+    client_request_id: Mapped[str] = mapped_column(String(100), unique=True, nullable=False, index=True)
+    store_id: Mapped[int | None] = mapped_column(ForeignKey("stores.id", ondelete="RESTRICT"), index=True)
+    operator_name: Mapped[str] = mapped_column(String(128), nullable=False)
+    status: Mapped[str] = mapped_column(String(20), default="ACTIVE", nullable=False, index=True)
+    started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow, nullable=False)
+    store: Mapped[Store | None] = relationship(back_populates="field_purchase_batches")
+    items: Mapped[list[FieldPurchaseItem]] = relationship(
+        back_populates="batch", cascade="all, delete-orphan", order_by="FieldPurchaseItem.id",
+    )
+
+
+class FieldPurchaseItem(Base):
+    __tablename__ = "field_purchase_items"
+    __table_args__ = (
+        CheckConstraint("quantity > 0", name="ck_field_purchase_items_quantity_positive"),
+        CheckConstraint(
+            "status IN ('LOCAL_DRAFT','UPLOAD_PENDING','ENRICHMENT_PENDING','ENRICHING',"
+            "'NEEDS_REVIEW','READY','FAILED_RETRYABLE','FAILED_MANUAL','CONFIRMED')",
+            name="ck_field_purchase_items_status",
+        ),
+        CheckConstraint(
+            "jan IS NOT NULL OR temporary_id IS NOT NULL",
+            name="ck_field_purchase_items_identity",
+        ),
+        Index(
+            "uq_field_purchase_items_batch_product",
+            "batch_id", "product_id", unique=True, sqlite_where=text("product_id IS NOT NULL"),
+        ),
+        Index(
+            "uq_field_purchase_items_batch_unmatched_jan",
+            "batch_id", "jan", unique=True,
+            sqlite_where=text("product_id IS NULL AND jan IS NOT NULL"),
+        ),
+    )
+    id: Mapped[int] = mapped_column(primary_key=True)
+    batch_id: Mapped[int] = mapped_column(
+        ForeignKey("field_purchase_batches.id", ondelete="CASCADE"), nullable=False, index=True,
+    )
+    product_id: Mapped[int | None] = mapped_column(ForeignKey("products.id", ondelete="RESTRICT"), index=True)
+    enrichment_task_id: Mapped[int | None] = mapped_column(
+        ForeignKey("product_enrichment_tasks.id", ondelete="SET NULL"), index=True,
+    )
+    jan: Mapped[str | None] = mapped_column(String(32), index=True)
+    temporary_id: Mapped[str | None] = mapped_column(String(80), unique=True, index=True)
+    quantity: Mapped[int] = mapped_column(Integer, default=1, nullable=False)
+    status: Mapped[str] = mapped_column(String(30), default="LOCAL_DRAFT", nullable=False, index=True)
+    name_cn: Mapped[str | None] = mapped_column(String(128))
+    name_ja: Mapped[str | None] = mapped_column(String(128))
+    brand: Mapped[str | None] = mapped_column(String(128))
+    category: Mapped[str | None] = mapped_column(String(128))
+    unit_name: Mapped[str | None] = mapped_column(String(128))
+    unit_price: Mapped[int | None] = mapped_column(Integer)
+    product_image_path: Mapped[str | None] = mapped_column(Text)
+    captured_by: Mapped[str] = mapped_column(String(128), nullable=False)
+    first_scanned_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
+    last_scanned_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
+    confirmed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow, nullable=False)
+    batch: Mapped[FieldPurchaseBatch] = relationship(back_populates="items")
+    product: Mapped[Product | None] = relationship(back_populates="field_purchase_items")
+    enrichment_task: Mapped[ProductEnrichmentTask | None] = relationship()
+    tag_evidence: Mapped[list[TagEvidence]] = relationship(
+        back_populates="item", cascade="all, delete-orphan", order_by="TagEvidence.id",
+    )
+    sync_requests: Mapped[list[FieldPurchaseSyncRequest]] = relationship(back_populates="item")
+    audit_logs: Mapped[list[EnrichmentAuditLog]] = relationship(back_populates="field_purchase_item")
+
+
+class TagEvidence(Base):
+    __tablename__ = "tag_evidence"
+    __table_args__ = (
+        UniqueConstraint("field_purchase_item_id", "sha256", name="uq_tag_evidence_item_hash"),
+        CheckConstraint(
+            "ocr_status IN ('PENDING','UNCONFIGURED','PROCESSING','COMPLETED','FAILED_RETRYABLE','FAILED_MANUAL')",
+            name="ck_tag_evidence_ocr_status",
+        ),
+    )
+    id: Mapped[int] = mapped_column(primary_key=True)
+    field_purchase_item_id: Mapped[int] = mapped_column(
+        ForeignKey("field_purchase_items.id", ondelete="CASCADE"), nullable=False, index=True,
+    )
+    original_filename: Mapped[str] = mapped_column(String(255), nullable=False)
+    content_type: Mapped[str] = mapped_column(String(100), nullable=False)
+    file_path: Mapped[str] = mapped_column(Text, nullable=False)
+    sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    byte_size: Mapped[int] = mapped_column(Integer, nullable=False)
+    ocr_status: Mapped[str] = mapped_column(String(30), default="PENDING", nullable=False, index=True)
+    ocr_text: Mapped[str | None] = mapped_column(Text)
+    ocr_confidence: Mapped[float | None] = mapped_column(Float)
+    captured_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
+    item: Mapped[FieldPurchaseItem] = relationship(back_populates="tag_evidence")
+
+
+class ProductSerial(Base):
+    __tablename__ = "product_serials"
+    __table_args__ = (
+        CheckConstraint("status IN ('ACTIVE','USED','VOID')", name="ck_product_serials_status"),
+    )
+    id: Mapped[int] = mapped_column(primary_key=True)
+    product_id: Mapped[int] = mapped_column(ForeignKey("products.id", ondelete="CASCADE"), nullable=False, index=True)
+    serial_value: Mapped[str] = mapped_column(String(255), unique=True, nullable=False)
+    source: Mapped[str] = mapped_column(String(50), default="manual", nullable=False)
+    status: Mapped[str] = mapped_column(String(20), default="ACTIVE", nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
+    product: Mapped[Product] = relationship(back_populates="serials")
+
+
+class FieldPurchaseSyncRequest(Base):
+    __tablename__ = "field_purchase_sync_requests"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    client_request_id: Mapped[str] = mapped_column(String(100), unique=True, nullable=False, index=True)
+    request_type: Mapped[str] = mapped_column(String(40), nullable=False)
+    batch_id: Mapped[int] = mapped_column(
+        ForeignKey("field_purchase_batches.id", ondelete="CASCADE"), nullable=False, index=True,
+    )
+    item_id: Mapped[int | None] = mapped_column(
+        ForeignKey("field_purchase_items.id", ondelete="SET NULL"), index=True,
+    )
+    response_json: Mapped[str] = mapped_column(Text, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
+    item: Mapped[FieldPurchaseItem | None] = relationship(back_populates="sync_requests")
+
+
+class DurableBackgroundJob(Base):
+    __tablename__ = "durable_background_jobs"
+    __table_args__ = (
+        CheckConstraint(
+            "status IN ('PENDING','RUNNING','COMPLETED','FAILED_RETRYABLE','FAILED_MANUAL')",
+            name="ck_durable_background_jobs_status",
+        ),
+    )
+    id: Mapped[int] = mapped_column(primary_key=True)
+    dedupe_key: Mapped[str] = mapped_column(String(160), unique=True, nullable=False, index=True)
+    job_type: Mapped[str] = mapped_column(String(60), nullable=False, index=True)
+    payload_json: Mapped[str] = mapped_column(Text, nullable=False)
+    status: Mapped[str] = mapped_column(String(30), default="PENDING", nullable=False, index=True)
+    attempts: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    max_attempts: Mapped[int] = mapped_column(Integer, default=3, nullable=False)
+    available_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False, index=True)
+    locked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), index=True)
+    last_error: Mapped[str | None] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow, nullable=False)
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+class PlatformProviderState(Base):
+    __tablename__ = "platform_provider_states"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    provider_code: Mapped[str] = mapped_column(String(50), unique=True, nullable=False, index=True)
+    configured: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    credentials_valid: Mapped[bool | None] = mapped_column(Boolean)
+    last_success_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    last_tested_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    last_test_status: Mapped[str | None] = mapped_column(String(30))
+    last_http_status: Mapped[int | None] = mapped_column(Integer)
+    last_result_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    recent_error: Mapped[str | None] = mapped_column(Text)
+    request_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow, nullable=False)
+
+
+class PlatformLookupResult(Base):
+    __tablename__ = "platform_lookup_results"
+    __table_args__ = (
+        CheckConstraint("link_type IN ('product','search')", name="ck_platform_lookup_results_link_type"),
+    )
+    id: Mapped[int] = mapped_column(primary_key=True)
+    price_search_run_id: Mapped[int | None] = mapped_column(
+        ForeignKey("price_search_runs.id", ondelete="CASCADE"), index=True,
+    )
+    field_purchase_item_id: Mapped[int | None] = mapped_column(
+        ForeignKey("field_purchase_items.id", ondelete="SET NULL"), index=True,
+    )
+    platform: Mapped[str] = mapped_column(String(50), nullable=False, index=True)
+    jan: Mapped[str | None] = mapped_column(String(32), index=True)
+    title: Mapped[str | None] = mapped_column(Text)
+    brand: Mapped[str | None] = mapped_column(String(128))
+    price: Mapped[int | None] = mapped_column(Integer)
+    shipping_fee: Mapped[int | None] = mapped_column(Integer)
+    total_price: Mapped[int | None] = mapped_column(Integer)
+    currency: Mapped[str] = mapped_column(String(3), default="JPY", nullable=False)
+    availability: Mapped[str | None] = mapped_column(String(30))
+    seller: Mapped[str | None] = mapped_column(String(255))
+    product_url: Mapped[str | None] = mapped_column(Text)
+    image_url: Mapped[str | None] = mapped_column(Text)
+    link_type: Mapped[str] = mapped_column(String(20), default="product", nullable=False)
+    jan_verified: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    match_type: Mapped[str] = mapped_column(String(30), default="UNVERIFIED", nullable=False)
+    confidence: Mapped[float] = mapped_column(Float, default=0, nullable=False)
+    fetched_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    error_code: Mapped[str | None] = mapped_column(String(60))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
+    search_run: Mapped[PriceSearchRun | None] = relationship(back_populates="platform_results")
+
+
+class EnrichmentAuditLog(Base):
+    __tablename__ = "enrichment_audit_logs"
+    __table_args__ = (
+        CheckConstraint(
+            "action IN ('SELECT_CANDIDATE','REJECT_CANDIDATE','MANUAL_EDIT','BULK_EDIT',"
+            "'RETRY','CONFIRM','BIND_EXISTING')",
+            name="ck_enrichment_audit_logs_action",
+        ),
+    )
+    id: Mapped[int] = mapped_column(primary_key=True)
+    field_purchase_item_id: Mapped[int | None] = mapped_column(
+        ForeignKey("field_purchase_items.id", ondelete="SET NULL"), index=True,
+    )
+    enrichment_task_id: Mapped[int | None] = mapped_column(
+        ForeignKey("product_enrichment_tasks.id", ondelete="SET NULL"), index=True,
+    )
+    action: Mapped[str] = mapped_column(String(40), nullable=False, index=True)
+    actor: Mapped[str] = mapped_column(String(128), nullable=False)
+    before_json: Mapped[str | None] = mapped_column(Text)
+    after_json: Mapped[str | None] = mapped_column(Text)
+    source: Mapped[str] = mapped_column(String(50), default="web", nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
+    field_purchase_item: Mapped[FieldPurchaseItem | None] = relationship(back_populates="audit_logs")
 
 
 class ImportJob(Base):
@@ -807,8 +1247,12 @@ class QinsiExportJob(Base):
     id: Mapped[int] = mapped_column(primary_key=True)
     status: Mapped[str] = mapped_column(String(20), default="pending", nullable=False)
     export_filename: Mapped[str | None] = mapped_column(String(255))
+    file_content: Mapped[bytes | None] = mapped_column(LargeBinary)
     exported_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     confirmed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    confirmed_by: Mapped[str | None] = mapped_column(String(128))
+    cancelled_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    cancelled_by: Mapped[str | None] = mapped_column(String(128))
     error_message: Mapped[str | None] = mapped_column(Text)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow, nullable=False)
@@ -874,6 +1318,9 @@ class PriceSearchRun(Base):
     offers: Mapped[list[ProductOffer]] = relationship(back_populates="search_run", cascade="all, delete-orphan", order_by="ProductOffer.total_price")
     provider_attempts: Mapped[list[PriceProviderAttempt]] = relationship(back_populates="search_run", cascade="all, delete-orphan", order_by="PriceProviderAttempt.id")
     lookup_histories: Mapped[list[PriceLookupHistory]] = relationship(back_populates="search_run", cascade="all, delete-orphan")
+    platform_results: Mapped[list[PlatformLookupResult]] = relationship(
+        back_populates="search_run", cascade="all, delete-orphan", order_by="PlatformLookupResult.id",
+    )
 
 
 class ProductOffer(Base):
