@@ -160,7 +160,10 @@ def test_existing_product_match_totals_history_and_comparison(db_session):
 def test_new_jan_creates_pending_product(db_session):
     provider = FakeProvider("new_candidate", ProviderResponse("success", (offer(900),)))
     view = query_prices(db_session, PriceLookupInput(jan=VALID_JAN), [provider])
-    assert view.product is not None and view.product.status == "new_pending_review"
+    # No deepseek_client is injected here, so DeepSeek stays unconfigured in this
+    # hermetic test run and the offer title never becomes a chosen_cn; the product
+    # still needs a human-completed Chinese name, hence new_pending_completion.
+    assert view.product is not None and view.product.status == "new_pending_completion"
     assert view.product.purchase_price == 900 and view.product.sale_price == 900
     assert view.run.is_new_candidate is False
     assert db_session.scalar(select(func.count()).select_from(Product)) == 1
