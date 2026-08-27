@@ -16,14 +16,14 @@ from fastapi import BackgroundTasks, Depends, FastAPI, File, Form, HTTPException
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, PlainTextResponse, RedirectResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
-from pydantic import BaseModel, Field, ValidationError
+from pydantic import BaseModel, ConfigDict, Field, ValidationError
 from sqlalchemy import func, or_, select, text
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.orm import Session, selectinload
 
 from app.config import PREVIEW_DIR, PRODUCT_IMAGE_DIR, PROJECT_ROOT, QINSI_PRODUCT_IMAGE_DIR, TAG_EVIDENCE_DIR, default_role, ensure_data_directories, get_deepseek_config, is_testing
 from app.db import SessionLocal, engine, get_db
-from app.models import DurableBackgroundJob, DuplicateDetectionLog, EnrichmentAuditLog, FieldPurchaseItem, PlatformProviderState, Product, ProductAlias, ProductEnrichmentCandidate, ProductWatchConfig, ProductWatchSnapshot, PurchaseBatch, PurchaseBatchItem, QinsiExportJob, QinsiGoodsImportRow, QinsiImportBatch, QinsiPurchaseExportJob, Receipt, ReceiptBatch, ReceiptImage, ReceiptItem, RestockList, RestockListItem, Store, StoreBrand, TagEvidence, ZipPackageItem, ZipPackageJob
+from app.models import Customer, DurableBackgroundJob, DuplicateDetectionLog, EnrichmentAuditLog, FieldPurchaseItem, PlatformProviderState, Product, ProductAlias, ProductEnrichmentCandidate, ProductWatchConfig, ProductWatchSnapshot, PurchaseBatch, PurchaseBatchItem, QinsiExportJob, QinsiGoodsImportRow, QinsiImportBatch, QinsiPurchaseExportJob, Receipt, ReceiptBatch, ReceiptImage, ReceiptItem, RestockList, RestockListItem, SalesOrder, Salesperson, Store, StoreBrand, TagEvidence, ZipPackageItem, ZipPackageJob
 from app.analytics_service import analytics_dashboard, procurement_data, resolve_date_range
 from app.product_matching import (
     bind_product,
@@ -123,6 +123,13 @@ from app.restock_service import (
     link_purchase_item, list_restock_lists, list_statistics, lists_for_product,
     recent_lists_for_store, restock_candidates, trace_rows, update_restock_item,
     update_restock_list_status,
+)
+from app.sales_order_service import (
+    ALLOWED_TRANSITIONS, PRIMARY_NEXT_ACTION, STATUS_LABELS as SALES_ORDER_STATUS_CN,
+    SalesOrderItemInput, create_customer, create_sales_order,
+    ensure_default_salesperson, get_sales_order, list_sales_orders, list_salespersons,
+    search_customers, search_products as search_sales_order_products,
+    status_counts as sales_order_status_counts, update_sales_order_status,
 )
 from app.provider_config import diagnostic_summary, provider_status_rows, test_provider_connection
 from app.rakuten_ip_monitor import rakuten_public_ip_status
@@ -2910,6 +2917,148 @@ def restock_list_item_link_purchase(item_id: int, purchase_batch_item_id: int = 
         db.rollback()
         return RedirectResponse(f"/restock-lists/{list_id}?error={quote(str(exc))}", status_code=303)
     return RedirectResponse(f"/restock-lists/{list_id}#restock-item-{item_id}", status_code=303)
+
+
+def _product_search_payload(product: Product) -> dict:
+    return {
+        "id": product.id,
+        "display_name": product.display_name or product.name_cn or product.name_ja or product.internal_sku,
+        "jan": product.jan,
+        "internal_sku": product.internal_sku,
+        "sale_price": str(product.sale_price) if product.sale_price is not None else None,
+    }
+
+
+def _customer_search_payload(customer: Customer) -> dict:
+    return {
+        "id": customer.id, "name": customer.name, "phone": customer.phone,
+        "wechat_name": customer.wechat_name, "address": customer.address, "note": customer.note,
+    }
+
+
+class CustomerCreateInput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    name: str = Field(min_length=1, max_length=255)
+    phone: str | None = None
+    wechat_name: str | None = None
+    address: str | None = None
+    note: str | None = None
+
+
+@app.get("/api/products/search")
+def api_sales_order_product_search(q: str = Query(""), db: Session = Depends(get_db)):
+    return [_product_search_payload(product) for product in search_sales_order_products(db, q, limit=20)]
+
+
+@app.get("/api/customers/search")
+def api_customer_search(q: str = Query(""), db: Session = Depends(get_db)):
+    return [_customer_search_payload(customer) for customer in search_customers(db, q, limit=20)]
+
+
+@app.post("/api/customers", status_code=201)
+def api_create_customer(data: CustomerCreateInput, db: Session = Depends(get_db)):
+    try:
+        customer = create_customer(
+            db, name=data.name, phone=data.phone, wechat_name=data.wechat_name,
+            address=data.address, note=data.note,
+        )
+    except ValueError as exc:
+        db.rollback()
+        raise HTTPException(422, str(exc)) from exc
+    return _customer_search_payload(customer)
+
+
+SALES_ORDER_TAB_STATUSES = ("submitted", "ready_to_ship", "shipped", "completed", "cancelled")
+
+
+@app.get("/sales-orders", response_class=HTMLResponse)
+def sales_orders_page(
+    request: Request, status: str = Query(""), q: str = Query(""),
+    date_from: str = Query(""), date_to: str = Query(""), db: Session = Depends(get_db),
+):
+    parsed_from = date.fromisoformat(date_from) if date_from else None
+    parsed_to = date.fromisoformat(date_to) if date_to else None
+    rows = list_sales_orders(db, status=status or None, q=q or None, date_from=parsed_from, date_to=parsed_to)
+    counts = sales_order_status_counts(db)
+    tabs = [(value, SALES_ORDER_STATUS_CN[value], counts.get(value, 0)) for value in SALES_ORDER_TAB_STATUSES]
+    return templates.TemplateResponse(request, "sales_orders.html", {
+        "rows": rows, "status": status, "q": q, "date_from": date_from, "date_to": date_to,
+        "status_labels": SALES_ORDER_STATUS_CN, "tabs": tabs, "total_count": sum(counts.values()),
+        "primary_next_action": PRIMARY_NEXT_ACTION,
+    })
+
+
+@app.get("/sales-orders/new", response_class=HTMLResponse)
+def sales_order_new_page(request: Request, db: Session = Depends(get_db)):
+    default_salesperson = ensure_default_salesperson(db)
+    salespersons = list_salespersons(db)
+    return templates.TemplateResponse(request, "sales_order_new.html", {
+        "default_salesperson": default_salesperson, "salespersons": salespersons,
+        "error": request.query_params.get("error"),
+    })
+
+
+@app.post("/sales-orders")
+async def sales_order_create(request: Request, db: Session = Depends(get_db)):
+    form = await request.form()
+    customer_id = str(form.get("customer_id") or "")
+    salesperson_id = str(form.get("salesperson_id") or "")
+    note = str(form.get("note") or "")
+    try:
+        if not customer_id.isdigit() or not salesperson_id.isdigit():
+            raise ValueError("请先选择客户")
+        raw_items = json.loads(form.get("items_json") or "[]")
+        if not isinstance(raw_items, list):
+            raise ValueError("商品数据格式错误")
+        items: list[SalesOrderItemInput] = []
+        for raw in raw_items:
+            try:
+                quantity = int(raw.get("quantity"))
+                unit_sale_price = Decimal(str(raw.get("unit_sale_price")))
+            except (TypeError, ValueError, ArithmeticError) as exc:
+                raise ValueError("数量或单价格式错误") from exc
+            product_id_raw = raw.get("product_id")
+            items.append(SalesOrderItemInput(
+                product_id=int(product_id_raw) if product_id_raw not in (None, "", 0) else None,
+                manual_name=raw.get("manual_name"), jan=raw.get("jan"),
+                quantity=quantity, unit_sale_price=unit_sale_price, note=raw.get("note"),
+            ))
+        order = create_sales_order(
+            db, customer_id=int(customer_id), salesperson_id=int(salesperson_id), items=items, note=note,
+            recipient_name=str(form.get("recipient_name") or ""),
+            recipient_phone=str(form.get("recipient_phone") or ""),
+            shipping_address=str(form.get("shipping_address") or ""),
+        )
+    except (LookupError, ValueError) as exc:
+        db.rollback()
+        return RedirectResponse(f"/sales-orders/new?error={quote(str(exc))}", status_code=303)
+    return RedirectResponse(f"/sales-orders/{order.id}", status_code=303)
+
+
+@app.get("/sales-orders/{order_id}", response_class=HTMLResponse)
+def sales_order_detail_page(order_id: int, request: Request, db: Session = Depends(get_db)):
+    order = get_sales_order(db, order_id)
+    if order is None:
+        raise HTTPException(404, "订单不存在")
+    return templates.TemplateResponse(request, "sales_order_detail.html", {
+        "order": order, "status_labels": SALES_ORDER_STATUS_CN,
+        "allowed_transitions": ALLOWED_TRANSITIONS.get(order.status, set()),
+        "primary_next_action": PRIMARY_NEXT_ACTION.get(order.status),
+        "error": request.query_params.get("error"),
+    })
+
+
+@app.post("/sales-orders/{order_id}/status")
+def sales_order_status_update(order_id: int, status: str = Form(...), db: Session = Depends(get_db)):
+    try:
+        update_sales_order_status(db, order_id, status)
+    except LookupError as exc:
+        db.rollback()
+        raise HTTPException(404, str(exc)) from exc
+    except ValueError as exc:
+        db.rollback()
+        return RedirectResponse(f"/sales-orders/{order_id}?error={quote(str(exc))}", status_code=303)
+    return RedirectResponse(f"/sales-orders/{order_id}", status_code=303)
 
 
 @app.get("/stores", response_class=HTMLResponse)

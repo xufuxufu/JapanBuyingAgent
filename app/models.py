@@ -1641,6 +1641,93 @@ class PriceAlert(Base):
     acknowledged_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
 
+class Customer(Base):
+    __tablename__ = "customers"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    name: Mapped[str] = mapped_column(String(255), nullable=False)
+    phone: Mapped[str | None] = mapped_column(String(50))
+    wechat_name: Mapped[str | None] = mapped_column(String(128))
+    address: Mapped[str | None] = mapped_column(Text)
+    note: Mapped[str | None] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow, nullable=False)
+    sales_orders: Mapped[list[SalesOrder]] = relationship(back_populates="customer")
+
+
+class Salesperson(Base):
+    __tablename__ = "salespersons"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    name: Mapped[str] = mapped_column(String(128), nullable=False)
+    active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow, nullable=False)
+    sales_orders: Mapped[list[SalesOrder]] = relationship(back_populates="salesperson")
+
+
+class SalesOrder(Base):
+    __tablename__ = "sales_orders"
+    __table_args__ = (
+        CheckConstraint(
+            "status IN ('submitted','ready_to_ship','shipped','completed','cancelled')",
+            name="ck_sales_orders_status",
+        ),
+        Index("ix_sales_orders_status_created", "status", "created_at"),
+    )
+    id: Mapped[int] = mapped_column(primary_key=True)
+    order_no: Mapped[str] = mapped_column(String(40), unique=True, nullable=False)
+    customer_id: Mapped[int] = mapped_column(ForeignKey("customers.id", ondelete="RESTRICT"), nullable=False, index=True)
+    salesperson_id: Mapped[int] = mapped_column(ForeignKey("salespersons.id", ondelete="RESTRICT"), nullable=False, index=True)
+    status: Mapped[str] = mapped_column(String(20), default="submitted", nullable=False, index=True)
+    order_date: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    note: Mapped[str | None] = mapped_column(Text)
+    recipient_name_snapshot: Mapped[str | None] = mapped_column(String(255))
+    recipient_phone_snapshot: Mapped[str | None] = mapped_column(String(50))
+    shipping_address_snapshot: Mapped[str | None] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False, index=True)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow, nullable=False)
+    customer: Mapped[Customer] = relationship(back_populates="sales_orders")
+    salesperson: Mapped[Salesperson] = relationship(back_populates="sales_orders")
+    items: Mapped[list[SalesOrderItem]] = relationship(
+        back_populates="sales_order", cascade="all, delete-orphan", order_by="SalesOrderItem.id",
+    )
+
+    @property
+    def total_amount(self) -> Decimal:
+        return sum((item.line_amount for item in self.items), Decimal("0"))
+
+    @property
+    def total_quantity(self) -> int:
+        return sum(item.quantity for item in self.items)
+
+    @property
+    def item_kind_count(self) -> int:
+        return len(self.items)
+
+
+class SalesOrderItem(Base):
+    __tablename__ = "sales_order_items"
+    __table_args__ = (
+        CheckConstraint("quantity > 0", name="ck_sales_order_items_quantity_positive"),
+        CheckConstraint("unit_sale_price >= 0", name="ck_sales_order_items_price_non_negative"),
+    )
+    id: Mapped[int] = mapped_column(primary_key=True)
+    sales_order_id: Mapped[int] = mapped_column(ForeignKey("sales_orders.id", ondelete="CASCADE"), nullable=False, index=True)
+    product_id: Mapped[int | None] = mapped_column(ForeignKey("products.id", ondelete="SET NULL"), index=True)
+    product_name_snapshot: Mapped[str] = mapped_column(String(255), nullable=False)
+    jan_snapshot: Mapped[str | None] = mapped_column(String(32))
+    quantity: Mapped[int] = mapped_column(Integer, nullable=False)
+    unit_sale_price: Mapped[Decimal] = mapped_column(Numeric(18, 2), nullable=False)
+    note: Mapped[str | None] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow, nullable=False)
+    sales_order: Mapped[SalesOrder] = relationship(back_populates="items")
+    product: Mapped[Product | None] = relationship()
+
+    @property
+    def line_amount(self) -> Decimal:
+        return (self.unit_sale_price or Decimal("0")) * self.quantity
+
+
 from app.product_identity import install_product_identity_events
 
 install_product_identity_events()

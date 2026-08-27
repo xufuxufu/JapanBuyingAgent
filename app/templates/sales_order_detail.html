@@ -1,0 +1,58 @@
+{% extends "base.html" %}
+{% block title %}{{ order.order_no }} · 订单详情{% endblock %}
+{% block content %}
+<div class="section-head"><div><h1>{{ order.order_no }}</h1><p class="muted"><span class="badge state-{{ order.status }}">{{ status_labels.get(order.status, order.status) }}</span> · 下单 {{ order.order_date|tokyo_datetime }} · 销售员 {{ order.salesperson.name }}</p></div><a class="button secondary" href="/sales-orders">返回列表</a></div>
+{% if error %}<div class="warning"><strong>操作失败：</strong>{{ error }}</div>{% endif %}
+
+<section class="card">
+  <h2>客户信息</h2>
+  <div class="summary-grid">
+    <span><strong>{{ order.customer.name }}</strong>客户</span>
+    <span><strong>{{ order.customer.phone or '—' }}</strong>电话</span>
+    <span><strong>{{ order.customer.wechat_name or '—' }}</strong>微信名</span>
+  </div>
+</section>
+
+<section class="card">
+  <h2>收货信息</h2>
+  <div class="summary-grid">
+    <span><strong>{{ order.recipient_name_snapshot or order.customer.name }}</strong>收件人</span>
+    <span><strong>{{ order.recipient_phone_snapshot or order.customer.phone or '—' }}</strong>收件手机号</span>
+  </div>
+  <p class="muted">地址：{{ order.shipping_address_snapshot or order.customer.address or '地址待补充' }}</p>
+</section>
+
+<section class="card">
+  <h2>商品信息</h2>
+  <div class="stack">
+    {% for item in order.items %}
+    <div class="row item-detail-row">
+      {% if item.product and item.product.preferred_image_url %}
+      <img class="product-thumb" loading="lazy" src="{{ item.product.preferred_image_url }}" alt="商品主图">
+      {% else %}<div class="product-image-empty product-thumb">无图</div>{% endif %}
+      <span>
+        <strong>{{ item.product_name_snapshot }}</strong>
+        <small>{{ item.jan_snapshot or 'JAN 未填写' }}{% if item.product_id %} · <a href="/products/{{ item.product_id }}">查看商品</a>{% else %} · 手工商品{% endif %}</small>
+        {% if item.note %}<small>备注：{{ item.note }}</small>{% endif %}
+      </span>
+      <span class="badge">×{{ item.quantity }} · ¥{{ item.unit_sale_price }} = ¥{{ item.line_amount }}</span>
+    </div>
+    {% else %}<p class="empty-state">订单暂无商品明细。</p>{% endfor %}
+  </div>
+  <p class="order-total">共 {{ order.total_quantity }} 件 · 订单总金额：¥{{ order.total_amount }}</p>
+  {% if order.note %}<p><strong>订单备注：</strong>{{ order.note }}</p>{% endif %}
+</section>
+
+<section class="card">
+  <h2>操作</h2>
+  <div class="button-row">
+    {% if primary_next_action %}
+    <form method="post" action="/sales-orders/{{ order.id }}/status"><input type="hidden" name="status" value="{{ primary_next_action[0] }}"><button type="submit">{{ primary_next_action[1] }}</button></form>
+    {% endif %}
+    {% if 'cancelled' in allowed_transitions %}
+    <form method="post" action="/sales-orders/{{ order.id }}/status" onsubmit="return confirm('确认取消该订单？取消后订单仍会保留，可用于后续核对。');"><input type="hidden" name="status" value="cancelled"><button type="submit" class="secondary">取消订单</button></form>
+    {% endif %}
+  </div>
+  {% if not primary_next_action and order.status not in ('cancelled',) %}<p class="muted">当前状态已是流转终点，无需继续操作。</p>{% endif %}
+</section>
+{% endblock %}

@@ -1,0 +1,80 @@
+{% extends "base.html" %}
+{% block title %}新建微信订单{% endblock %}
+{% block content %}
+<div class="section-head"><div><h1>新建微信订单</h1><p class="muted">只记录客户需求事实；不判断库存、不生成采购、不联系微信。</p></div><a class="button secondary" href="/sales-orders">返回列表</a></div>
+{% if error %}<div class="warning"><strong>提交失败：</strong>{{ error }}</div>{% endif %}
+<form id="salesOrderForm" method="post" action="/sales-orders">
+  <input type="hidden" name="customer_id" id="customerIdInput">
+  <input type="hidden" name="salesperson_id" value="{{ default_salesperson.id }}">
+  <input type="hidden" name="items_json" id="itemsJsonInput">
+
+  <section class="card">
+    <h2>客户</h2>
+    <div id="customerPicked" hidden><p><strong id="customerPickedName"></strong> <button type="button" class="link-button" id="customerChange">更换</button></p><p class="muted" id="customerPickedMeta"></p></div>
+    <div id="customerSearchBlock">
+      <label>搜索已有客户（姓名 / 电话 / 微信名）<input type="search" id="customerSearchInput" autocomplete="off" placeholder="输入关键字搜索"></label>
+      <div id="customerSearchResults" class="search-results" hidden></div>
+      <button type="button" class="secondary" id="customerQuickAddToggle">+ 快速新增客户</button>
+      <div id="customerQuickAddForm" class="stack" hidden>
+        <label>客户姓名（必填）<input id="newCustomerName" maxlength="255"></label>
+        <label>电话（可空）<input id="newCustomerPhone" maxlength="50" inputmode="tel"></label>
+        <label>微信名（可空）<input id="newCustomerWechat" maxlength="128"></label>
+        <label>地址（可空）<input id="newCustomerAddress" maxlength="255"></label>
+        <label>备注（可空）<input id="newCustomerNote" maxlength="255"></label>
+        <div class="button-row"><button type="button" id="customerQuickAddSave">保存并使用</button><button type="button" class="secondary" id="customerQuickAddCancel">取消</button></div>
+        <p id="customerQuickAddError" class="error" hidden></p>
+      </div>
+    </div>
+  </section>
+
+  <section class="card" id="recipientBlock" hidden>
+    <h2>收货信息</h2>
+    <p class="muted">默认带出客户资料，可为同一微信客户单独修改本次收货人。</p>
+    <div class="form-grid">
+      <label>收件人姓名<input name="recipient_name" id="recipientNameInput" maxlength="255"></label>
+      <label>收件手机号<input name="recipient_phone" id="recipientPhoneInput" maxlength="50" inputmode="tel"></label>
+      <label class="full">收货地址<input name="shipping_address" id="shippingAddressInput" maxlength="500"></label>
+    </div>
+  </section>
+
+  <section class="card">
+    <h2>销售员</h2>
+    {% if salespersons|length > 1 %}
+    <label>销售员<select name="salesperson_id_select" id="salespersonSelect">{% for person in salespersons %}<option value="{{ person.id }}"{% if person.id == default_salesperson.id %} selected{% endif %}>{{ person.name }}</option>{% endfor %}</select></label>
+    {% else %}
+    <p class="badge">默认销售员：{{ default_salesperson.name }}</p>
+    {% endif %}
+  </section>
+
+  <section class="card">
+    <div class="section-head"><h2>商品</h2><button type="button" id="addItemRow">+ 添加商品</button></div>
+    <div id="itemRows" class="stack"></div>
+    <template id="itemRowTemplate">
+      <div class="card item-card">
+        <div class="button-row"><span class="badge">商品 <span class="item-index"></span></span><button type="button" class="link-button item-remove">删除</button></div>
+        <label class="item-mode-existing">商品搜索<input type="search" class="item-product-search" autocomplete="off" placeholder="输入中文名/日文名/JAN/秦丝货号/内部SKU"></label>
+        <div class="search-results item-search-results" hidden></div>
+        <p class="muted item-selected-name" hidden></p>
+        <button type="button" class="link-button item-manual-toggle">该商品未收录，改为手工输入名称</button>
+        <label class="item-mode-manual full" hidden>手工商品名（必填）<input class="item-manual-name" maxlength="255"></label>
+        <div class="form-grid">
+          <label>JAN（可空）<input class="item-jan" maxlength="32"></label>
+          <label>数量<input class="item-quantity" type="number" min="1" step="1" inputmode="numeric" value="1"></label>
+          <label>实际销售单价（日元）<input class="item-price" type="number" min="0" step="1" inputmode="numeric"></label>
+          <label>备注（可空）<input class="item-note" maxlength="255"></label>
+        </div>
+        <p class="muted">行金额：¥<span class="item-line-amount">0</span></p>
+      </div>
+    </template>
+    <p id="itemsEmptyHint" class="empty-state">点击“添加商品”开始录入。</p>
+  </section>
+
+  <section class="card order-submit-bar">
+    <label>订单备注（可空）<textarea name="note" rows="2" maxlength="500"></textarea></label>
+    <p class="order-total">订单总金额：¥<span id="orderTotalAmount">0</span></p>
+    <button class="full" type="submit" id="submitOrderButton">提交订单</button>
+    <p id="formError" class="error" hidden></p>
+  </section>
+</form>
+<script src="/static/sales_order_new.js" defer></script>
+{% endblock %}

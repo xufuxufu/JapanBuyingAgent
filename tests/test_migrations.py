@@ -9,7 +9,7 @@ from alembic import command
 from alembic.config import Config
 
 
-HEAD_REVISION = "20260825_0037"
+HEAD_REVISION = "20260828_0039"
 
 
 def test_migration_from_empty_and_repeat_safe(tmp_path, monkeypatch):
@@ -22,6 +22,7 @@ def test_migration_from_empty_and_repeat_safe(tmp_path, monkeypatch):
         tables = {row[0] for row in connection.execute("SELECT name FROM sqlite_master WHERE type='table'")}
         revision = connection.execute("SELECT version_num FROM alembic_version").fetchone()
         product_columns = {row[1] for row in connection.execute("PRAGMA table_info(products)")}
+        sales_order_columns = {row[1] for row in connection.execute("PRAGMA table_info(sales_orders)")}
     assert {"receipt_batches", "receipt_images", "receipts", "receipt_items", "ai_recognition_runs", "products", "product_aliases", "store_brands", "stores", "store_aliases", "locations", "purchase_batches", "purchase_batch_items", "inventory_transactions", "import_jobs", "import_rows", "product_match_logs", "qinsi_export_jobs", "qinsi_export_lines", "qinsi_export_line_sources", "qinsi_purchase_export_jobs", "qinsi_purchase_export_lines", "qinsi_purchase_export_line_sources", "marketplaces", "price_search_runs", "product_offers", "price_provider_attempts", "price_lookup_histories", "price_watch_rules", "price_alerts", "product_watch_configs", "product_watch_recommendations", "duplicate_detection_logs", "zip_package_jobs", "zip_package_items"} <= tables
     assert {"product_watch_snapshots", "product_watch_notifications", "monitor_scheduler_states"} <= tables
     assert {"qinsi_inventory_snapshots", "qinsi_inventory_snapshot_lines", "qinsi_product_mappings"} <= tables
@@ -33,8 +34,124 @@ def test_migration_from_empty_and_repeat_safe(tmp_path, monkeypatch):
             "enrichment_audit_logs", "product_operation_logs",
     } <= tables
     assert {"restock_lists", "restock_list_items"} <= tables
+    assert {"customers", "salespersons", "sales_orders", "sales_order_items"} <= tables
     assert {"low_stock_threshold", "unit_name", "weight_kg", "qinsi_brand_master_id"} <= product_columns
+    assert {"recipient_name_snapshot", "recipient_phone_snapshot", "shipping_address_snapshot"} <= sales_order_columns
     assert revision == (HEAD_REVISION,)
+
+
+def test_0038_sales_order_tables_are_empty_and_repeat_safe(tmp_path, monkeypatch):
+    db_path = tmp_path / "sales-orders.sqlite3"
+    monkeypatch.setenv("JBA_DATABASE_URL", f"sqlite:///{db_path.as_posix()}")
+    config = Config(str(Path(__file__).resolve().parents[1] / "alembic.ini"))
+    command.upgrade(config, "head")
+    command.upgrade(config, "head")
+    with sqlite3.connect(db_path) as connection:
+        counts = {
+            table: connection.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+            for table in ("customers", "salespersons", "sales_orders", "sales_order_items")
+        }
+        columns = {row[1] for row in connection.execute("PRAGMA table_info(sales_order_items)")}
+    assert counts == {"customers": 0, "salespersons": 0, "sales_orders": 0, "sales_order_items": 0}
+    assert {"product_id", "product_name_snapshot", "jan_snapshot", "quantity", "unit_sale_price"} <= columns
+
+
+def test_0039_upgrade_preserves_submitted_and_cancelled_orders_and_downgrade_works(tmp_path, monkeypatch):
+    # Seed the *literal* 0038 schema by hand (not via command.upgrade), because
+    # migration 20260714_0001 bootstraps every table straight from the current,
+    # live app/models.py -- on an empty database it would create sales_orders
+    # already in its post-0039 shape and make 0039's own rebuild a silent no-op,
+    # so a command.upgrade(..., "20260828_0038")-based setup would never actually
+    # exercise migration 0039's real ALTER/rebuild logic (this bit a first version
+    # of this test: it "passed" without the rebuild ever running).
+    db_path = tmp_path / "sales-order-fulfillment.sqlite3"
+    with sqlite3.connect(db_path) as connection:
+        connection.executescript("""
+        CREATE TABLE alembic_version (version_num VARCHAR(32) NOT NULL PRIMARY KEY);
+        INSERT INTO alembic_version VALUES ('20260828_0038');
+        CREATE TABLE customers (
+            id INTEGER PRIMARY KEY, name VARCHAR(255) NOT NULL, phone VARCHAR(50),
+            wechat_name VARCHAR(128), address TEXT, note TEXT,
+            created_at DATETIME NOT NULL, updated_at DATETIME NOT NULL
+        );
+        CREATE TABLE salespersons (
+            id INTEGER PRIMARY KEY, name VARCHAR(128) NOT NULL, active BOOLEAN NOT NULL,
+            created_at DATETIME NOT NULL, updated_at DATETIME NOT NULL
+        );
+        CREATE TABLE products (id INTEGER PRIMARY KEY, internal_sku VARCHAR(32) NOT NULL);
+        CREATE TABLE sales_orders (
+            id INTEGER PRIMARY KEY,
+            order_no VARCHAR(40) NOT NULL UNIQUE,
+            customer_id INTEGER NOT NULL REFERENCES customers(id) ON DELETE RESTRICT,
+            salesperson_id INTEGER NOT NULL REFERENCES salespersons(id) ON DELETE RESTRICT,
+            status VARCHAR(20) NOT NULL,
+            order_date DATETIME NOT NULL,
+            note TEXT,
+            created_at DATETIME NOT NULL, updated_at DATETIME NOT NULL,
+            CONSTRAINT ck_sales_orders_status CHECK (status IN ('submitted','cancelled'))
+        );
+        CREATE TABLE sales_order_items (
+            id INTEGER PRIMARY KEY,
+            sales_order_id INTEGER NOT NULL REFERENCES sales_orders(id) ON DELETE CASCADE,
+            product_id INTEGER REFERENCES products(id) ON DELETE SET NULL,
+            product_name_snapshot VARCHAR(255) NOT NULL,
+            jan_snapshot VARCHAR(32),
+            quantity INTEGER NOT NULL,
+            unit_sale_price NUMERIC(18,2) NOT NULL,
+            note TEXT,
+            created_at DATETIME NOT NULL, updated_at DATETIME NOT NULL
+        );
+        INSERT INTO customers (id, name, created_at, updated_at) VALUES (1, '旧客户', datetime('now'), datetime('now'));
+        INSERT INTO salespersons (id, name, active, created_at, updated_at) VALUES (1, '秀', 1, datetime('now'), datetime('now'));
+        INSERT INTO sales_orders (order_no, customer_id, salesperson_id, status, order_date, created_at, updated_at)
+            VALUES ('SO-OLD-0001', 1, 1, 'submitted', datetime('now'), datetime('now'), datetime('now'));
+        INSERT INTO sales_orders (order_no, customer_id, salesperson_id, status, order_date, created_at, updated_at)
+            VALUES ('SO-OLD-0002', 1, 1, 'cancelled', datetime('now'), datetime('now'), datetime('now'));
+        INSERT INTO sales_order_items (sales_order_id, product_name_snapshot, quantity, unit_sale_price, created_at, updated_at)
+            VALUES (1, '旧商品', 1, 100, datetime('now'), datetime('now'));
+        """)
+    monkeypatch.setenv("JBA_DATABASE_URL", f"sqlite:///{db_path.as_posix()}")
+    config = Config(str(Path(__file__).resolve().parents[1] / "alembic.ini"))
+
+    command.upgrade(config, "head")
+    with sqlite3.connect(db_path) as connection:
+        connection.execute("PRAGMA foreign_keys=ON")
+        rows = {
+            row[0]: row[1] for row in connection.execute("SELECT order_no, status FROM sales_orders")
+        }
+        columns = {row[1] for row in connection.execute("PRAGMA table_info(sales_orders)")}
+        item_fk_sql = connection.execute("SELECT sql FROM sqlite_master WHERE name='sales_order_items'").fetchone()[0]
+        revision = connection.execute("SELECT version_num FROM alembic_version").fetchone()
+        # sales_order_items must still reference the live "sales_orders" table, not a
+        # leftover rebuild artifact -- this is the regression this test guards against.
+        connection.execute(
+            "INSERT INTO sales_order_items (sales_order_id, product_name_snapshot, quantity, unit_sale_price, created_at, updated_at) "
+            "VALUES (1, '迁移后新商品', 1, 50, datetime('now'), datetime('now'))"
+        )
+        connection.commit()
+    assert rows == {"SO-OLD-0001": "submitted", "SO-OLD-0002": "cancelled"}
+    assert {"recipient_name_snapshot", "recipient_phone_snapshot", "shipping_address_snapshot"} <= columns
+    assert "REFERENCES sales_orders" in item_fk_sql
+    assert revision == (HEAD_REVISION,)
+
+    command.downgrade(config, "20260828_0038")
+    with sqlite3.connect(db_path) as connection:
+        connection.execute("PRAGMA foreign_keys=ON")
+        rows = {
+            row[0]: row[1] for row in connection.execute("SELECT order_no, status FROM sales_orders")
+        }
+        columns = {row[1] for row in connection.execute("PRAGMA table_info(sales_orders)")}
+        item_fk_sql = connection.execute("SELECT sql FROM sqlite_master WHERE name='sales_order_items'").fetchone()[0]
+        revision = connection.execute("SELECT version_num FROM alembic_version").fetchone()
+        connection.execute(
+            "INSERT INTO sales_order_items (sales_order_id, product_name_snapshot, quantity, unit_sale_price, created_at, updated_at) "
+            "VALUES (1, '降级后新商品', 1, 50, datetime('now'), datetime('now'))"
+        )
+        connection.commit()
+    assert rows == {"SO-OLD-0001": "submitted", "SO-OLD-0002": "cancelled"}
+    assert "recipient_name_snapshot" not in columns
+    assert "REFERENCES sales_orders" in item_fk_sql
+    assert revision == ("20260828_0038",)
 
 
 def test_upgrade_from_phase1_preserves_old_data(tmp_path, monkeypatch):
@@ -46,6 +163,7 @@ def test_upgrade_from_phase1_preserves_old_data(tmp_path, monkeypatch):
         CREATE TABLE receipt_batches (id INTEGER PRIMARY KEY, batch_no VARCHAR(40) NOT NULL, status VARCHAR(20) NOT NULL, image_count INTEGER NOT NULL, source_type VARCHAR(20) NOT NULL, recognition_engine VARCHAR(30) NOT NULL, created_at DATETIME NOT NULL, updated_at DATETIME NOT NULL);
         CREATE TABLE receipt_images (id INTEGER PRIMARY KEY, batch_id INTEGER NOT NULL, original_filename VARCHAR(255) NOT NULL, stored_filename VARCHAR(100) NOT NULL, original_path TEXT NOT NULL, processed_path TEXT, page_no INTEGER NOT NULL, file_hash VARCHAR(64) NOT NULL, mime_type VARCHAR(100) NOT NULL, file_size INTEGER NOT NULL, width INTEGER, height INTEGER, preprocessing_status VARCHAR(30) NOT NULL, created_at DATETIME NOT NULL);
         CREATE TABLE receipts (id INTEGER PRIMARY KEY, batch_id INTEGER NOT NULL, raw_store_name VARCHAR(255), purchased_at DATETIME, receipt_number VARCHAR(100), subtotal INTEGER, discount_total INTEGER NOT NULL, tax_total INTEGER, paid_total INTEGER, currency VARCHAR(3) NOT NULL, recognition_status VARCHAR(20) NOT NULL, confirmation_status VARCHAR(20) NOT NULL, created_at DATETIME NOT NULL, confirmed_at DATETIME);
+        CREATE TABLE products (id INTEGER PRIMARY KEY, jan VARCHAR(32), qinsi_product_code VARCHAR(100), internal_sku VARCHAR(32) NOT NULL, created_at DATETIME, updated_at DATETIME);
         INSERT INTO receipt_batches VALUES (1,'RB-OLD','uploaded',1,'mobile','none','2026-07-14','2026-07-14');
         INSERT INTO receipt_images VALUES (1,1,'old.jpg','stored.jpg','data/uploads/original/stored.jpg','data/uploads/preview/stored.jpg',1,'abc','image/jpeg',10,100,200,'previewed','2026-07-14');
         INSERT INTO receipts VALUES (1,1,'旧店',NULL,NULL,100,0,10,110,'JPY','imported','pending','2026-07-14',NULL);
@@ -275,6 +393,7 @@ def test_upgrade_from_0008_creates_and_seeds_location_master(tmp_path, monkeypat
     with sqlite3.connect(db_path) as connection:
         connection.execute("CREATE TABLE alembic_version (version_num VARCHAR(32) NOT NULL PRIMARY KEY)")
         connection.execute("INSERT INTO alembic_version VALUES ('20260715_0008')")
+        connection.execute("CREATE TABLE products (id INTEGER PRIMARY KEY, jan VARCHAR(32), qinsi_product_code VARCHAR(100), internal_sku VARCHAR(32) NOT NULL)")
     monkeypatch.setenv("JBA_DATABASE_URL", f"sqlite:///{db_path.as_posix()}")
     config = Config(str(Path(__file__).resolve().parents[1] / "alembic.ini"))
     command.upgrade(config, "head")
@@ -291,6 +410,7 @@ def test_upgrade_from_0009_creates_purchase_batch_tables(tmp_path, monkeypatch):
     with sqlite3.connect(db_path) as connection:
         connection.execute("CREATE TABLE alembic_version (version_num VARCHAR(32) NOT NULL PRIMARY KEY)")
         connection.execute("INSERT INTO alembic_version VALUES ('20260715_0009')")
+        connection.execute("CREATE TABLE products (id INTEGER PRIMARY KEY, jan VARCHAR(32), qinsi_product_code VARCHAR(100), internal_sku VARCHAR(32) NOT NULL)")
     monkeypatch.setenv("JBA_DATABASE_URL", f"sqlite:///{db_path.as_posix()}")
     config = Config(str(Path(__file__).resolve().parents[1] / "alembic.ini"))
     command.upgrade(config, "head")
