@@ -4,7 +4,7 @@ import re
 from datetime import date, datetime, time, timedelta, timezone
 from difflib import SequenceMatcher
 
-from sqlalchemy import select
+from sqlalchemy import or_, select
 from sqlalchemy.orm import Session
 
 from app.models import Product, ProductAlias, ProductMatchLog, Receipt, ReceiptBatch, ReceiptItem
@@ -33,6 +33,24 @@ def _record(session: Session, item: ReceiptItem, old_product_id: int | None, met
     ))
 
 
+def candidate_products_for_jan(session: Session, jan: str | None) -> list[Product]:
+    cleaned = (jan or "").strip()
+    if not validate_jan(cleaned):
+        return []
+    rows = session.scalars(
+        select(Product)
+        .where(or_(Product.jan == cleaned, Product.qinsi_product_code == cleaned))
+        .order_by(Product.id)
+    )
+    products: list[Product] = []
+    seen: set[int] = set()
+    for product in rows:
+        if product.id not in seen:
+            products.append(product)
+            seen.add(product.id)
+    return products
+
+
 def match_item(session: Session, item: ReceiptItem, force: bool = False) -> ReceiptItem:
     if item.review_status != "confirmed":
         return item
@@ -55,7 +73,7 @@ def match_item(session: Session, item: ReceiptItem, force: bool = False) -> Rece
         item.match_status, item.match_method = "invalid_jan", "jan_validation"
         decision = "invalid_jan"
     else:
-        products = list(session.scalars(select(Product).where(Product.jan == jan)))
+        products = candidate_products_for_jan(session, jan)
         if len(products) == 1:
             item.product_id = products[0].id
             item.match_status, item.match_method, item.match_confidence = "matched_existing", "jan_exact", 1.0
@@ -70,6 +88,27 @@ def match_item(session: Session, item: ReceiptItem, force: bool = False) -> Rece
     session.flush()
     _record(session, item, old_product_id, item.match_method or "unknown", decision)
     return item
+
+
+def refresh_resolved_conflicts(session: Session, receipt: Receipt, commit: bool = True) -> int:
+    """Recompute historical JAN conflicts that are no longer ambiguous."""
+    changed = 0
+    for item in receipt.items:
+        if item.review_status != "confirmed" or item.match_status != "conflict" or item.product_id is not None:
+            continue
+        if len(candidate_products_for_jan(session, item.jan_candidate)) == 1:
+            match_item(session, item, force=True)
+            changed += 1
+    if changed:
+        _sync_batch_product_status(receipt.batch)
+        if receipt.confirmation_status == "confirmed":
+            from app.purchase_service import ensure_purchase_batch_for_receipt
+            ensure_purchase_batch_for_receipt(session, receipt)
+    if changed and commit:
+        session.commit()
+        from app.product_enrichment import safe_trigger_receipt_items
+        safe_trigger_receipt_items(session, list(receipt.items), "receipt_conflict_refresh")
+    return changed
 
 
 def _sync_batch_product_status(batch: ReceiptBatch) -> None:
@@ -144,11 +183,22 @@ def create_product_from_item(session: Session, item: ReceiptItem) -> Product:
     product = Product(
         jan=product_jan,
         name_cn=(item.recognized_name or item.raw_name).strip(), purchase_price=item.unit_price,
-        product_data_confirmed=True, name_locked=True,
-        product_origin="receipt", source="receipt_manual",
+        sale_price=item.unit_price,
+        product_data_confirmed=False, name_locked=False,
+        product_origin="receipt", source="receipt",
+        status="new_pending_completion" if product_jan is None else "new_pending_review",
     )
     session.add(product)
     session.flush()
+    alias_text = (item.recognized_name or item.raw_name).strip()
+    if alias_text:
+        session.add(ProductAlias(
+            product_id=product.id,
+            alias=alias_text,
+            normalized_alias=normalize_alias(alias_text),
+            confirmed=False,
+            created_from_item_id=item.id,
+        ))
     old_product_id = item.product_id
     item.product_id = product.id
     item.match_status, item.match_method, item.match_confidence = "new_product", "manual_new", 1.0

@@ -26,6 +26,7 @@ node_modules/
 *.sqlite-*
 *.sqlite3
 *.sqlite3-*
+*.sqlite3.bak-*
 *.xlsx
 *.xls
 *.xlsm
@@ -33,6 +34,7 @@ node_modules/
 .idea/
 data/db/*.sqlite3
 data/db/*.sqlite3-*
+data/db/*.sqlite3.bak-*
 data/db/*.sqlite
 data/db/*.sqlite-*
 data/db/*.db

@@ -227,6 +227,8 @@ class Product(Base):
     name_cn: Mapped[str | None] = mapped_column(String(255))
     name_ja: Mapped[str | None] = mapped_column(String(255))
     display_name: Mapped[str | None] = mapped_column(String(257))
+    name_source: Mapped[str | None] = mapped_column(String(30))
+    needs_review: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     main_image_path: Mapped[str | None] = mapped_column(Text)
     main_image_source_url: Mapped[str | None] = mapped_column(Text)
     product_data_confirmed: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
@@ -235,6 +237,9 @@ class Product(Base):
     main_image_source_platform: Mapped[str | None] = mapped_column(String(50))
     main_image_downloaded_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     main_image_hash: Mapped[str | None] = mapped_column(String(64))
+    image_width: Mapped[int | None] = mapped_column(Integer)
+    image_height: Mapped[int | None] = mapped_column(Integer)
+    image_quality: Mapped[str | None] = mapped_column(String(20))
     brand: Mapped[str | None] = mapped_column(String(128))
     manufacturer: Mapped[str | None] = mapped_column(String(128))
     category: Mapped[str | None] = mapped_column(String(128))
@@ -243,6 +248,14 @@ class Product(Base):
     model_number: Mapped[str | None] = mapped_column(String(128))
     package_count: Mapped[str | None] = mapped_column(String(64))
     specification: Mapped[str | None] = mapped_column(String(255))
+    net_weight_g: Mapped[Decimal | None] = mapped_column(Numeric(18, 3))
+    volume_ml: Mapped[Decimal | None] = mapped_column(Numeric(18, 3))
+    length_mm: Mapped[Decimal | None] = mapped_column(Numeric(18, 3))
+    width_mm: Mapped[Decimal | None] = mapped_column(Numeric(18, 3))
+    height_mm: Mapped[Decimal | None] = mapped_column(Numeric(18, 3))
+    depth_mm: Mapped[Decimal | None] = mapped_column(Numeric(18, 3))
+    pack_quantity: Mapped[int | None] = mapped_column(Integer)
+    spec_text: Mapped[str | None] = mapped_column(Text)
     model_spec: Mapped[str | None] = mapped_column(String(255))
     purchase_price: Mapped[Decimal | None] = mapped_column(Numeric(18, 2))
     sale_price: Mapped[Decimal | None] = mapped_column(Numeric(18, 2))
@@ -272,6 +285,17 @@ class Product(Base):
     qinsi_brand_master_id: Mapped[int | None] = mapped_column(ForeignKey("qinsi_master_values.id", ondelete="SET NULL"))
     qinsi_category_master_id: Mapped[int | None] = mapped_column(ForeignKey("qinsi_master_values.id", ondelete="SET NULL"))
     qinsi_unit_master_id: Mapped[int | None] = mapped_column(ForeignKey("qinsi_master_values.id", ondelete="SET NULL"))
+    qinsi_product_barcode: Mapped[str | None] = mapped_column(String(100))
+    qinsi_unit_barcode: Mapped[str | None] = mapped_column(String(100))
+    qinsi_name: Mapped[str | None] = mapped_column(String(255))
+    qinsi_image_url: Mapped[str | None] = mapped_column(Text)
+    qinsi_brand: Mapped[str | None] = mapped_column(String(128))
+    qinsi_category: Mapped[str | None] = mapped_column(String(128))
+    qinsi_unit: Mapped[str | None] = mapped_column(String(128))
+    qinsi_status: Mapped[str | None] = mapped_column(String(50))
+    qinsi_remark: Mapped[str | None] = mapped_column(Text)
+    qinsi_synced_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    has_jan: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
     status: Mapped[str] = mapped_column(String(30), default="active", nullable=False)
     source: Mapped[str] = mapped_column(String(50), default="manual", nullable=False)
     product_origin: Mapped[str] = mapped_column(String(20), default="manual", nullable=False)
@@ -299,6 +323,12 @@ class Product(Base):
         if self.main_image_path and self.id:
             return f"/product-images/{self.id}"
         return self.main_image_source_url or self.image_url
+
+    @property
+    def compact_spec(self) -> str:
+        from app.product_specs import compact_spec_label
+
+        return compact_spec_label(self)
 
 
 class ProductAlias(Base):
@@ -329,6 +359,25 @@ class ProductOperationLog(Base):
     after_json: Mapped[str | None] = mapped_column(Text)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
     product: Mapped[Product | None] = relationship(back_populates="operation_logs")
+
+
+class ProductPlaceholderCleanupLog(Base):
+    __tablename__ = "product_placeholder_cleanup_logs"
+    __table_args__ = (
+        Index("ix_product_placeholder_cleanup_old", "old_product_id", "created_at"),
+        Index("ix_product_placeholder_cleanup_new", "new_product_id", "created_at"),
+        Index("ix_product_placeholder_cleanup_jan", "jan"),
+    )
+    id: Mapped[int] = mapped_column(primary_key=True)
+    old_product_id: Mapped[int | None] = mapped_column(ForeignKey("products.id", ondelete="SET NULL"), index=True)
+    new_product_id: Mapped[int | None] = mapped_column(ForeignKey("products.id", ondelete="SET NULL"), index=True)
+    jan: Mapped[str] = mapped_column(String(32), nullable=False)
+    migrated_association_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    operation_type: Mapped[str] = mapped_column(String(50), nullable=False)
+    actor: Mapped[str] = mapped_column(String(128), nullable=False)
+    reason: Mapped[str] = mapped_column(String(100), nullable=False)
+    deleted_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
 
 
 class StoreBrand(Base):
@@ -738,6 +787,25 @@ class QinsiProductMapping(Base):
     source_snapshot_line: Mapped[QinsiInventorySnapshotLine | None] = relationship()
 
 
+class QinsiConflictResolution(Base):
+    __tablename__ = "qinsi_conflict_resolutions"
+    __table_args__ = (
+        Index("uq_qinsi_conflict_resolutions_key", "conflict_key", unique=True),
+        Index("ix_qinsi_conflict_resolutions_barcode", "barcode"),
+        Index("ix_qinsi_conflict_resolutions_auto", "auto_apply"),
+    )
+    id: Mapped[int] = mapped_column(primary_key=True)
+    conflict_key: Mapped[str] = mapped_column(String(255), nullable=False)
+    barcode: Mapped[str | None] = mapped_column(String(100))
+    qinsi_product_codes: Mapped[str] = mapped_column(Text, nullable=False)
+    resolution_type: Mapped[str] = mapped_column(String(40), nullable=False)
+    action: Mapped[str] = mapped_column(String(80), nullable=False)
+    note: Mapped[str | None] = mapped_column(Text)
+    auto_apply: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow, nullable=False)
+
+
 class InventoryTransaction(Base):
     __tablename__ = "inventory_transactions"
     id: Mapped[int] = mapped_column(primary_key=True)
@@ -865,7 +933,7 @@ class QinsiMasterValue(Base):
 class ProductBarcode(Base):
     __tablename__ = "product_barcodes"
     __table_args__ = (
-        Index("uq_product_barcodes_barcode", "barcode", unique=True),
+        Index("ix_product_barcodes_barcode", "barcode"),
         UniqueConstraint("product_id", "barcode", name="uq_product_barcode_product_value"),
     )
     id: Mapped[int] = mapped_column(primary_key=True)
@@ -1205,6 +1273,14 @@ class ProductEnrichmentCandidate(Base):
     color: Mapped[str | None] = mapped_column(String(64))
     model_number: Mapped[str | None] = mapped_column(String(128))
     package_count: Mapped[str | None] = mapped_column(String(64))
+    net_weight_g: Mapped[Decimal | None] = mapped_column(Numeric(18, 3))
+    volume_ml: Mapped[Decimal | None] = mapped_column(Numeric(18, 3))
+    length_mm: Mapped[Decimal | None] = mapped_column(Numeric(18, 3))
+    width_mm: Mapped[Decimal | None] = mapped_column(Numeric(18, 3))
+    height_mm: Mapped[Decimal | None] = mapped_column(Numeric(18, 3))
+    depth_mm: Mapped[Decimal | None] = mapped_column(Numeric(18, 3))
+    pack_quantity: Mapped[int | None] = mapped_column(Integer)
+    spec_text: Mapped[str | None] = mapped_column(Text)
     image_url: Mapped[str | None] = mapped_column(Text)
     source_url: Mapped[str] = mapped_column(Text, nullable=False)
     platform: Mapped[str] = mapped_column(String(50), nullable=False)

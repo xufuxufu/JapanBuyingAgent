@@ -5,6 +5,7 @@ import io
 import json
 import os
 import time
+import unicodedata
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal, ROUND_HALF_UP
 from difflib import SequenceMatcher
@@ -22,23 +23,38 @@ from sqlalchemy.orm import Session, selectinload
 
 from app.config import PREVIEW_DIR, PRODUCT_IMAGE_DIR, PROJECT_ROOT, QINSI_PRODUCT_IMAGE_DIR, TAG_EVIDENCE_DIR, default_role, ensure_data_directories, get_deepseek_config, is_testing
 from app.db import SessionLocal, engine, get_db
-from app.models import DurableBackgroundJob, EnrichmentAuditLog, FieldPurchaseItem, PlatformProviderState, Product, ProductAlias, ProductEnrichmentCandidate, ProductWatchConfig, ProductWatchSnapshot, PurchaseBatch, PurchaseBatchItem, QinsiExportJob, QinsiGoodsImportRow, QinsiImportBatch, QinsiPurchaseExportJob, Receipt, ReceiptBatch, ReceiptImage, ReceiptItem, RestockList, RestockListItem, Store, StoreBrand, TagEvidence, ZipPackageItem, ZipPackageJob
+from app.models import DurableBackgroundJob, DuplicateDetectionLog, EnrichmentAuditLog, FieldPurchaseItem, PlatformProviderState, Product, ProductAlias, ProductEnrichmentCandidate, ProductWatchConfig, ProductWatchSnapshot, PurchaseBatch, PurchaseBatchItem, QinsiExportJob, QinsiGoodsImportRow, QinsiImportBatch, QinsiPurchaseExportJob, Receipt, ReceiptBatch, ReceiptImage, ReceiptItem, RestockList, RestockListItem, Store, StoreBrand, TagEvidence, ZipPackageItem, ZipPackageJob
 from app.analytics_service import analytics_dashboard, procurement_data, resolve_date_range
-from app.product_matching import bind_product, create_product_from_item, match_batch, match_date, match_receipt, normalize_alias
+from app.product_matching import (
+    bind_product,
+    candidate_products_for_jan,
+    create_product_from_item,
+    match_batch,
+    match_date,
+    match_item,
+    match_receipt,
+    normalize_alias,
+    refresh_resolved_conflicts,
+    validate_jan,
+)
+from app.product_merge import list_duplicate_jan_groups, merge_all_duplicate_jans, merge_duplicate_jan_group
 from app.product_identity import create_product_record, format_product_display_name, normalize_product_name, update_product_identifiers
 from app.product_admin import (
     EDITABLE_PRODUCT_STATUSES,
     archive_product,
     delete_product_if_allowed,
+    execute_placeholder_cleanup,
     product_associations,
+    preview_placeholder_cleanup,
     restore_product,
+    save_product_photo_for_completion,
     update_product_master,
 )
 from app.price_service import build_lookup_view, query_prices, recent_price_lookup_histories
 from app.product_enrichment import (
-    accept_task, bind_task_to_existing, enrichment_summary_for_receipt, get_task,
-    list_review_tasks, process_enrichment_task, process_price_lookup_enrichment,
-    safe_trigger_receipt_items, translate_candidate,
+    accept_task, bind_task_to_existing, enrichment_summary_for_receipt, ensure_existing_product_enrichment_task, get_task,
+    list_review_tasks, process_enrichment_task, process_price_lookup_enrichment, refresh_existing_product_main_image,
+    product_needs_jan_completion, safe_trigger_receipt_items, translate_candidate,
 )
 from app.field_purchase import (
     assign_field_item_jan, bind_field_item_to_product, bulk_edit_field_items, complete_field_batch, confirm_field_item,
@@ -49,7 +65,7 @@ from app.field_purchase import (
     retry_field_items, save_field_product_image, update_field_batch_store, update_field_item,
 )
 from app.location_service import get_default_physical_location, initialize_default_locations, list_locations
-from app.local_product import resolve_local_product_by_jan
+from app.local_product import normalize_jan, resolve_local_product_by_jan
 from app.jan_governance import build_jan_governance_rows, export_jan_governance_report
 from app.product_image_localization import (
     image_localization_dashboard, product_display_image, queue_missing_product_images,
@@ -65,18 +81,31 @@ from app.monitor_service import (
     list_notifications, mark_notification_read, monitor_dashboard, run_due_monitor_cycle,
     run_single_monitor_cycle, unread_notification_count,
 )
-from app.purchase_service import get_purchase_batch, list_purchase_batches
+from app.purchase_service import ensure_purchase_batch_for_receipt, get_purchase_batch, list_purchase_batches, purchase_batch_blockers_for_receipt
+from app.receipt_pricing import actual_line_amount, purchase_unit_price
 from app.qinsi_export import (
     QINSI_PRODUCT_EXPORTABLE_STATUSES,
     cancel_qinsi_export_confirmation, cancel_qinsi_product_export_confirmation,
-    confirm_qinsi_export, confirm_qinsi_product_export, create_qinsi_product_export,
+    confirm_qinsi_export, confirm_qinsi_product_export, confirmed_qinsi_product_import_product_ids, create_qinsi_product_export,
     generate_merged_purchase_batch_export, generate_purchase_batch_exports, get_qinsi_export_job, get_qinsi_product_export_job,
     list_qinsi_export_jobs, list_qinsi_product_export_jobs, purchase_item_export_states,
-    qinsi_product_export_rows, retry_failed_qinsi_lines,
+    pending_qinsi_product_exports, qinsi_product_export_image_warning, qinsi_product_export_rows, qinsi_product_has_export_name,
+    qinsi_product_is_exportable, qinsi_product_requires_import,
+    regenerate_qinsi_product_export_file, retry_failed_qinsi_lines,
 )
 from app.qinsi_goods_import import (
     create_import_batch, process_queued_confirmation, process_queued_import,
     queue_import_confirmation,
+)
+from app.qinsi_product_master_import import (
+    MASTER_SOURCE,
+    QINSI_CONFLICT_RESOLUTION_TYPES,
+    MasterInputFile,
+    confirm_qinsi_master_import,
+    create_qinsi_master_preview,
+    export_qinsi_master_audit_workbook,
+    qinsi_master_preview_statistics,
+    resolve_qinsi_master_conflict,
 )
 from app.qinsi_inventory import (
     INVENTORY_STATUS_LABELS, MATCH_METHOD_LABELS, MATCH_STATUS_LABELS,
@@ -191,6 +220,7 @@ def _nav_unread_count() -> int:
 templates.env.globals["nav_unread_count"] = _nav_unread_count
 templates.env.globals["product_image_url"] = preferred_product_image_url
 templates.env.globals["product_display_image"] = product_display_image
+templates.env.globals["qinsi_product_export_image_warning"] = qinsi_product_export_image_warning
 
 
 NAV_PERMISSIONS = {
@@ -437,6 +467,19 @@ def _validation_message(exc: ValidationError) -> str:
     return "; ".join(f"{'.'.join(map(str, error['loc']))}: {error['msg']}" for error in exc.errors())
 
 
+def _qinsi_confirmation_validation_message(exc: ValidationError) -> str:
+    messages: list[str] = []
+    for error in exc.errors():
+        loc = ".".join(map(str, error["loc"]))
+        if loc == "result":
+            messages.append("确认结果只能是 all_success、partial_failure 或 all_failed")
+        elif loc == "":
+            messages.append("部分失败必须至少选择一条失败行")
+        else:
+            messages.append(f"{loc}: {error['msg']}")
+    return "；".join(messages)
+
+
 def history_tags(batch: ReceiptBatch, latest_ready_id: int | None) -> list[str]:
     today = datetime.now(timezone.utc).astimezone(TOKYO).date()
     created = batch.created_at if batch.created_at.tzinfo else batch.created_at.replace(tzinfo=timezone.utc)
@@ -484,6 +527,81 @@ async def parse_item_form(request: Request) -> ReceiptItemDraftInput:
     values["discount_amount"] = values["discount_amount"] or 0
     values["review_status"] = values["review_status"] or "pending"
     return ReceiptItemDraftInput.model_validate(values)
+
+
+def jan_cleanup_suggestion(value: str | None) -> str | None:
+    raw = unicodedata.normalize("NFKC", value or "").strip()
+    if not raw or raw.isdigit():
+        return None
+    cleaned = "".join(char for char in raw if char.isdigit())
+    return cleaned if cleaned != raw and validate_jan(cleaned) else None
+
+
+def _receipt_item_snapshot(item: ReceiptItem) -> dict:
+    return {
+        "raw_name": item.raw_name,
+        "recognized_name": item.recognized_name,
+        "jan_candidate": item.jan_candidate,
+        "product_id": item.product_id,
+        "match_status": item.match_status,
+        "quantity": item.quantity,
+        "unit_price": item.unit_price,
+        "discount_amount": item.discount_amount,
+        "line_total": item.line_total,
+    }
+
+
+def _mark_qinsi_exports_stale(db: Session, purchase_detail: PurchaseBatchItem | None, reason: str) -> None:
+    if purchase_detail is None:
+        return
+    rows = list(db.scalars(
+        select(QinsiPurchaseExportJob)
+        .join(PurchaseBatch, PurchaseBatch.id == QinsiPurchaseExportJob.purchase_batch_id)
+        .where(
+            PurchaseBatch.id == purchase_detail.purchase_batch_id,
+            QinsiPurchaseExportJob.status.in_(["generated", "imported", "partially_failed"]),
+        )
+    ))
+    for job in rows:
+        note = job.confirmation_note or ""
+        marker = f"数据已修改，需要重新导出/重新确认：{reason}"
+        if marker not in note:
+            job.confirmation_note = f"{note}\n{marker}".strip()
+        if job.status == "generated":
+            job.purchase_batch.qinsi_status = "not_exported"
+
+
+def _sync_purchase_detail_from_receipt_item(db: Session, item: ReceiptItem) -> None:
+    detail = item.purchase_detail
+    if detail is None:
+        ensure_purchase_batch_for_receipt(db, item.receipt)
+        detail = item.purchase_detail
+    if detail is None:
+        return
+    if item.product_id is not None:
+        detail.product_id = item.product_id
+    detail.quantity = item.quantity
+    detail.unit_price = purchase_unit_price(item.quantity, item.unit_price, item.line_total)
+    detail.discount_amount = item.discount_amount
+    detail.actual_line_amount = actual_line_amount(item.quantity, item.unit_price, item.discount_amount, item.line_total)
+
+
+def _normal_receipt_blockers(receipt: Receipt) -> list[str]:
+    blockers: list[str] = []
+    if receipt.confirmation_status == "confirmed":
+        return blockers
+    if receipt.duplicate_status in {"auto_duplicate", "review_required", "likely_duplicate"}:
+        blockers.append(f"重复状态为 {receipt.duplicate_status}")
+    active_items = [item for item in receipt.items if item.review_status != "ignored"]
+    if not active_items:
+        blockers.append("没有未忽略商品行")
+    for item in active_items:
+        if item.product_id is None:
+            jan = item.jan_candidate or "无JAN"
+            blockers.append(f"第{item.line_no}行 JAN {jan} 未解决")
+        elif item.match_status in {"invalid_jan", "conflict"}:
+            blockers.append(f"第{item.line_no}行 {item.match_status}")
+    return blockers
 
 
 @app.get("/health")
@@ -826,11 +944,30 @@ def upload_page(request: Request):
 
 
 @app.get("/price-check", response_class=HTMLResponse)
-def price_check_page(request: Request, jan: str = Query(""), db: Session = Depends(get_db)):
+def price_check_page(
+    request: Request,
+    background_tasks: BackgroundTasks,
+    jan: str = Query(""),
+    refresh: int = Query(1),
+    auto: bool = Query(True),
+    db: Session = Depends(get_db),
+):
+    if jan.strip() and auto:
+        try:
+            force_refresh = refresh != 0
+            lookup = PriceLookupInput.model_validate({"jan": jan, "current_store_price": None, "force_refresh": force_refresh})
+            local = resolve_local_product_by_jan(db, lookup.jan)
+            providers = [] if local.product is not None and not lookup.force_refresh else None
+            view = query_prices(db, lookup, providers=providers, trigger_enrichment=False)
+            if local.product is None or lookup.force_refresh or product_needs_jan_completion(local.product):
+                database_url = db.get_bind().url.render_as_string(hide_password=False)
+                background_tasks.add_task(process_price_lookup_enrichment, database_url, lookup.jan, view.history.id)
+            return RedirectResponse(f"/price-check/results/{view.history.id}", status_code=303)
+        except (ValidationError, ValueError):
+            pass
     return templates.TemplateResponse(request, "price_check.html", {
         "histories": recent_price_lookup_histories(db, jan=jan.strip() or None),
         "error": None, "jan": jan.strip(), "current_store_price": "",
-        "rakuten_ip_status": rakuten_public_ip_status(),
     })
 
 
@@ -848,7 +985,6 @@ def price_check_submit(
         return templates.TemplateResponse(request, "price_check.html", {
             "histories": recent_price_lookup_histories(db), "error": _validation_message(exc),
             "jan": jan, "current_store_price": current_store_price,
-            "rakuten_ip_status": rakuten_public_ip_status(),
         }, status_code=422)
     try:
         local = resolve_local_product_by_jan(db, lookup.jan)
@@ -858,9 +994,8 @@ def price_check_submit(
         return templates.TemplateResponse(request, "price_check.html", {
             "histories": recent_price_lookup_histories(db), "error": str(exc),
             "jan": jan, "current_store_price": current_store_price,
-            "rakuten_ip_status": rakuten_public_ip_status(),
         }, status_code=409)
-    if local.product is None:
+    if local.product is None or product_needs_jan_completion(local.product):
         database_url = db.get_bind().url.render_as_string(hide_password=False)
         background_tasks.add_task(process_price_lookup_enrichment, database_url, lookup.jan, view.history.id)
     return RedirectResponse(f"/price-check/results/{view.history.id}", status_code=303)
@@ -1188,14 +1323,28 @@ def select_image_source(batch_id: int, image_id: int, request: Request, source: 
 @app.get("/receipts/{batch_id}/review", response_class=HTMLResponse)
 def review_page(batch_id: int, request: Request, receipt_id: int | None = Query(None), db: Session = Depends(get_db)):
     batch = load_batch(db, batch_id)
+    for candidate_receipt in batch.receipts:
+        refresh_resolved_conflicts(db, candidate_receipt)
     receipt = current_receipt(batch, receipt_id)
     products = list(db.scalars(
         select(Product).where(Product.status == "active").order_by(Product.name_cn, Product.id).limit(500)
     ))
+    candidate_products_by_item = {}
+    selected_product_ids = {product.id for product in products}
+    for item in receipt.items:
+        candidates = candidate_products_for_jan(db, item.jan_candidate)
+        if candidates:
+            candidate_products_by_item[item.id] = candidates
+        for product in candidates:
+            if product.id not in selected_product_ids:
+                products.append(product)
+                selected_product_ids.add(product.id)
     product_by_id = {product.id: product for product in products}
     for item in receipt.items:
         if item.product_id and item.product_id not in product_by_id:
-            product_by_id[item.product_id] = db.get(Product, item.product_id)
+            product = db.get(Product, item.product_id)
+            if product is not None:
+                product_by_id[item.product_id] = product
     recommendations = {}
     fuzzy_candidates = {}
     for item in receipt.items:
@@ -1215,16 +1364,43 @@ def review_page(batch_id: int, request: Request, receipt_id: int | None = Query(
     physical_locations = [location for location in active_locations if location.location_type in {"local_physical", "qinsi_warehouse"}]
     qinsi_warehouses = [location for location in active_locations if location.is_qinsi_warehouse]
     default_physical = get_default_physical_location(db)
-    purchase_batch = db.scalar(select(PurchaseBatch).where(PurchaseBatch.receipt_id == receipt.id))
+    purchase_batch = db.scalar(
+        select(PurchaseBatch)
+        .where(PurchaseBatch.receipt_id == receipt.id, PurchaseBatch.status != "cancelled")
+        .order_by(PurchaseBatch.id)
+    )
+    purchase_batches_by_receipt = {
+        purchase.receipt_id: purchase
+        for purchase in db.scalars(
+            select(PurchaseBatch)
+            .where(PurchaseBatch.gpt_batch_id == batch.id, PurchaseBatch.status != "cancelled")
+            .order_by(PurchaseBatch.id)
+        )
+    }
+    purchase_blockers_by_receipt = {
+        candidate.id: purchase_batch_blockers_for_receipt(db, candidate)
+        for candidate in batch.receipts
+        if candidate.confirmation_status == "confirmed" and candidate.id not in purchase_batches_by_receipt
+    }
+    jan_suggestions_by_item = {
+        item.id: jan_cleanup_suggestion(item.jan_candidate)
+        for candidate in batch.receipts
+        for item in candidate.items
+    }
     stores = list(db.scalars(select(Store).where(Store.is_active.is_(True)).order_by(Store.name_cn, Store.name_ja, Store.id)))
     return templates.TemplateResponse(request, "review.html", {
         "batch": batch, "receipt": receipt, "warnings": amount_warnings(receipt), "error": None,
         "products": products, "product_by_id": product_by_id, "recommendations": recommendations,
-        "fuzzy_candidates": fuzzy_candidates,
+        "fuzzy_candidates": fuzzy_candidates, "candidate_products_by_item": candidate_products_by_item,
         "physical_locations": physical_locations, "qinsi_warehouses": qinsi_warehouses,
-        "default_physical": default_physical, "purchase_batch": purchase_batch, "stores": stores,
+        "default_physical": default_physical, "purchase_batch": purchase_batch,
+        "purchase_batches_by_receipt": purchase_batches_by_receipt,
+        "purchase_blockers_by_receipt": purchase_blockers_by_receipt,
+        "stores": stores,
+        "jan_suggestions_by_item": jan_suggestions_by_item,
         "receipt_status_cn": RECEIPT_STATUS_CN, "item_status_cn": ITEM_STATUS_CN, "match_status_cn": MATCH_STATUS_CN,
         "enrichment_summary": enrichment_summary_for_receipt(db, receipt.id),
+        "product_display_label": product_display_label,
     })
 
 
@@ -1265,8 +1441,6 @@ async def save_item(batch_id: int, item_id: int, request: Request, db: Session =
     receipt = next((candidate for candidate in batch.receipts if any(row.id == item_id for row in candidate.items)), None)
     if not receipt:
         raise HTTPException(404, "商品行不存在")
-    if receipt.confirmation_status == "confirmed":
-        raise HTTPException(409, "已确认小票不可编辑")
     item = next((row for row in receipt.items if row.id == item_id), None)
     if not item:
         raise HTTPException(404, "商品行不存在")
@@ -1274,6 +1448,29 @@ async def save_item(batch_id: int, item_id: int, request: Request, db: Session =
         data = await parse_item_form(request)
     except ValidationError as exc:
         raise HTTPException(422, _validation_message(exc)) from exc
+    if receipt.confirmation_status == "confirmed":
+        before = _receipt_item_snapshot(item)
+        suggested = jan_cleanup_suggestion(data.jan_candidate)
+        if suggested:
+            data.jan_candidate = suggested
+        data.review_status = "confirmed"
+        apply_item_draft(item, data)
+        item.jan_candidate = normalize_jan(item.jan_candidate)
+        match_item(db, item, force=True)
+        _sync_purchase_detail_from_receipt_item(db, item)
+        _mark_qinsi_exports_stale(db, item.purchase_detail, f"小票行 {item.id} 纠错")
+        db.add(DuplicateDetectionLog(
+            entity_type="receipt_item",
+            new_entity_id=item.id,
+            matched_entity_id=item.product_id,
+            algorithm_version="manual-correction-v1",
+            sha_match=False,
+            decision="correction",
+            reason=json.dumps({"before": before, "after": _receipt_item_snapshot(item)}, ensure_ascii=False, default=str),
+        ))
+        db.commit()
+        safe_trigger_receipt_items(db, [item], "confirmed_item_correction")
+        return RedirectResponse(_review_url(batch_id, receipt) + f"#receipt-item-{item.id}", status_code=303)
     apply_item_draft(item, data)
     db.commit()
     safe_trigger_receipt_items(db, [item], "manual_jan")
@@ -1358,6 +1555,66 @@ async def confirm_review(batch_id: int, request: Request, db: Session = Depends(
     return RedirectResponse(_review_url(batch_id, receipt), status_code=303)
 
 
+@app.post("/receipts/{batch_id}/review/confirm-normal")
+def confirm_normal_receipts(batch_id: int, db: Session = Depends(get_db)):
+    batch = load_batch(db, batch_id)
+    confirmed = 0
+    skipped: list[str] = []
+    settings = PurchaseConfirmationInput(initial_location_id=get_default_physical_location(db).id)
+    for index, receipt in enumerate(batch.receipts, start=1):
+        if receipt.confirmation_status == "confirmed":
+            continue
+        blockers = _normal_receipt_blockers(receipt)
+        if blockers:
+            skipped.append(f"第{index}张 {'；'.join(blockers)}")
+            continue
+        try:
+            confirm_receipt(db, batch, receipt, settings)
+            confirmed += 1
+        except ValueError as exc:
+            db.rollback()
+            batch = load_batch(db, batch_id)
+            skipped.append(f"第{index}张 {exc}")
+    message = f"已确认 {confirmed} 张，跳过 {len(skipped)} 张"
+    if skipped:
+        message = message + "：" + "；".join(skipped[:8])
+    return RedirectResponse(f"/receipts/{batch_id}/review?message={quote(message)}", status_code=303)
+
+
+@app.post("/receipts/{batch_id}/review/receipts/{receipt_id}/not-duplicate")
+def mark_receipt_not_duplicate(batch_id: int, receipt_id: int, db: Session = Depends(get_db)):
+    batch = load_batch(db, batch_id)
+    receipt = next((candidate for candidate in batch.receipts if candidate.id == receipt_id), None)
+    if receipt is None:
+        raise HTTPException(404, "小票不存在")
+    before = {
+        "duplicate_status": receipt.duplicate_status,
+        "duplicate_of_receipt_id": receipt.duplicate_of_receipt_id,
+        "duplicate_reason": receipt.duplicate_reason,
+    }
+    receipt.duplicate_status = "distinct"
+    receipt.duplicate_of_receipt_id = None
+    receipt.duplicate_score = None
+    receipt.duplicate_reason = "人工确认不是重复"
+    db.add(DuplicateDetectionLog(
+        entity_type="receipt",
+        new_entity_id=receipt.id,
+        matched_entity_id=before["duplicate_of_receipt_id"],
+        algorithm_version="manual-duplicate-clear-v1",
+        sha_match=False,
+        decision="manual_distinct",
+        reason=json.dumps({"before": before, "after": {"duplicate_status": "distinct"}}, ensure_ascii=False, default=str),
+    ))
+    if receipt.confirmation_status == "confirmed":
+        refresh_resolved_conflicts(db, receipt, commit=False)
+        ensure_purchase_batch_for_receipt(db, receipt)
+    else:
+        match_receipt(db, receipt, force=True, commit=False)
+    db.commit()
+    safe_trigger_receipt_items(db, list(receipt.items), "manual_not_duplicate")
+    return RedirectResponse(_review_url(batch_id, receipt), status_code=303)
+
+
 def _batch_item(batch: ReceiptBatch, item_id: int) -> ReceiptItem:
     item = next((item for receipt in batch.receipts for item in receipt.items if item.id == item_id), None)
     if not item:
@@ -1369,13 +1626,25 @@ def _batch_item(batch: ReceiptBatch, item_id: int) -> ReceiptItem:
 def match_one_receipt(batch_id: int, receipt_id: int | None = Form(None), rematch: bool = Form(False), db: Session = Depends(get_db)):
     batch = load_batch(db, batch_id)
     receipt = current_receipt(batch, receipt_id)
-    match_receipt(db, receipt, force=rematch)
+    if receipt.confirmation_status == "confirmed":
+        refresh_resolved_conflicts(db, receipt)
+        ensure_purchase_batch_for_receipt(db, receipt)
+        db.commit()
+    else:
+        match_receipt(db, receipt, force=rematch)
     return RedirectResponse(_review_url(batch_id, receipt), status_code=303)
 
 
 @app.post("/receipts/{batch_id}/match")
 def match_whole_batch(batch_id: int, rematch: bool = Form(False), db: Session = Depends(get_db)):
-    match_batch(db, load_batch(db, batch_id), force=rematch)
+    batch = load_batch(db, batch_id)
+    if batch.status == "confirmed" or any(receipt.confirmation_status == "confirmed" for receipt in batch.receipts):
+        for receipt in batch.receipts:
+            refresh_resolved_conflicts(db, receipt)
+            ensure_purchase_batch_for_receipt(db, receipt)
+        db.commit()
+    else:
+        match_batch(db, batch, force=rematch)
     return RedirectResponse(f"/receipts/{batch_id}/review", status_code=303)
 
 
@@ -1491,6 +1760,160 @@ def product_import_confirm(
     return RedirectResponse(f"/products/import?job_id={job.id}", status_code=303)
 
 
+@app.get("/products/qinsi-master-import", response_class=HTMLResponse)
+def qinsi_product_master_import_page(
+    request: Request,
+    job_id: int | None = Query(None),
+    db: Session = Depends(get_db),
+):
+    jobs = list(db.scalars(
+        select(QinsiImportBatch)
+        .where(QinsiImportBatch.source_system == MASTER_SOURCE)
+        .order_by(QinsiImportBatch.created_at.desc())
+        .limit(20)
+    ))
+    job = db.get(QinsiImportBatch, job_id) if job_id else (jobs[0] if jobs else None)
+    if job is not None and job.source_system != MASTER_SOURCE:
+        raise HTTPException(404, "秦丝商品主数据导入任务不存在")
+    rows = list(db.scalars(select(QinsiGoodsImportRow).where(
+        QinsiGoodsImportRow.import_batch_id == job.id,
+    ).order_by(QinsiGoodsImportRow.excel_row_number).limit(200))) if job else []
+    for row in rows:
+        parsed = json.loads(row.parsed_data)
+        raw = json.loads(row.raw_json)
+        row.display_raw_json = json.dumps(raw, ensure_ascii=False, indent=2)
+        row.display_name = parsed.get("qinsi_name")
+        row.display_goods_no = parsed.get("qinsi_goods_no")
+        row.display_jan = parsed.get("jan")
+        row.display_jan_source = parsed.get("jan_source")
+        row.display_has_jan = parsed.get("has_jan")
+        row.display_conflicts = json.loads(row.conflict_json) if row.conflict_json else []
+        row.display_candidate_products = []
+        for conflict in row.display_conflicts:
+            existing = conflict.get("existing_value")
+            if isinstance(existing, list):
+                row.display_candidate_products.extend(item for item in existing if isinstance(item, dict))
+            elif isinstance(existing, dict):
+                row.display_candidate_products.append(existing)
+        row.display_warnings = json.loads(row.warnings) if row.warnings else []
+        row.display_errors = json.loads(row.errors) if row.errors else []
+    summary = qinsi_master_preview_statistics(db, job) if job else {}
+    return templates.TemplateResponse(request, "qinsi_product_master_import.html", {
+        "jobs": jobs, "job": job, "rows": rows, "summary": summary,
+        "status_cn": IMPORT_STATUS_CN,
+        "resolution_types": QINSI_CONFLICT_RESOLUTION_TYPES,
+    })
+
+
+@app.post("/products/qinsi-master-import/preview")
+async def qinsi_product_master_import_preview(
+    files: list[UploadFile] = File(...),
+    business_batch_key: str | None = Form(None),
+    db: Session = Depends(get_db),
+):
+    selected: list[MasterInputFile] = []
+    for file in files:
+        if not file.filename:
+            continue
+        selected.append(MasterInputFile(filename=Path(file.filename).name, content=await file.read()))
+    if not selected:
+        raise HTTPException(422, "请上传至少一个秦丝商品列表Excel")
+    try:
+        job = create_qinsi_master_preview(db, selected, business_batch_key=business_batch_key)
+    except ValueError as exc:
+        raise HTTPException(422, str(exc)) from exc
+    return RedirectResponse(f"/products/qinsi-master-import?job_id={job.id}", status_code=303)
+
+
+@app.get("/products/qinsi-master-import/{job_id}/status")
+def qinsi_product_master_import_status(job_id: int, db: Session = Depends(get_db)):
+    job = db.get(QinsiImportBatch, job_id)
+    if not job or job.source_system != MASTER_SOURCE:
+        raise HTTPException(404, "秦丝商品主数据导入任务不存在")
+    summary = qinsi_master_preview_statistics(db, job)
+    return {
+        "id": job.id,
+        "status": job.status,
+        "status_label": IMPORT_STATUS_CN.get(job.status, job.status),
+        "total_rows": job.total_rows,
+        "jan_from_unit_barcode": summary.get("jan_from_unit_barcode", 0),
+        "jan_from_product_barcode": summary.get("jan_from_product_barcode", 0),
+        "jan_from_goods_no": summary.get("jan_from_goods_no", 0),
+        "no_jan_count": summary.get("no_jan_count", 0),
+        "same_jan_multi_group_count": summary.get("same_jan_multi_group_count", 0),
+        "same_jan_multi_product_count": summary.get("same_jan_multi_product_count", 0),
+        "local_exists_count": summary.get("local_exists_count", 0),
+        "jan_correction_count": summary.get("jan_correction_count", 0),
+        "new_count": job.new_count,
+        "update_count": job.update_count,
+        "unchanged_count": job.unchanged_count,
+        "conflict_count": job.conflict_count,
+        "error_count": job.error_count,
+        "mark_imported_count": summary.get("mark_imported_count", job.success_count),
+        "error_message": job.error_message,
+    }
+
+
+@app.post("/products/qinsi-master-import/{job_id}/confirm")
+def qinsi_product_master_import_confirm(job_id: int, db: Session = Depends(get_db)):
+    job = db.get(QinsiImportBatch, job_id)
+    if not job or job.source_system != MASTER_SOURCE:
+        raise HTTPException(404, "秦丝商品主数据导入任务不存在")
+    try:
+        confirm_qinsi_master_import(db, job)
+    except ValueError as exc:
+        raise HTTPException(409, str(exc)) from exc
+    return RedirectResponse(f"/products/qinsi-master-import?job_id={job.id}", status_code=303)
+
+
+@app.post("/products/qinsi-master-import/{job_id}/rows/{row_id}/resolve-conflict")
+def qinsi_product_master_import_resolve_conflict(
+    job_id: int,
+    row_id: int,
+    resolution_type: str = Form(...),
+    action: str = Form(""),
+    note: str = Form(""),
+    auto_apply: bool = Form(False),
+    primary_product_id: int | None = Form(None),
+    db: Session = Depends(get_db),
+):
+    job = db.get(QinsiImportBatch, job_id)
+    if not job or job.source_system != MASTER_SOURCE:
+        raise HTTPException(404, "秦丝商品主数据导入任务不存在")
+    try:
+        resolve_qinsi_master_conflict(
+            db,
+            job,
+            row_id,
+            resolution_type=resolution_type,
+            action=action or None,
+            note=note,
+            auto_apply=auto_apply,
+            primary_product_id=primary_product_id,
+        )
+    except LookupError as exc:
+        db.rollback()
+        raise HTTPException(404, str(exc)) from exc
+    except ValueError as exc:
+        db.rollback()
+        return RedirectResponse(f"/products/qinsi-master-import?job_id={job.id}&error={quote(str(exc))}", status_code=303)
+    return RedirectResponse(f"/products/qinsi-master-import?job_id={job.id}&message={quote('冲突处理已保存')}", status_code=303)
+
+
+@app.get("/products/qinsi-master-import/{job_id}/audit.xlsx")
+def qinsi_product_master_import_audit(job_id: int, db: Session = Depends(get_db)):
+    job = db.get(QinsiImportBatch, job_id)
+    if not job or job.source_system != MASTER_SOURCE:
+        raise HTTPException(404, "秦丝商品主数据导入任务不存在")
+    content = export_qinsi_master_audit_workbook(db, job)
+    filename = quote(f"qinsi-product-master-audit-{job.id}.xlsx")
+    return StreamingResponse(
+        io.BytesIO(content),
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": f"attachment; filename*=UTF-8''{filename}"},
+    )
+
+
 @app.post("/products/match-by-date")
 def product_match_by_date(purchased_date: date = Form(...), rematch: bool = Form(False), db: Session = Depends(get_db)):
     match_date(db, purchased_date, force=rematch)
@@ -1502,6 +1925,12 @@ def products_page(
     request: Request, q: str = Query(""), page: int = Query(1, ge=1),
     page_size: int = Query(100, ge=20, le=200), status: str = Query(""), db: Session = Depends(get_db),
 ):
+    focused_qinsi_product_ids = {
+        int(value)
+        for raw in request.query_params.getlist("qinsi_product_ids")
+        for value in raw.split(",")
+        if value.isdigit()
+    }
     query = select(
         Product,
         func.count(ReceiptItem.id),
@@ -1516,6 +1945,8 @@ def products_page(
             Product.qinsi_product_code.like(value), Product.name_cn.like(value),
             Product.name_ja.like(value), Product.display_name.like(value),
         ))
+    if focused_qinsi_product_ids:
+        filters.append(Product.id.in_(focused_qinsi_product_ids))
     product_status_labels = {
         "active": "普通商品",
         "new_pending_completion": "新商品待补全",
@@ -1538,7 +1969,29 @@ def products_page(
     inventories = latest_inventory_for_products(db, [row[0].id for row in raw_rows])
     rows = [(product, count, quantity, latest, inventories[product.id]) for product, count, quantity, latest in raw_rows]
     association_by_id = {product.id: product_associations(db, product) for product, _, _, _, _ in rows}
+    row_product_ids = {product.id for product, _, _, _, _ in rows}
+    confirmed_imported_ids = confirmed_qinsi_product_import_product_ids(db, row_product_ids)
+    qinsi_product_exportable_product_ids = {
+        product.id for product, _, _, _, _ in rows
+        if qinsi_product_is_exportable(product, confirmed_imported_ids)
+    }
     page_count = max(1, (total + page_size - 1) // page_size)
+    pending_export_ids = {
+        int(value)
+        for raw in request.query_params.getlist("pending_export_ids")
+        for value in raw.split(",")
+        if value.isdigit()
+    }
+    pending_export_links = [
+        job for job in list_qinsi_product_export_jobs(db)
+        if job.id in pending_export_ids and job.status == "exported"
+    ]
+    remaining_product_ids = [
+        int(value)
+        for raw in request.query_params.getlist("remaining_product_ids")
+        for value in raw.split(",")
+        if value.isdigit()
+    ]
     return templates.TemplateResponse(request, "products.html", {
         "rows": rows, "q": q, "page": page, "page_size": page_size,
         "page_count": page_count, "total": total,
@@ -1547,7 +2000,10 @@ def products_page(
         "editable_product_statuses": EDITABLE_PRODUCT_STATUSES,
         "association_by_id": association_by_id,
         "qinsi_product_exportable_statuses": QINSI_PRODUCT_EXPORTABLE_STATUSES,
+        "qinsi_product_exportable_product_ids": qinsi_product_exportable_product_ids,
         "qinsi_product_exports": list_qinsi_product_export_jobs(db)[:10],
+        "pending_export_links": pending_export_links,
+        "remaining_product_ids": remaining_product_ids,
         "message": request.query_params.get("message"),
         "error": request.query_params.get("error"),
         "missing_chinese_name_count": count_missing_chinese_name_products(db),
@@ -1598,16 +2054,134 @@ async def products_generate_chinese_names(request: Request, db: Session = Depend
     return RedirectResponse(f"/products?message={quote(text)}", status_code=303)
 
 
+@app.post("/products/{product_id}/enrich-by-jan")
+def product_enrich_by_jan(
+    product_id: int,
+    return_to: str = Form(""),
+    db: Session = Depends(get_db),
+):
+    product = db.get(Product, product_id)
+    if product is None:
+        raise HTTPException(404, "商品不存在")
+    target = return_to if return_to.startswith("/") and not return_to.startswith("//") else f"/products/{product_id}"
+    separator = "&" if "?" in target else "?"
+    task = ensure_existing_product_enrichment_task(db, product)
+    if task is None:
+        return RedirectResponse(f"{target}{separator}error={quote('只有有合法JAN的缺资料商品可以按JAN补全')}", status_code=303)
+    process_enrichment_task(db, task, force=True)
+    db.refresh(product)
+    if product.status == "new_pending_completion":
+        return RedirectResponse(f"{target}{separator}error={quote('按JAN补全失败，已保留缺资料商品，可重试')}", status_code=303)
+    return RedirectResponse(f"{target}{separator}message={quote('已按JAN补全商品资料')}", status_code=303)
+
+
 @app.post("/products/qinsi-new-exports")
 async def products_qinsi_new_export(request: Request, db: Session = Depends(get_db)):
     form = await request.form()
     product_ids = {int(value) for value in form.getlist("product_ids") if str(value).isdigit()}
+    confirm_remaining = str(form.get("confirm_remaining") or "").casefold() in {"1", "true", "yes", "on"}
+    pending = pending_qinsi_product_exports(db, product_ids)
+    pending_product_ids = {item.product_id for item in pending}
+    if pending and not confirm_remaining:
+        job_ids = sorted({item.job_id for item in pending})
+        if pending_product_ids == product_ids and len(job_ids) == 1:
+            return RedirectResponse(f"/qinsi-product-exports/{job_ids[0]}", status_code=303)
+        labels = "、".join(item.label for item in pending)
+        params = f"pending_export_ids={quote(','.join(str(item) for item in job_ids))}"
+        if pending_product_ids != product_ids:
+            remaining_ids = sorted(product_ids - pending_product_ids)
+            params = (
+                f"{params}&remaining_product_ids={quote(','.join(str(item) for item in remaining_ids))}"
+                f"&error={quote('部分商品已有待确认的新商品导出：' + labels + '。请确认是否仅生成剩余商品。')}"
+            )
+        else:
+            params = f"{params}&error={quote('所选商品分别已有待确认的新商品导出：' + labels)}"
+        return RedirectResponse(f"/products?{params}", status_code=303)
+    if confirm_remaining:
+        product_ids = product_ids - pending_product_ids
     try:
         job = create_qinsi_product_export(db, product_ids)
     except ValueError as exc:
         db.rollback()
-        raise HTTPException(409, str(exc)) from exc
+        return RedirectResponse(f"/products?error={quote(str(exc))}", status_code=303)
     return RedirectResponse(f"/qinsi-product-exports/{job.id}", status_code=303)
+
+
+@app.get("/products/placeholder-cleanup", response_class=HTMLResponse)
+def product_placeholder_cleanup_page(request: Request, db: Session = Depends(get_db)):
+    preview = preview_placeholder_cleanup(db)
+    action_labels = {
+        "delete_unlinked": "直接删除临时商品",
+        "migrate_and_delete": "迁移采购关联后删除",
+        "manual_multiple_formal": "人工选择：同JAN多个正式秦丝商品",
+        "manual_blocking_links": "人工处理：存在非采购业务关联",
+        "keep_no_formal": "保留：无正式秦丝商品",
+    }
+    return templates.TemplateResponse(request, "product_placeholder_cleanup.html", {
+        "preview": preview,
+        "stats": preview.stats,
+        "action_labels": action_labels,
+        "message": request.query_params.get("message"),
+        "error": request.query_params.get("error"),
+    })
+
+
+@app.get("/products/duplicate-jans", response_class=HTMLResponse)
+def product_duplicate_jans_page(request: Request, db: Session = Depends(get_db)):
+    groups = list_duplicate_jan_groups(db)
+    return templates.TemplateResponse(request, "duplicate_jans.html", {
+        "groups": groups,
+        "message": request.query_params.get("message"),
+        "error": request.query_params.get("error"),
+    })
+
+
+@app.post("/products/duplicate-jans/{jan}/merge")
+def product_duplicate_jan_merge(
+    jan: str,
+    primary_product_id: int = Form(...),
+    actor: str = Form("system"),
+    db: Session = Depends(get_db),
+):
+    try:
+        result = merge_duplicate_jan_group(db, jan, primary_product_id=primary_product_id, actor=actor)
+    except ValueError as exc:
+        db.rollback()
+        return RedirectResponse(f"/products/duplicate-jans?error={quote(str(exc))}", status_code=303)
+    if result is None:
+        message = f"JAN {jan} 当前没有重复商品"
+    else:
+        message = f"JAN {jan} 已合并 {len(result.merged_product_ids)} 个重复商品，迁移关联 {result.migrated_association_count} 条"
+    return RedirectResponse(f"/products/duplicate-jans?message={quote(message)}", status_code=303)
+
+
+@app.post("/products/duplicate-jans/merge-all")
+def product_duplicate_jans_merge_all(actor: str = Form("system"), db: Session = Depends(get_db)):
+    try:
+        results = merge_all_duplicate_jans(db, actor=actor)
+    except ValueError as exc:
+        db.rollback()
+        return RedirectResponse(f"/products/duplicate-jans?error={quote(str(exc))}", status_code=303)
+    migrated = sum(result.migrated_association_count for result in results)
+    merged = sum(len(result.merged_product_ids) for result in results)
+    return RedirectResponse(
+        f"/products/duplicate-jans?message={quote(f'已合并 {len(results)} 组重复 JAN、{merged} 个重复商品，迁移关联 {migrated} 条')}",
+        status_code=303,
+    )
+
+
+@app.post("/products/placeholder-cleanup/confirm")
+def product_placeholder_cleanup_confirm(actor: str = Form("system"), db: Session = Depends(get_db)):
+    try:
+        result = execute_placeholder_cleanup(db, actor=actor)
+    except ValueError as exc:
+        db.rollback()
+        return RedirectResponse(f"/products/placeholder-cleanup?error={quote(str(exc))}", status_code=303)
+    message = (
+        f"已迁移商品 {result.migrated_product_count} 个、采购关联 {result.migrated_association_count} 条；"
+        f"删除临时商品 {result.deleted_product_count} 个；人工处理 {result.manual_count} 个"
+    )
+    return RedirectResponse(f"/products/placeholder-cleanup?message={quote(message)}", status_code=303)
 
 
 def _qinsi_product_export_or_404(db: Session, job_id: int) -> QinsiExportJob:
@@ -1629,6 +2203,8 @@ def qinsi_product_export_detail(job_id: int, request: Request, db: Session = Dep
 @app.get("/qinsi-product-exports/{job_id}/download")
 def qinsi_product_export_download(job_id: int, db: Session = Depends(get_db)):
     job = _qinsi_product_export_or_404(db, job_id)
+    regenerate_qinsi_product_export_file(db, job)
+    db.commit()
     if not job.file_content:
         raise HTTPException(404, "秦丝新商品导出文件不存在")
     return StreamingResponse(
@@ -2420,9 +2996,14 @@ def api_locations(db: Session = Depends(get_db)):
     return list_locations(db)
 
 
-@app.get("/purchase-batches", response_class=HTMLResponse)
-def purchase_batches_page(request: Request, db: Session = Depends(get_db)):
+def _purchase_batches_template_context(
+    db: Session,
+    *,
+    selected_purchase_batch_ids: set[int] | None = None,
+    merge_error: str | None = None,
+) -> dict:
     purchase_batches = list_purchase_batches(db)
+    selected_purchase_batch_ids = selected_purchase_batch_ids or set()
     merge_rows = []
     for purchase_batch in purchase_batches:
         states = purchase_item_export_states(db, purchase_batch.id)
@@ -2437,22 +3018,48 @@ def purchase_batches_page(request: Request, db: Session = Depends(get_db)):
             "blocking_count": blocking_count,
             "selectable": purchase_batch.status != "cancelled" and pending_count > 0,
         })
-    return templates.TemplateResponse(request, "purchase_batches.html", {
+    blocking_products = list({
+            item.product.id: item.product
+            for purchase_batch in purchase_batches if purchase_batch.id in selected_purchase_batch_ids
+            for item in purchase_batch.items
+            if item.product and qinsi_product_requires_import(item.product)
+    }.values())
+    return {
         "purchase_batches": purchase_batches, "merge_rows": merge_rows,
         "purchase_status_cn": PURCHASE_STATUS_CN,
-    })
+        "selected_purchase_batch_ids": selected_purchase_batch_ids,
+        "merge_error": merge_error,
+        "merge_blocking_products": blocking_products,
+        "product_display_label": product_display_label,
+    }
+
+
+@app.get("/purchase-batches", response_class=HTMLResponse)
+def purchase_batches_page(request: Request, db: Session = Depends(get_db)):
+    return templates.TemplateResponse(request, "purchase_batches.html", _purchase_batches_template_context(db))
 
 
 @app.post("/purchase-batches/qinsi-exports/merge")
 async def create_merged_purchase_batch_qinsi_export(request: Request, db: Session = Depends(get_db)):
     form = await request.form()
+    purchase_batch_ids: set[int] = set()
     try:
         purchase_batch_ids = {int(value) for value in form.getlist("purchase_batch_ids")}
         job = generate_merged_purchase_batch_export(db, purchase_batch_ids)
     except LookupError as exc:
-        raise HTTPException(404, str(exc)) from exc
+        db.rollback()
+        return templates.TemplateResponse(
+            request, "purchase_batches.html",
+            _purchase_batches_template_context(db, selected_purchase_batch_ids=purchase_batch_ids, merge_error=str(exc)),
+            status_code=200,
+        )
     except (TypeError, ValueError) as exc:
-        raise HTTPException(409, str(exc)) from exc
+        db.rollback()
+        return templates.TemplateResponse(
+            request, "purchase_batches.html",
+            _purchase_batches_template_context(db, selected_purchase_batch_ids=purchase_batch_ids, merge_error=str(exc)),
+            status_code=200,
+        )
     return RedirectResponse(f"/qinsi-exports/{job.id}", status_code=303)
 
 
@@ -2465,7 +3072,7 @@ def purchase_batch_detail(purchase_batch_id: int, request: Request, db: Session 
     item_states = {item.id: export_states.get(item.id, "pending") for item in purchase_batch.items}
     blocking_products = list({
         item.product.id: item.product for item in purchase_batch.items
-        if item.product.status != "qinsi_product_imported"
+        if qinsi_product_requires_import(item.product)
     }.values())
     summary = {
         "kind_count": len({item.product.jan or item.product_id for item in purchase_batch.items}),
@@ -2477,6 +3084,7 @@ def purchase_batch_detail(purchase_batch_id: int, request: Request, db: Session 
         "item_states": item_states, "purchase_export_state_cn": PURCHASE_EXPORT_STATE_CN,
         "pending_export_count": 0 if blocking_products else sum(state == "pending" for state in item_states.values()),
         "blocking_products": blocking_products, "summary": summary,
+        "product_display_label": product_display_label,
     })
 
 
@@ -2532,6 +3140,7 @@ def qinsi_export_detail(export_job_id: int, request: Request, db: Session = Depe
     return templates.TemplateResponse(request, "qinsi_export_detail.html", {
         "job": job, "qinsi_export_status_cn": QINSI_EXPORT_STATUS_CN,
         "qinsi_export_type_cn": QINSI_EXPORT_TYPE_CN, "qinsi_line_status_cn": QINSI_LINE_STATUS_CN,
+        "error": request.query_params.get("error"),
     })
 
 
@@ -2558,9 +3167,19 @@ async def qinsi_export_confirm(export_job_id: int, request: Request, db: Session
         })
         confirm_qinsi_export(db, job, confirmation)
     except ValidationError as exc:
-        raise HTTPException(422, _validation_message(exc)) from exc
+        db.rollback()
+        return templates.TemplateResponse(request, "qinsi_export_detail.html", {
+            "job": job, "qinsi_export_status_cn": QINSI_EXPORT_STATUS_CN,
+            "qinsi_export_type_cn": QINSI_EXPORT_TYPE_CN, "qinsi_line_status_cn": QINSI_LINE_STATUS_CN,
+            "error": f"确认结果无效：{_qinsi_confirmation_validation_message(exc)}",
+        }, status_code=422)
     except ValueError as exc:
-        raise HTTPException(409, str(exc)) from exc
+        db.rollback()
+        return templates.TemplateResponse(request, "qinsi_export_detail.html", {
+            "job": job, "qinsi_export_status_cn": QINSI_EXPORT_STATUS_CN,
+            "qinsi_export_type_cn": QINSI_EXPORT_TYPE_CN, "qinsi_line_status_cn": QINSI_LINE_STATUS_CN,
+            "error": str(exc),
+        }, status_code=409)
     return RedirectResponse(f"/qinsi-exports/{export_job_id}", status_code=303)
 
 
@@ -3052,6 +3671,15 @@ def update_product_page(
     jan: str | None = Form(None),
     main_image_source_url: str = Form(""),
     purchase_price: str = Form(""),
+    specification: str = Form(""),
+    net_weight_g: str = Form(""),
+    volume_ml: str = Form(""),
+    length_mm: str = Form(""),
+    width_mm: str = Form(""),
+    height_mm: str = Form(""),
+    depth_mm: str = Form(""),
+    pack_quantity: str = Form(""),
+    spec_text: str = Form(""),
     status: str = Form("active"),
     actor: str = Form("人工操作"),
     reason: str = Form(""),
@@ -3069,6 +3697,15 @@ def update_product_page(
             jan=jan,
             image_url=main_image_source_url,
             purchase_price=purchase_price,
+            specification=specification,
+            net_weight_g=net_weight_g,
+            volume_ml=volume_ml,
+            length_mm=length_mm,
+            width_mm=width_mm,
+            height_mm=height_mm,
+            depth_mm=depth_mm,
+            pack_quantity=pack_quantity,
+            spec_text=spec_text,
             status=status,
             actor=actor,
             reason=reason,
@@ -3084,21 +3721,92 @@ def update_product_page(
     return RedirectResponse(f"/products/{product_id}?saved=1", status_code=303)
 
 
+@app.post("/products/{product_id}/photo")
+async def product_photo_completion(
+    product_id: int,
+    product_image: UploadFile = File(...),
+    name_cn: str = Form(""),
+    name_ja: str = Form(""),
+    spec_text: str = Form(""),
+    actor: str = Form("人工操作"),
+    db: Session = Depends(get_db),
+):
+    product = db.get(Product, product_id)
+    if not product:
+        raise HTTPException(404, "商品不存在")
+    try:
+        save_product_photo_for_completion(
+            db,
+            product,
+            content=await product_image.read(),
+            content_type=(product_image.content_type or "application/octet-stream").casefold(),
+            original_filename=product_image.filename or "product-photo",
+            name_cn=name_cn,
+            name_ja=name_ja,
+            spec_text=spec_text,
+            actor=actor,
+        )
+    except ValueError as exc:
+        db.rollback()
+        return RedirectResponse(f"/products/{product_id}?error={quote(str(exc))}", status_code=303)
+    return RedirectResponse(f"/products/{product_id}?message={quote('已上传商品照片，资料候选待确认')}", status_code=303)
+
+
 @app.post("/products/{product_id}/redownload-image")
 def product_redownload_image(product_id: int, db: Session = Depends(get_db)):
     product = db.get(Product, product_id)
     if not product:
         raise HTTPException(404, "商品不存在")
-    job = queue_product_image_localization(db, product, force_retry=True)
-    if job is None:
+    result = refresh_existing_product_main_image(db, product)
+    if result.replaced:
+        message = f"已替换为高清商品图：{result.new_width}x{result.new_height}"
+    elif result.reason == "thumbnail_only":
+        message = "只找到缩略图，已标记thumbnail并保留旧图"
+    elif result.reason == "not_larger":
+        message = "新图不比现有主图更清晰，已保留旧图"
+    else:
         return RedirectResponse(
-            f"/products/{product_id}?error={quote('没有可下载的线上主图URL')}",
+            f"/products/{product_id}?error={quote('没有找到可刷新的商品图候选')}",
             status_code=303,
         )
-    db.commit()
-    wake_image_localization_worker()
     return RedirectResponse(
-        f"/products/{product_id}?message={quote('已加入图片重新下载队列')}",
+        f"/products/{product_id}?message={quote(message)}",
+        status_code=303,
+    )
+
+
+@app.post("/products/{product_id}/restore-auto-image")
+def product_restore_auto_image(product_id: int, db: Session = Depends(get_db)):
+    product = db.get(Product, product_id)
+    if not product:
+        raise HTTPException(404, "商品不存在")
+    product.main_image_locked = False
+    product.main_image_path = None
+    product.main_image_hash = None
+    product.image_width = None
+    product.image_height = None
+    product.image_quality = None
+    db.commit()
+    return RedirectResponse(
+        f"/products/{product_id}?message={quote('已恢复自动图片优先级')}",
+        status_code=303,
+    )
+
+
+@app.post("/products/{product_id}/restore-auto-image")
+def product_restore_auto_image(product_id: int, db: Session = Depends(get_db)):
+    product = db.get(Product, product_id)
+    if not product:
+        raise HTTPException(404, "商品不存在")
+    product.main_image_locked = False
+    product.main_image_path = None
+    product.main_image_hash = None
+    product.image_width = None
+    product.image_height = None
+    product.image_quality = None
+    db.commit()
+    return RedirectResponse(
+        f"/products/{product_id}?message={quote('已恢复自动图片优先级')}",
         status_code=303,
     )
 

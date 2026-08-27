@@ -7,7 +7,9 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import httpx
+import pytest
 from sqlalchemy import func, select
+from sqlalchemy.exc import IntegrityError
 
 import app.field_purchase as field_purchase
 from app.config import rakuten_http_referer
@@ -21,6 +23,7 @@ from app.field_purchase import (
     record_ambiguous_scan_for_review,
     record_existing_scan,
     recover_stale_jobs,
+    save_field_product_image,
     update_field_batch_store,
     update_field_item,
 )
@@ -100,7 +103,37 @@ def test_jan_validation_preserves_leading_zero_and_rejects_empty():
 def test_unified_jan_lookup_returns_not_found_and_invalid(db_session):
     assert product_lookup_payload(db_session, VALID_JAN)["status"] == "NOT_FOUND"
     assert product_lookup_payload(db_session, "12345678")["status"] == "INVALID"
-    assert resolve_local_product_by_jan(db_session, "123456789012").status == "INVALID"
+    assert resolve_local_product_by_jan(db_session, "123456789012").status == "NOT_FOUND"
+    assert resolve_local_product_by_jan(db_session, "123456789013").status == "INVALID"
+
+
+def test_field_lookup_is_local_only_and_qinsi_code_does_not_fake_jan(db_session, monkeypatch):
+    import app.price_service as price_service
+
+    monkeypatch.setattr(price_service, "query_prices", lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("online provider called")))
+    product = Product(name_cn="秦丝货号不是JAN", qinsi_product_code=VALID_JAN)
+    db_session.add(product)
+    db_session.commit()
+
+    payload = product_lookup_payload(db_session, VALID_JAN)
+
+    assert payload["status"] == "NOT_FOUND"
+
+
+def test_formal_jan_wins_over_qinsi_code_for_known_duplicate_shape(db_session):
+    imported = Product(name_cn="秦丝旧货号", qinsi_product_code="4550624157131", status="qinsi_product_imported")
+    formal = Product(jan="4550624157131", name_cn="正式JAN商品", name_ja="正式JAN", status="new_pending_review")
+    db_session.add_all([imported, formal])
+    db_session.commit()
+
+    resolution = resolve_local_product_by_jan(db_session, "4550624157131")
+    payload = product_lookup_payload(db_session, "4550624157131")
+
+    assert resolution.status == "UNIQUE"
+    assert resolution.product.id == formal.id
+    assert resolution.match_method == "product_jan"
+    assert payload["status"] == "UNIQUE"
+    assert payload["product"]["id"] == formal.id
 
 
 def test_existing_product_barcode_lookup_repeat_scan_and_idempotency(db_session):
@@ -165,7 +198,7 @@ def test_confirmed_jan_alias_lookup_is_shared_by_price_and_field_purchase(db_ses
     assert payload["match_source"] == "product_alias_jan"
 
 
-def test_qinsi_sku_derived_jan_resolves_reproduction_and_backfill_is_idempotent(db_session):
+def test_qinsi_sku_derived_jan_backfill_is_not_used_for_plain_scan(db_session):
     reproduction_jan = "4550726010198"
     assert validate_jan(reproduction_jan)
     product = Product(
@@ -183,16 +216,15 @@ def test_qinsi_sku_derived_jan_resolves_reproduction_and_backfill_is_idempotent(
     )
 
     resolution = resolve_local_product_by_jan(db_session, reproduction_jan)
-    assert resolution.product.id == product.id
-    assert resolution.match_method == "qinsi_sku_derived"
-    assert product_lookup_payload(db_session, reproduction_jan, batch.id)["status"] == "UNIQUE"
-    scanned = record_existing_scan(
-        db_session,
-        batch_id=batch.id,
-        jan=reproduction_jan,
-        client_request_id="derived-qinsi-scan",
-    )
-    assert scanned["product"]["id"] == product.id
+    assert resolution.status == "NOT_FOUND"
+    assert product_lookup_payload(db_session, reproduction_jan, batch.id)["status"] == "NOT_FOUND"
+    with pytest.raises(LookupError):
+        record_existing_scan(
+            db_session,
+            batch_id=batch.id,
+            jan=reproduction_jan,
+            client_request_id="derived-qinsi-scan",
+        )
     assert db_session.scalar(select(func.count()).select_from(Product)) == 1
 
     ensure_qinsi_derived_barcode(db_session, product)
@@ -206,6 +238,7 @@ def test_qinsi_sku_derived_jan_resolves_reproduction_and_backfill_is_idempotent(
     assert len(aliases) == 1
     assert aliases[0].source_system == QINSI_DERIVED_BARCODE_SOURCE
     assert aliases[0].is_primary is False
+    assert resolve_local_product_by_jan(db_session, reproduction_jan).status == "NOT_FOUND"
 
 
 def test_qinsi_sku_derived_jan_preserves_leading_zero_and_rejects_unsafe_forms(db_session):
@@ -216,7 +249,7 @@ def test_qinsi_sku_derived_jan_preserves_leading_zero_and_rejects_unsafe_forms(d
     db_session.commit()
 
     assert derive_jan_from_qinsi_sku(leading.qinsi_product_code) == LEADING_ZERO_JAN
-    assert resolve_local_product_by_jan(db_session, LEADING_ZERO_JAN).product.id == leading.id
+    assert resolve_local_product_by_jan(db_session, LEADING_ZERO_JAN).product is None
     assert derive_jan_from_qinsi_sku(invalid.qinsi_product_code) is None
     assert derive_jan_from_qinsi_sku(ordinary.qinsi_product_code) is None
     assert resolve_local_product_by_jan(db_session, "4550726010198").product is None
@@ -237,12 +270,11 @@ def test_local_jan_conflict_never_auto_matches(db_session):
     db_session.commit()
 
     resolution = resolve_local_product_by_jan(db_session, jan)
-    assert resolution.is_conflict
-    assert set(resolution.candidate_product_ids) == {barcode_product.id, derived_product.id}
+    assert resolution.is_unique
+    assert resolution.product.id == barcode_product.id
     payload = product_lookup_payload(db_session, jan)
-    assert payload["status"] == "AMBIGUOUS"
-    assert {item["id"] for item in payload["candidates"]} == {barcode_product.id, derived_product.id}
-    assert "请选择商品" in payload["message"]
+    assert payload["status"] == "UNIQUE"
+    assert payload["product"]["id"] == barcode_product.id
     batch = create_field_batch(
         db_session,
         store_id=None,
@@ -254,23 +286,22 @@ def test_local_jan_conflict_never_auto_matches(db_session):
         batch_id=batch.id,
         jan=jan,
         client_request_id="ambiguous-selected",
-        selected_product_id=derived_product.id,
+        selected_product_id=barcode_product.id,
     )
-    assert selected["product"]["id"] == derived_product.id
-    review = record_ambiguous_scan_for_review(
-        db_session,
-        batch_id=batch.id,
-        jan=jan,
-        client_request_id="ambiguous-review",
-    )
-    assert review["resolution_status"] == "AMBIGUOUS"
-    assert review["product"] is None
+    assert selected["product"]["id"] == barcode_product.id
+    with pytest.raises(ValueError):
+        record_ambiguous_scan_for_review(
+            db_session,
+            batch_id=batch.id,
+            jan=jan,
+            client_request_id="ambiguous-review",
+        )
     try:
         ensure_qinsi_derived_barcode(db_session, derived_product)
     except ValueError as exc:
-        assert "多个商品" in str(exc)
+        assert "其他商品" in str(exc) or "多个商品" in str(exc)
     else:
-        raise AssertionError("冲突 JAN 不应创建秦丝派生条码别名")
+        raise AssertionError("已被普通条码占用的派生 JAN 不应创建秦丝派生条码别名")
     assert db_session.scalar(
         select(func.count())
         .select_from(ProductBarcode)
@@ -279,6 +310,55 @@ def test_local_jan_conflict_never_auto_matches(db_session):
             ProductBarcode.source_system == QINSI_DERIVED_BARCODE_SOURCE,
         )
     ) == 0
+
+
+def test_same_jan_products_are_rejected_and_unique_product_scans_directly(db_session):
+    jan = "4571609352419"
+    red = Product(
+        jan=jan,
+        qinsi_product_code="Q-RED",
+        qinsi_name="红色款",
+        name_cn="红色款",
+        specification="红",
+        status="qinsi_product_imported",
+    )
+    blue = Product(
+        jan=jan,
+        qinsi_product_code="Q-BLUE",
+        qinsi_name="蓝色款",
+        name_cn="蓝色款",
+        specification="蓝",
+        status="qinsi_product_imported",
+    )
+    db_session.add_all([red, blue])
+    with pytest.raises(IntegrityError):
+        db_session.commit()
+    db_session.rollback()
+
+    db_session.add(red)
+    db_session.commit()
+
+    resolution = resolve_local_product_by_jan(db_session, jan)
+    assert resolution.product.id == red.id
+    assert not resolution.is_conflict
+    payload = product_lookup_payload(db_session, jan)
+    assert payload["status"] == "UNIQUE"
+    assert payload["product"]["id"] == red.id
+
+    batch = create_field_batch(
+        db_session,
+        store_id=None,
+        operator_name="采购员A",
+        client_request_id="same-jan-candidate-batch",
+    )
+    scanned = record_existing_scan(
+        db_session,
+        batch_id=batch.id,
+        jan=jan,
+        client_request_id="same-jan-unique",
+    )
+    assert scanned["product"]["id"] == red.id
+    assert db_session.scalar(select(FieldPurchaseItem.product_id)) == red.id
 
 
 def test_optional_field_store_allows_scanning_then_later_update_and_analytics(client):
@@ -482,7 +562,7 @@ def test_stale_running_job_recovers_after_restart_and_moves_to_review(
     assert evidence.ocr_status == "UNCONFIGURED"
 
 
-def test_manual_review_confirms_no_jan_product_without_fabricating_barcode(
+def test_manual_review_blocks_no_jan_product_without_fabricating_barcode(
     db_session,
     tmp_path,
     monkeypatch,
@@ -512,14 +592,64 @@ def test_manual_review_confirms_no_jan_product_without_fabricating_barcode(
         category="测试分类",
         unit_name="个",
     )
-    product = confirm_field_item(db_session, payload["item_id"], actor="审核员")
-    item = db_session.get(FieldPurchaseItem, payload["item_id"])
+    try:
+        confirm_field_item(db_session, payload["item_id"], actor="审核员")
+    except ValueError as exc:
+        assert "合法 JAN" in str(exc)
+    else:
+        raise AssertionError("无 JAN 草稿不应自动创建 Product")
+    assert db_session.scalar(select(func.count()).select_from(Product)) == 0
 
-    assert product.jan is None
-    assert product.internal_sku
-    assert item.temporary_id == "TMP-MANUAL-1"
-    assert item.status == "CONFIRMED"
-    assert db_session.scalar(select(func.count()).select_from(EnrichmentAuditLog)) == 2
+
+def test_photo_completion_updates_existing_same_jan_and_does_not_guess_jan(
+    db_session,
+    tmp_path,
+    monkeypatch,
+    jpeg_bytes,
+):
+    monkeypatch.setattr(field_purchase, "PROJECT_ROOT", tmp_path)
+    monkeypatch.setattr(field_purchase, "TAG_EVIDENCE_DIR", tmp_path / "tags")
+    monkeypatch.setattr(field_purchase, "PRODUCT_IMAGE_DIR", tmp_path / "products")
+    batch = make_batch(db_session)
+    existing = Product(jan=VALID_JAN, status="new_pending_completion", name_ja="缺商品")
+    db_session.add(existing)
+    db_session.flush()
+    item = FieldPurchaseItem(
+        batch_id=batch.id,
+        jan=VALID_JAN,
+        quantity=1,
+        status="NEEDS_REVIEW",
+        name_ja="写真候補商品 140g",
+        captured_by="采购员A",
+    )
+    db_session.add(item)
+    db_session.commit()
+    save_field_product_image(
+        db_session,
+        item.id,
+        actor="审核员",
+        content=jpeg_bytes,
+        content_type="image/jpeg",
+        original_filename="photo.jpg",
+    )
+    evidence = db_session.scalar(select(TagEvidence).where(TagEvidence.field_purchase_item_id == item.id))
+    evidence.ocr_status = "COMPLETED"
+    evidence.ocr_text = "JAN 4570110290418 W60×H60×D80mm 140g"
+    db_session.commit()
+
+    product = confirm_field_item(db_session, item.id, actor="审核员")
+
+    assert product.id == existing.id
+    assert product.jan == VALID_JAN
+    assert product.name_ja == "写真候補商品 140g"
+    assert product.source == "photo"
+    assert product.name_source == "photo"
+    assert product.needs_review is True
+    assert product.main_image_path and (tmp_path / product.main_image_path).is_file()
+    assert product.net_weight_g == 140
+    assert product.width_mm == 60 and product.height_mm == 60 and product.depth_mm == 80
+    assert db_session.scalar(select(func.count()).select_from(Product).where(Product.jan == VALID_JAN)) == 1
+    assert db_session.scalar(select(Product).where(Product.jan == "4570110290418")) is None
 
 
 def test_field_purchase_api_and_navigation_permissions(client, monkeypatch, jpeg_bytes):
@@ -538,7 +668,7 @@ def test_field_purchase_api_and_navigation_permissions(client, monkeypatch, jpeg
     page = test_client.get(f"/field-purchase?batch_id={batch.id}")
     assert page.status_code == 200
     assert "fieldCameraSelect" in page.text
-    assert "吊牌（必拍）" in page.text
+    assert "拍商品照片" in page.text
     default_page = test_client.get("/field-purchase")
     assert batch.batch_no in default_page.text
     assert "当前批次暂无商品" in default_page.text
@@ -648,6 +778,8 @@ def test_camera_contract_uses_high_resolution_roi_and_safe_capability_fallback()
         assert diagnostic in script
     assert "tagPhoto.value = \"\";" in script
     assert "已保存到本机；服务器待同步" in script
+    assert "本地商品查询失败，请重试。" in script
+    assert "finally" in script
     assert "UnifiedJanScanner" in adapter
     assert "decode loop running" in adapter
     assert "framesTotal" in script

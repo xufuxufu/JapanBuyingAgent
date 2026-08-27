@@ -507,18 +507,18 @@
 
   function renderAmbiguous(payload) {
     const cards = (payload.candidates || []).map((candidate) => `
-      <article class="field-ambiguous-candidate">
+      <article class="field-ambiguous-candidate compact">
         ${candidate.image_url ? `<img src="${escapeHtml(candidate.image_url)}" alt="商品图片">` : "<div class=\"field-image-empty\">暂无图</div>"}
-        <div><h3>${escapeHtml(candidate.name || candidate.internal_sku)}</h3>
-        <p>${escapeHtml(candidate.specification || "规格未填写")}</p>
-        <p>秦丝货号：${escapeHtml(candidate.qinsi_product_code || "—")}</p>
-        <p>秦丝条码：${escapeHtml((candidate.qinsi_barcodes || []).join("、") || "—")}</p>
+        <div><h3>${escapeHtml(candidate.qinsi_name || candidate.name || candidate.internal_sku)}</h3>
+        <p>货号：${escapeHtml(candidate.qinsi_goods_no || candidate.qinsi_product_code || candidate.internal_sku || "—")}</p>
+        <p>${escapeHtml([candidate.compact_spec || candidate.specification, candidate.color].filter(Boolean).join(" · ") || "规格/颜色未登记")}</p>
+        ${candidate.recent_purchase ? `<p class="muted">最近采购：${escapeHtml(candidate.recent_purchase.store_name || candidate.recent_purchase.batch_no || "—")} · ×${Number(candidate.recent_purchase.quantity || 0)}${candidate.recent_purchase.unit_price == null ? "" : ` · ¥${Number(candidate.recent_purchase.unit_price)}`}</p>` : "<p class=\"muted\">暂无最近采购</p>"}
         <button type="button" data-select-product="${Number(candidate.id)}">选择此商品</button></div>
       </article>`).join("");
     result.innerHTML = `
-      <span class="badge warning">JAN 多匹配</span>
+      <span class="badge warning">找到${Number((payload.candidates || []).length)}个候选</span>
       <h2>${escapeHtml(payload.jan)}</h2>
-      <p>${escapeHtml(payload.message)}</p>
+      <p>该JAN对应多个商品，请选择。</p>
       <div class="field-ambiguous-list">${cards}</div>
       <button type="button" class="secondary" data-store-review="true">暂存待审核</button>`;
     result.querySelectorAll("[data-select-product]").forEach((button) => {
@@ -1057,32 +1057,47 @@
     setNextBarVisible(true);
     draftPanel.hidden = true;
     pendingIdentity = null;
-    result.innerHTML = `<span class="badge">查询中</span><h2>${escapeHtml(jan)}</h2><p class="muted">正在查询本地商品…</p>`;
-    setNextEnabled(false, "正在查询本地商品。");
-    cameraStatus.textContent = `已读取 ${jan}，正在查询本地商品…`;
-    const payload = await lookupJan(jan, generation);
-    if (payload.stale || generation !== currentFlowGeneration) return;
-    if (payload.status === "UNIQUE") {
-      const saved = await queueExisting(payload);
-      cameraStatus.textContent = saved ? "商品已登记，采购事实已保存。" : "采购事实保存失败，请重试。";
-    } else if (payload.status === "NOT_FOUND") {
-      if (!flowState.local_query_loading) {
+    try {
+      result.innerHTML = `<span class="badge">查询中</span><h2>${escapeHtml(jan)}</h2><p class="muted">正在查询本地商品…</p>`;
+      setNextEnabled(false, "正在查询本地商品。");
+      cameraStatus.textContent = `已读取 ${jan}，正在查询本地商品…`;
+      const payload = await lookupJan(jan, generation);
+      if (payload.stale || generation !== currentFlowGeneration) return;
+      if (payload.status === "UNIQUE") {
+        const saved = await queueExisting(payload);
+        cameraStatus.textContent = saved ? "商品已登记，采购事实已保存。" : "采购事实保存失败，请重试。";
+      } else if (payload.status === "NOT_FOUND") {
         renderNew(jan, null);
         cameraStatus.textContent = payload.offline ? "离线新商品：拍吊牌保存本机草稿。" : "新商品：请拍吊牌。";
         feedback("warning");
+      } else if (payload.status === "AMBIGUOUS") {
+        renderAmbiguous(payload);
+        cameraStatus.textContent = "找到多个本地候选，请选择。";
+        feedback("warning");
+      } else {
+        renderInvalid(payload.message || "本地商品查询失败，请重试。");
+        result.insertAdjacentHTML("beforeend", `<button type="button" class="secondary compact" data-retry-lookup="${escapeHtml(jan)}">重试查询本地商品</button>`);
+        setFlowState({failed_retryable: true});
+        setNextEnabled(false, "本地查询失败，尚未保存采购事实或新品草稿。");
+        feedback("warning");
+        handlingCode = false;
+        if (manualSubmit) manualSubmit.disabled = false;
       }
-    } else if (payload.status === "AMBIGUOUS") {
-      renderAmbiguous(payload);
-      cameraStatus.textContent = "JAN 多匹配：请选择商品或暂存待审核。";
-      feedback("warning");
-    } else {
-      renderInvalid(payload.message || "本地商品查询失败，请重试。");
-      result.insertAdjacentHTML("beforeend", `<button type="button" class="secondary compact" data-retry-lookup="${escapeHtml(jan)}">重试查询本地商品</button>`);
-      setFlowState({failed_retryable: true});
+    } catch (error) {
+      if (generation !== currentFlowGeneration) return;
+      setFlowState({local_query_loading: false, local_query_failed_retryable: true, failed_retryable: true});
+      renderInvalid("本地商品查询失败，请重试。");
+      result.insertAdjacentHTML("beforeend", `<p class="error message">${escapeHtml(safeErrorMessage(error, "补全失败，可稍后重试。"))}</p><button type="button" class="secondary compact" data-retry-lookup="${escapeHtml(jan)}">重试查询本地商品</button>`);
       setNextEnabled(false, "本地查询失败，尚未保存采购事实或新品草稿。");
+      cameraStatus.textContent = "本地商品查询失败，可重试。";
       feedback("warning");
       handlingCode = false;
       if (manualSubmit) manualSubmit.disabled = false;
+    } finally {
+      if (generation === currentFlowGeneration) {
+        setFlowState({local_query_loading: false});
+        updateDebug();
+      }
     }
   }
 

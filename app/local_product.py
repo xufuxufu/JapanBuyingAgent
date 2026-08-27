@@ -13,6 +13,13 @@ from app.product_matching import validate_jan
 
 QINSI_DERIVED_BARCODE_SOURCE = "qinsi_sku_derived"
 _QINSI_DERIVED_JAN_PATTERN = re.compile(r"^/([0-9]{8}|[0-9]{13})$")
+ACTIVE_PRODUCT_STATUSES = {
+    "active",
+    "new_pending_completion",
+    "new_pending_review",
+    "pending_qinsi_product_import",
+    "qinsi_product_imported",
+}
 
 
 @dataclass(frozen=True)
@@ -45,7 +52,7 @@ def normalize_jan(value: str | None) -> str | None:
 
 
 def is_valid_jan(value: str | None) -> bool:
-    return bool(value and len(value) in {8, 13} and validate_jan(value))
+    return bool(value and validate_jan(value))
 
 
 def derive_jan_from_qinsi_sku(value: str | None) -> str | None:
@@ -57,10 +64,14 @@ def derive_jan_from_qinsi_sku(value: str | None) -> str | None:
     return jan if is_valid_jan(jan) else None
 
 
+def _active_product_query():
+    return select(Product).where(Product.status.in_(ACTIVE_PRODUCT_STATUSES))
+
+
 def _products_for_ids(session: Session, product_ids: set[int]) -> list[Product]:
     if not product_ids:
         return []
-    return list(session.scalars(select(Product).where(Product.id.in_(product_ids)).order_by(Product.id)))
+    return list(session.scalars(_active_product_query().where(Product.id.in_(product_ids)).order_by(Product.id)))
 
 
 def resolve_local_product_by_jan(
@@ -71,27 +82,40 @@ def resolve_local_product_by_jan(
     if not is_valid_jan(jan):
         return LocalProductResolution(status="INVALID", jan=jan)
 
-    matches: list[tuple[str, Product]] = []
-    barcode_rows = list(
-        session.scalars(
-            select(ProductBarcode)
-            .where(ProductBarcode.barcode == jan)
-            .order_by(ProductBarcode.id)
-        )
+    direct_products = list(
+        session.scalars(_active_product_query().where(Product.jan == jan).order_by(Product.id))
     )
+    if len(direct_products) == 1:
+        product = direct_products[0]
+        return LocalProductResolution(
+            status="UNIQUE",
+            jan=jan,
+            product=product,
+            match_method="product_jan",
+            candidate_product_ids=(product.id,),
+            candidate_products=(product,),
+        )
+    if len(direct_products) > 1:
+        product_ids = tuple(product.id for product in direct_products)
+        return LocalProductResolution(
+            status="AMBIGUOUS",
+            jan=jan,
+            candidate_product_ids=product_ids,
+            candidate_products=tuple(direct_products),
+        )
+
+    matches: list[tuple[str, Product]] = []
+    barcode_rows = list(session.scalars(
+        select(ProductBarcode)
+        .where(
+            ProductBarcode.barcode == jan,
+            ProductBarcode.source_system != QINSI_DERIVED_BARCODE_SOURCE,
+        )
+        .order_by(ProductBarcode.id)
+    ))
     barcode_product_ids = {row.product_id for row in barcode_rows}
     matches.extend(("product_barcode", product) for product in _products_for_ids(session, barcode_product_ids))
 
-    matches.extend(
-        ("product_jan", product)
-        for product in session.scalars(select(Product).where(Product.jan == jan).order_by(Product.id))
-    )
-    matches.extend(
-        ("qinsi_sku_exact", product)
-        for product in session.scalars(
-            select(Product).where(Product.qinsi_product_code == jan).order_by(Product.id)
-        )
-    )
     alias_rows = session.scalars(
         select(ProductAlias)
         .where(
@@ -102,15 +126,6 @@ def resolve_local_product_by_jan(
     )
     alias_product_ids = {row.product_id for row in alias_rows if is_valid_jan(row.alias)}
     matches.extend(("product_alias_jan", product) for product in _products_for_ids(session, alias_product_ids))
-
-    derived_code = f"/{jan}"
-    matches.extend(
-        ("qinsi_sku_derived", product)
-        for product in session.scalars(
-            select(Product).where(Product.qinsi_product_code == derived_code).order_by(Product.id)
-        )
-        if derive_jan_from_qinsi_sku(product.qinsi_product_code) == jan
-    )
 
     product_ids = tuple(sorted({product.id for _, product in matches}))
     candidate_products = tuple(_products_for_ids(session, set(product_ids)))

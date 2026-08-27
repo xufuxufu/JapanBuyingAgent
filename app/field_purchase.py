@@ -22,6 +22,8 @@ from app.models import (
     FieldPurchaseSyncRequest,
     Product,
     ProductEnrichmentTask,
+    PurchaseBatch,
+    PurchaseBatchItem,
     Store,
     TagEvidence,
 )
@@ -32,6 +34,7 @@ from app.product_image_localization import (
     process_product_image_job,
     product_image_summary,
 )
+from app.product_specs import parse_product_specs
 
 
 OPEN_ITEM_STATUSES = {
@@ -51,6 +54,11 @@ ALLOWED_IMAGE_TYPES = {
     "image/heic": ".heic",
     "image/heif": ".heif",
 }
+
+
+def _usable_name(value: str | None) -> str:
+    text = normalize_product_name_whitespace(value) or ""
+    return "" if text in {"缺商品", "中文名待补", "日文名待补"} else text
 
 
 def utcnow() -> datetime:
@@ -164,6 +172,39 @@ def lookup_local_product(session: Session, code: str | None) -> Product | None:
     return resolve_local_product_by_jan(session, code).product
 
 
+def _recent_purchase_summary(session: Session, product_id: int) -> dict[str, Any] | None:
+    row = session.execute(
+        select(PurchaseBatchItem, PurchaseBatch)
+        .join(PurchaseBatch, PurchaseBatch.id == PurchaseBatchItem.purchase_batch_id)
+        .where(PurchaseBatchItem.product_id == product_id)
+        .order_by(PurchaseBatch.purchased_at.desc(), PurchaseBatch.created_at.desc(), PurchaseBatchItem.id.desc())
+        .limit(1)
+    ).first()
+    if row is None:
+        return None
+    item, batch = row
+    purchased_at = batch.purchased_at or batch.created_at
+    return {
+        "batch_no": batch.batch_no,
+        "store_name": batch.store_name,
+        "purchased_at": purchased_at.isoformat() if purchased_at else None,
+        "quantity": item.quantity,
+        "unit_price": item.unit_price,
+    }
+
+
+def _field_candidate_summary(session: Session, product: Product) -> dict[str, Any]:
+    summary = product_image_summary(product)
+    summary.update({
+        "qinsi_name": product.qinsi_name,
+        "qinsi_goods_no": product.qinsi_product_code,
+        "compact_spec": product.compact_spec,
+        "color": product.color,
+        "recent_purchase": _recent_purchase_summary(session, product.id),
+    })
+    return summary
+
+
 def product_lookup_payload(session: Session, code: str | None, batch_id: int | None = None) -> dict[str, Any]:
     value = (code or "").strip()
     if not value:
@@ -176,8 +217,8 @@ def product_lookup_payload(session: Session, code: str | None, batch_id: int | N
             "status": "AMBIGUOUS",
             "jan": value,
             "candidate_product_ids": list(resolution.candidate_product_ids),
-            "candidates": [product_image_summary(product) for product in resolution.candidate_products],
-            "message": "本地存在多个商品匹配此JAN，已停止自动匹配；请选择商品或暂存待审核",
+            "candidates": [_field_candidate_summary(session, product) for product in resolution.candidate_products],
+            "message": "该JAN对应多个商品，请选择",
         }
     product = resolution.product
     if product is None:
@@ -193,7 +234,7 @@ def product_lookup_payload(session: Session, code: str | None, batch_id: int | N
     return {
         "status": "UNIQUE",
         "jan": value,
-        "product": product_image_summary(product),
+        "product": _field_candidate_summary(session, product),
         "batch_quantity": quantity,
         "match_source": resolution.match_method,
         "message": "商品已登记",
@@ -955,7 +996,7 @@ def update_field_item(
     item.category = (category or "").strip()[:128] or None
     item.unit_name = (unit_name or "").strip()[:128] or None
     if item.status not in {"CONFIRMED", "FAILED_MANUAL"}:
-        item.status = "READY" if item.name_cn and item.name_ja else "NEEDS_REVIEW"
+        item.status = "READY" if item.name_cn or item.name_ja else "NEEDS_REVIEW"
     after = {
         "name_cn": item.name_cn,
         "name_ja": item.name_ja,
@@ -979,6 +1020,69 @@ def update_field_item(
     return item
 
 
+def _promote_field_product_image(item: FieldPurchaseItem) -> tuple[str | None, str | None]:
+    if not item.product_image_path:
+        return None, None
+    source_path = (PROJECT_ROOT / item.product_image_path).resolve()
+    if not source_path.is_relative_to(TAG_EVIDENCE_DIR.resolve()) or not source_path.is_file():
+        return None, None
+    PRODUCT_IMAGE_DIR.mkdir(parents=True, exist_ok=True)
+    content = source_path.read_bytes()
+    digest = hashlib.sha256(content).hexdigest()
+    destination = PRODUCT_IMAGE_DIR / f"{digest}{source_path.suffix.casefold()}"
+    if not destination.exists():
+        destination.write_bytes(content)
+    return destination.resolve().relative_to(PROJECT_ROOT.resolve()).as_posix(), digest
+
+
+def _ocr_text_for_specs(item: FieldPurchaseItem) -> str | None:
+    texts = [evidence.ocr_text for evidence in item.tag_evidence if evidence.ocr_text]
+    return "\n".join(texts) if texts else None
+
+
+def _apply_field_item_completion(product: Product, item: FieldPurchaseItem, *, name_source: str) -> None:
+    name_cn = _usable_name(item.name_cn)
+    name_ja = _usable_name(item.name_ja)
+    if name_cn and not _usable_name(product.name_cn):
+        product.name_cn = name_cn[:128]
+    if name_ja and not _usable_name(product.name_ja):
+        product.name_ja = name_ja[:128]
+    if name_cn or name_ja:
+        product.display_name = format_product_display_name(product.name_cn, product.name_ja)
+        product.name_source = product.name_source or name_source
+    if item.brand and not product.brand:
+        product.brand = item.brand
+    if item.category and not product.category:
+        product.category = item.category
+    if item.unit_name and not product.unit_name:
+        product.unit_name = item.unit_name
+    if item.unit_price is not None and product.purchase_price is None:
+        product.purchase_price = item.unit_price
+    if item.unit_price is not None and product.sale_price is None:
+        product.sale_price = item.unit_price
+    promoted_image, digest = _promote_field_product_image(item)
+    if promoted_image and not product.main_image_path:
+        product.main_image_path = promoted_image
+        product.main_image_hash = digest
+        product.main_image_locked = True
+        if product.id:
+            product.display_image_url = f"/product-images/{product.id}"
+    spec_text = _ocr_text_for_specs(item)
+    parsed = parse_product_specs(spec_text)
+    for field, value in parsed.as_dict().items():
+        if value is not None and getattr(product, field, None) is None:
+            setattr(product, field, value)
+    if parsed.spec_text and not product.specification:
+        product.specification = parsed.spec_text[:255]
+    if name_source == "photo":
+        product.source = "photo"
+        product.needs_review = True
+    product.product_data_confirmed = True
+    product.name_locked = product.name_locked or name_source == "manual"
+    if product.status == "new_pending_completion" and (product.name_cn or product.name_ja):
+        product.status = "new_pending_review"
+
+
 def save_field_product_image(
     session: Session,
     item_id: int,
@@ -997,6 +1101,23 @@ def save_field_product_image(
     )
     before = item.product_image_path
     item.product_image_path = path.resolve().relative_to(PROJECT_ROOT.resolve()).as_posix()
+    evidence = session.scalar(
+        select(TagEvidence).where(
+            TagEvidence.field_purchase_item_id == item.id,
+            TagEvidence.sha256 == digest,
+        )
+    )
+    if evidence is None:
+        evidence = TagEvidence(
+            field_purchase_item_id=item.id,
+            original_filename=(original_filename or "product-photo")[:255],
+            content_type=content_type[:100],
+            file_path=item.product_image_path,
+            sha256=digest,
+            byte_size=len(content),
+            ocr_status="PENDING",
+        )
+        session.add(evidence)
     session.add(
         EnrichmentAuditLog(
             field_purchase_item_id=item.id,
@@ -1059,44 +1180,54 @@ def confirm_field_item(session: Session, item_id: int, *, actor: str) -> Product
     item = get_field_item(session, item_id)
     if item.product is not None:
         product = item.product
+        _apply_field_item_completion(
+            product,
+            item,
+            name_source="photo" if item.product_image_path else "manual",
+        )
     else:
-        name_cn = normalize_product_name_whitespace(item.name_cn) or ""
-        name_ja = normalize_product_name_whitespace(item.name_ja) or ""
-        if not name_cn or not name_ja:
-            raise ValueError("确认正式商品前必须填写中文名和日文名")
+        if not is_valid_jan(item.jan):
+            raise ValueError("确认正式商品前必须有合法 JAN")
+        name_cn = _usable_name(item.name_cn)
+        name_ja = _usable_name(item.name_ja)
+        if not name_cn and not name_ja:
+            raise ValueError("确认正式商品前至少填写一个可用商品名")
         resolution = resolve_local_product_by_jan(session, item.jan) if item.jan else None
         if resolution is not None and resolution.is_conflict:
             raise ValueError("此 JAN 对应多个商品，请先在候选中人工选择，不能自动建新品")
         existing = resolution.product if resolution is not None else None
         if existing is not None:
             product = existing
+            _apply_field_item_completion(
+                product,
+                item,
+                name_source="photo" if item.product_image_path else "manual",
+            )
         else:
-            promoted_image = None
-            if item.product_image_path:
-                source_path = (PROJECT_ROOT / item.product_image_path).resolve()
-                if source_path.is_relative_to(TAG_EVIDENCE_DIR.resolve()) and source_path.is_file():
-                    PRODUCT_IMAGE_DIR.mkdir(parents=True, exist_ok=True)
-                    digest = hashlib.sha256(source_path.read_bytes()).hexdigest()
-                    destination = PRODUCT_IMAGE_DIR / f"{digest}{source_path.suffix.casefold()}"
-                    if not destination.exists():
-                        destination.write_bytes(source_path.read_bytes())
-                    promoted_image = destination.resolve().relative_to(PROJECT_ROOT.resolve()).as_posix()
+            promoted_image, digest = _promote_field_product_image(item)
+            name_source = "photo" if promoted_image else "manual"
             product = Product(
                 jan=assert_jan_available(session, item.jan),
-                name_cn=name_cn[:128],
-                name_ja=name_ja[:128],
-                display_name=format_product_display_name(name_cn[:128], name_ja[:128]),
+                name_cn=name_cn[:128] or None,
+                name_ja=name_ja[:128] or None,
+                display_name=format_product_display_name(name_cn[:128] or None, name_ja[:128] or None),
                 brand=item.brand,
                 category=item.category,
                 unit_name=item.unit_name,
                 purchase_price=item.unit_price,
+                sale_price=item.unit_price,
                 main_image_path=promoted_image,
+                main_image_hash=digest,
                 main_image_locked=bool(promoted_image),
                 product_data_confirmed=True,
-                name_locked=True,
-                source="field_purchase",
+                name_locked=name_source == "manual",
+                source=name_source,
                 product_origin="manual",
+                name_source=name_source,
+                needs_review=name_source == "photo",
+                status="new_pending_review",
             )
+            _apply_field_item_completion(product, item, name_source=name_source)
             session.add(product)
             session.flush()
             if promoted_image:

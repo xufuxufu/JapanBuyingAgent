@@ -223,9 +223,9 @@ def test_product_image_fallback_and_field_offline_cache_contract(monkeypatch, tm
     product.local_image_path = "data/products/qinsi-localized/a.jpg"
     product.image_sha256 = "abcdef1234567890"
     product.display_image_url = "/product-local-images/7?v=abc"
-    assert preferred_product_image_url(product) == "/product-local-images/7?v=abc"
+    assert preferred_product_image_url(product) == "/product-local-images/7?v=abcdef123456"
     display = product_display_image(product)
-    assert display.display_image_url == "/product-local-images/7?v=abc"
+    assert display.display_image_url == "/product-local-images/7?v=abcdef123456"
     assert display.status == "local"
     product.display_image_url = None
     assert preferred_product_image_url(product) == "/product-local-images/7?v=abcdef123456"

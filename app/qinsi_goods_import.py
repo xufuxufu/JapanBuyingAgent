@@ -36,6 +36,7 @@ from app.models import (
 )
 from app.product_identity import format_product_display_name, normalize_product_name_whitespace
 from app.product_image_localization import product_image_summary, queue_product_image_localization
+from app.product_merge import merge_duplicate_jan_group, merge_products_with_jan_into_primary
 
 
 MAX_XLSX_BYTES = 20 * 1024 * 1024
@@ -90,6 +91,27 @@ HEADER_TO_FIELD = {
     "盘点库存数量": "counted_inventory_quantity",
     "当前库存（导入时不需要录入）": "current_inventory_quantity",
 }
+FORMAL_PRODUCT_LIST_HEADERS = {
+    "商品名称", "商品规格", "货号", "商品条码", "单品条码", "型号规格",
+    "图片", "图片链接", "品牌", "分类", "单位", "采购价", "销售价", "最低销售价", "状态", "备注",
+}
+FORMAL_REQUIRED_HEADERS = {"商品名称", "货号"}
+FORMAL_HEADER_TO_TEMPLATE_HEADER = {
+    "商品名称": "名称（必填）",
+    "商品规格": "商品规格",
+    "货号": "货号（必填且唯一）",
+    "型号规格": "型号规格",
+    "图片": "商品图片链接",
+    "图片链接": "商品图片链接",
+    "品牌": "品牌",
+    "分类": "分类",
+    "单位": "单位",
+    "采购价": "采购价",
+    "销售价": "销售价",
+    "最低销售价": "最低销售价",
+    "状态": "状态",
+    "备注": "商品备注",
+}
 PRODUCT_FIELDS = tuple(
     field for field in dict.fromkeys(HEADER_TO_FIELD.values())
     if field not in {"counted_inventory_quantity", "current_inventory_quantity"}
@@ -117,6 +139,8 @@ class ParsedWorkbook:
     inventory_warehouse: str | None
     defined_names: tuple[str, ...]
     missing_formula_cache: dict[int, list[str]]
+    sheet_name: str = PRODUCT_SHEET
+    source_format: str = "qinsi_goods_template"
 
 
 def _validate_archive(content: bytes) -> None:
@@ -179,7 +203,71 @@ def _logical_cell_text(cell: Cell, cached_cell: Cell, *, identifier: bool = Fals
 def _normalized_header(value: str | None) -> str | None:
     if value is None:
         return None
-    return HEADER_ALIASES.get(value, value)
+    text = normalize_product_name_whitespace(value)
+    return HEADER_ALIASES.get(text, text)
+
+
+def _sheet_headers(values_sheet, formulas_sheet) -> list[str]:
+    headers: list[str] = []
+    for column in range(1, values_sheet.max_column + 1):
+        header = _logical_cell_text(
+            formulas_sheet.cell(1, column), values_sheet.cell(1, column),
+        )
+        headers.append(_normalized_header(header) or "")
+    return headers
+
+
+def _old_template_inventory_warehouse(headers: list[str]) -> str | None:
+    canonical_fixed = tuple(_normalized_header(value) for value in headers[:-1])
+    legacy_headers = tuple(header for header in FIXED_HEADERS if header != "商品规格")
+    if canonical_fixed in {FIXED_HEADERS, legacy_headers}:
+        return headers[-1].strip() or None
+    return None
+
+
+def _formal_header_score(headers: list[str]) -> int:
+    header_set = {header for header in headers if header}
+    if not FORMAL_REQUIRED_HEADERS <= header_set:
+        return 0
+    return len(header_set & FORMAL_PRODUCT_LIST_HEADERS)
+
+
+def _classify_product_sheet(values_book, formulas_book) -> tuple[str, str, list[str], str | None]:
+    candidates: list[tuple[int, int, str, str, list[str], str | None]] = []
+    for order, sheet_name in enumerate(values_book.sheetnames):
+        if sheet_name == CONFIG_SHEET:
+            continue
+        headers = _sheet_headers(values_book[sheet_name], formulas_book[sheet_name])
+        inventory_warehouse = _old_template_inventory_warehouse(headers)
+        if inventory_warehouse is not None:
+            priority = 0 if sheet_name == PRODUCT_SHEET else 1
+            candidates.append((priority, order, sheet_name, "qinsi_goods_template", headers, inventory_warehouse))
+            continue
+        score = _formal_header_score(headers)
+        if score >= 5:
+            priority = 2 if sheet_name == PRODUCT_SHEET else 3
+            candidates.append((priority, -score, sheet_name, "qinsi_product_list", headers, None))
+    if not candidates:
+        raise ValueError("Excel缺少可识别的秦丝商品列表工作表")
+    _priority, _order_or_score, sheet_name, source_format, headers, inventory_warehouse = sorted(candidates)[0]
+    return sheet_name, source_format, headers, inventory_warehouse
+
+
+def _determine_formal_jan(raw: dict[str, str | None]) -> str | None:
+    for value in (raw.get("单品条码"), raw.get("商品条码"), raw.get("货号")):
+        candidate = (value or "").strip()
+        if is_valid_jan(candidate):
+            return candidate
+    return None
+
+
+def _formal_row_to_template_raw(raw: dict[str, str | None]) -> dict[str, str | None]:
+    mapped: dict[str, str | None] = {}
+    for formal_header, template_header in FORMAL_HEADER_TO_TEMPLATE_HEADER.items():
+        if formal_header in raw:
+            mapped[template_header] = raw.get(formal_header)
+    mapped["条码"] = _determine_formal_jan(raw)
+    return mapped
 
 
 def parse_qinsi_workbook(content: bytes) -> ParsedWorkbook:
@@ -190,24 +278,9 @@ def parse_qinsi_workbook(content: bytes) -> ParsedWorkbook:
     except Exception as exc:
         raise ValueError("Excel工作簿无法解析") from exc
     try:
-        if PRODUCT_SHEET not in values_book.sheetnames:
-            raise ValueError("Excel缺少“商品导入”工作表")
-        if CONFIG_SHEET not in values_book.sheetnames:
-            raise ValueError("Excel缺少“配置”工作表")
-        values_sheet = values_book[PRODUCT_SHEET]
-        formulas_sheet = formulas_book[PRODUCT_SHEET]
-
-        headers: list[str] = []
-        for column in range(1, values_sheet.max_column + 1):
-            header = _logical_cell_text(
-                formulas_sheet.cell(1, column), values_sheet.cell(1, column),
-            )
-            headers.append(header or "")
-        canonical_fixed = tuple(_normalized_header(value) for value in headers[:-1])
-        legacy_headers = tuple(header for header in FIXED_HEADERS if header != "商品规格")
-        if canonical_fixed not in {FIXED_HEADERS, legacy_headers}:
-            raise ValueError("商品导入表头不匹配：应为秦丝29列旧模板或30列完整模板")
-        inventory_warehouse = headers[-1].strip() or None
+        sheet_name, source_format, headers, inventory_warehouse = _classify_product_sheet(values_book, formulas_book)
+        values_sheet = values_book[sheet_name]
+        formulas_sheet = formulas_book[sheet_name]
 
         rows: list[tuple[int, dict[str, str | None]]] = []
         formula_cache_missing: dict[int, list[str]] = {}
@@ -228,21 +301,24 @@ def parse_qinsi_workbook(content: bytes) -> ParsedWorkbook:
                     missing.append(original_header)
             if missing:
                 formula_cache_missing[row_number] = missing
+            if source_format == "qinsi_product_list":
+                raw = _formal_row_to_template_raw(raw)
             rows.append((row_number, raw))
 
-        config_values = values_book[CONFIG_SHEET]
-        config_formulas = formulas_book[CONFIG_SHEET]
         config: dict[str, list[str]] = {}
-        for master_type, row_number in CONFIG_ROWS.items():
-            values: list[str] = []
-            for column in range(1, config_values.max_column + 1):
-                value = _logical_cell_text(
-                    config_formulas.cell(row_number, column),
-                    config_values.cell(row_number, column),
-                )
-                if value is not None:
-                    values.append(value)
-            config[master_type] = list(dict.fromkeys(values))
+        if CONFIG_SHEET in values_book.sheetnames:
+            config_values = values_book[CONFIG_SHEET]
+            config_formulas = formulas_book[CONFIG_SHEET]
+            for master_type, row_number in CONFIG_ROWS.items():
+                values: list[str] = []
+                for column in range(1, config_values.max_column + 1):
+                    value = _logical_cell_text(
+                        config_formulas.cell(row_number, column),
+                        config_values.cell(row_number, column),
+                    )
+                    if value is not None:
+                        values.append(value)
+                config[master_type] = list(dict.fromkeys(values))
         return ParsedWorkbook(
             rows=rows,
             headers=tuple(headers),
@@ -250,6 +326,8 @@ def parse_qinsi_workbook(content: bytes) -> ParsedWorkbook:
             inventory_warehouse=inventory_warehouse,
             defined_names=tuple(values_book.defined_names),
             missing_formula_cache=formula_cache_missing,
+            sheet_name=sheet_name,
+            source_format=source_format,
         )
     finally:
         values_book.close()
@@ -470,7 +548,34 @@ def _changed_product_fields(target: Product, mapped: dict) -> list[str]:
     ]
     if mapped.get("image_url") and _values_differ(target.main_image_source_url, mapped["image_url"]):
         changed.append("main_image_source_url")
+    if mapped.get("image_url") and (
+        target.main_image_path
+        or target.local_image_path
+        or _values_differ(target.display_image_url, mapped["image_url"])
+    ):
+        changed.append("display_image_url")
     return changed
+
+
+def _apply_qinsi_image_authority(product: Product, image_url: str) -> None:
+    product.image_url = image_url
+    product.main_image_source_url = image_url
+    product.qinsi_image_url = image_url
+    product.display_image_url = image_url
+    product.main_image_path = None
+    product.main_image_hash = None
+    product.main_image_locked = False
+    product.main_image_source_platform = "qinsi"
+    product.main_image_downloaded_at = None
+    product.local_image_path = None
+    product.image_sha256 = None
+    product.image_width = None
+    product.image_height = None
+    product.image_quality = None
+    product.image_localization_status = None
+    product.image_localization_source_url = None
+    product.image_localized_at = None
+    product.image_localization_error = None
 
 
 def _reset_batch_counts(batch: QinsiImportBatch) -> None:
@@ -550,7 +655,7 @@ def parse_import_batch(session: Session, batch: QinsiImportBatch) -> QinsiImport
             row = QinsiGoodsImportRow(
                 import_batch_id=batch.id,
                 source_file_name=batch.original_filename,
-                sheet_name=PRODUCT_SHEET,
+                sheet_name=workbook.sheet_name,
                 excel_row_number=row_number,
                 qinsi_product_code=mapped.get("qinsi_product_code"),
                 barcode=mapped.get("jan"),
@@ -620,7 +725,8 @@ def parse_import_batch(session: Session, batch: QinsiImportBatch) -> QinsiImport
         batch.error_count = statuses.count("error")
         batch.warning_count = sum(bool(row.warnings) for row, _ in prepared)
         batch.summary_json = _json_dumps({
-            "sheet": PRODUCT_SHEET,
+            "sheet": workbook.sheet_name,
+            "source_format": workbook.source_format,
             "headers": list(workbook.headers),
             "configuration": workbook.config,
             "configuration_counts": {key: len(value) for key, value in workbook.config.items()},
@@ -888,13 +994,18 @@ def confirm_import(
                 action = "imported_new"
             else:
                 action = "imported_updated" if _changed_product_fields(target, mapped) else "unchanged"
-            previous_image_url = target.main_image_source_url or target.image_url
             for field in PRODUCT_FIELDS:
                 value = mapped.get(field)
                 if value is not None and _values_differ(getattr(target, field), value):
                     setattr(target, field, value)
-            if mapped.get("image_url") and _values_differ(target.main_image_source_url, mapped["image_url"]):
-                target.main_image_source_url = mapped["image_url"]
+            if mapped.get("name_cn"):
+                target.name_source = "qinsi_import"
+                target.name_locked = False
+                target.product_data_confirmed = False
+                if mapped.get("name_ja") is None:
+                    target.name_ja = None
+            if mapped.get("image_url"):
+                _apply_qinsi_image_authority(target, mapped["image_url"])
             target.display_name = format_product_display_name(target.name_cn, target.name_ja)
             target.status = "qinsi_product_imported"
             for master_type, (field, relationship_field) in MASTER_PRODUCT_FIELDS.items():
@@ -903,12 +1014,24 @@ def confirm_import(
                 if master is not None:
                     setattr(target, relationship_field, master.id)
             session.flush()
+            if mapped.get("jan"):
+                merge_products_with_jan_into_primary(
+                    session,
+                    mapped["jan"],
+                    target,
+                    actor="qinsi_import",
+                    commit=False,
+                )
+                merge_duplicate_jan_group(
+                    session,
+                    mapped["jan"],
+                    primary_product_id=target.id,
+                    actor="qinsi_import",
+                    commit=False,
+                )
             _ensure_product_barcode(session, target, mapped.get("jan"))
             ensure_qinsi_derived_barcode(session, target)
-            if mapped.get("image_url") and (
-                previous_image_url != mapped.get("image_url")
-                or target.image_localization_source_url != mapped.get("image_url")
-            ):
+            if mapped.get("image_url"):
                 queue_product_image_localization(session, target)
             row.product_id = target.id
             row.validation_status = action

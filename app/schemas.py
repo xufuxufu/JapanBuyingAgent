@@ -219,7 +219,7 @@ class ReceiptItemDraftInput(BaseModel):
     @field_validator("review_status")
     @classmethod
     def validate_review_status(cls, value: str) -> str:
-        if value not in {"pending", "reviewed", "ignored"}:
+        if value not in {"pending", "reviewed", "confirmed", "ignored"}:
             raise ValueError("review_status 无效")
         return value
 

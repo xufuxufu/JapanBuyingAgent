@@ -54,7 +54,7 @@
 <section class="card table-wrap">
   <div class="section-head"><h2>小票商品行</h2></div>
   <table>
-    <thead><tr><th>小票</th><th>原始简称</th><th>数量</th><th>单价</th><th>折扣</th><th>行金额</th><th>匹配商品</th><th>状态</th></tr></thead>
+    <thead><tr><th>小票</th><th>原始简称</th><th>数量</th><th>采购单价</th><th>折扣</th><th>行金额</th><th>匹配商品</th><th>状态</th></tr></thead>
     <tbody>
     {% for receipt in batch.receipts %}
       {% for item in receipt.items %}

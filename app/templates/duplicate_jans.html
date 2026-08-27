@@ -1,0 +1,39 @@
+{% extends "base.html" %}
+{% block title %}重复 JAN 治理{% endblock %}
+{% block content %}
+<div class="section-head"><div><h1>重复 JAN 治理</h1><p class="muted">主商品优先级：秦丝商品 → 普通 active → new_pending。合并会迁移业务关联，旧商品删除或归档并清空 JAN。</p></div><a class="button secondary" href="/products">返回商品</a></div>
+{% if message %}<div class="success message">{{ message }}</div>{% endif %}
+{% if error %}<div class="error message">{{ error }}</div>{% endif %}
+<section class="card">
+  <div class="section-head"><div><h2>重复组</h2><p class="muted">当前 {{ groups|length }} 组。</p></div>{% if groups %}<form method="post" action="/products/duplicate-jans/merge-all" onsubmit="return confirm('将按固定优先级合并全部重复 JAN，并迁移业务关联。确认执行？')"><input type="hidden" name="actor" value="system"><button class="danger" type="submit">合并全部重复 JAN</button></form>{% endif %}</div>
+</section>
+{% for group in groups %}
+<section class="card table-wrap">
+  <div class="section-head">
+    <div><h2>JAN {{ group.jan }}</h2><p class="muted">推荐主商品：{{ group.recommended_primary.internal_sku }} · 关联 {{ group.association_total }} 条 · {% if group.has_qinsi_product %}含秦丝商品{% else %}无秦丝商品{% endif %}</p></div>
+    <form method="post" action="/products/duplicate-jans/{{ group.jan }}/merge" onsubmit="return confirm('将 JAN {{ group.jan }} 的重复商品合并到推荐主商品 {{ group.recommended_primary.internal_sku }}。确认执行？')">
+      <input type="hidden" name="primary_product_id" value="{{ group.recommended_primary.id }}">
+      <input type="hidden" name="actor" value="system">
+      <button class="danger" type="submit">合并到推荐主商品</button>
+    </form>
+  </div>
+  <table>
+    <thead><tr><th>主</th><th>ID</th><th>内部SKU</th><th>商品名</th><th>秦丝编码</th><th>状态</th><th>来源</th><th>优先级</th><th>关联数</th><th></th></tr></thead>
+    <tbody>{% for view in group.products %}{% set product = view.product %}<tr>
+      <td>{% if view.is_recommended_primary %}<span class="badge">推荐主</span>{% else %}—{% endif %}</td>
+      <td>{{ product.id }}</td>
+      <td>{{ product.internal_sku }}</td>
+      <td>{{ product.display_name or product.name_cn or product.name_ja or '未命名商品' }}</td>
+      <td>{{ product.qinsi_product_code or '—' }}</td>
+      <td>{{ product.status }}</td>
+      <td>{{ product.product_origin }} / {{ product.source }}</td>
+      <td>{{ view.priority }}</td>
+      <td>{{ view.association_count }}</td>
+      <td><a class="button secondary compact" href="/products/{{ product.id }}">查看</a></td>
+    </tr>{% endfor %}</tbody>
+  </table>
+</section>
+{% else %}
+<section class="card empty-state">当前没有重复 JAN。</section>
+{% endfor %}
+{% endblock %}

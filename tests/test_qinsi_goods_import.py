@@ -1,24 +1,31 @@
 from __future__ import annotations
 
 import json
+from datetime import datetime, timezone
 from io import BytesIO
 from decimal import Decimal
 from pathlib import Path
 
 import pytest
-from openpyxl import load_workbook
+from openpyxl import Workbook, load_workbook
 from sqlalchemy import func, select
 
 from app.location_service import initialize_default_locations
 from app.models import (
     DurableBackgroundJob,
+    Location,
     Product,
     ProductBarcode,
+    PurchaseBatch,
+    PurchaseBatchItem,
     QinsiGoodsImportRow,
     QinsiImportBatch,
     QinsiInventorySnapshot,
     QinsiInventorySnapshotLine,
     QinsiMasterValue,
+    Receipt,
+    ReceiptBatch,
+    ReceiptItem,
 )
 from app.qinsi_goods_import import (
     _mapped_row,
@@ -98,7 +105,7 @@ def test_real_qinsi_preview_confirm_and_file_hash_idempotency(db_session):
     assert (
         batch.total_rows, batch.new_count, batch.update_count, batch.unchanged_count,
         batch.skipped_count, batch.conflict_count, batch.error_count, batch.warning_count,
-    ) == (2000, 1973, 0, 0, 0, 24, 3, 0)
+    ) == (2000, 1974, 0, 0, 0, 24, 2, 0)
 
     import_rows = list(db_session.scalars(select(QinsiGoodsImportRow).where(
         QinsiGoodsImportRow.import_batch_id == batch.id,
@@ -109,7 +116,7 @@ def test_real_qinsi_preview_confirm_and_file_hash_idempotency(db_session):
     assert not any(row.barcode == "184" for row in import_rows)
     assert not any("可疑值184" in (row.warnings or "") for row in import_rows)
     assert not any("重复非空条码：184" in (row.conflict_json or "") for row in import_rows)
-    assert sum(row.validation_status == "error" for row in import_rows) == 3
+    assert sum(row.validation_status == "error" for row in import_rows) == 2
     assert sum(row.validation_status == "conflict" for row in import_rows) == 24
     assert all(
         "合法 JAN-8/JAN-13" in (row.errors or "")
@@ -119,8 +126,8 @@ def test_real_qinsi_preview_confirm_and_file_hash_idempotency(db_session):
 
     confirm_import(db_session, batch)
     assert batch.status == "completed_with_issues"
-    assert (batch.new_count, batch.update_count, batch.unchanged_count) == (1973, 0, 0)
-    assert db_session.scalar(select(func.count()).select_from(Product)) == 1973
+    assert (batch.new_count, batch.update_count, batch.unchanged_count) == (1974, 0, 0)
+    assert db_session.scalar(select(func.count()).select_from(Product)) == 1974
     assert db_session.scalar(
         select(func.count()).select_from(Product).where(Product.product_note.is_not(None))
     ) == 0
@@ -174,7 +181,7 @@ def test_real_qinsi_preview_confirm_and_file_hash_idempotency(db_session):
     assert repeated.id == batch.id
     assert repeated.status == "completed_with_issues"
     assert db_session.scalar(select(func.count()).select_from(QinsiImportBatch)) == 1
-    assert db_session.scalar(select(func.count()).select_from(Product)) == 1973
+    assert db_session.scalar(select(func.count()).select_from(Product)) == 1974
     assert db_session.scalar(select(func.count()).select_from(QinsiInventorySnapshot)) == 1
 
 
@@ -209,6 +216,174 @@ def test_background_preview_status_page_and_confirm_flow(client):
     batch = db.get(QinsiImportBatch, batch.id)
     assert batch.status == "completed"
     assert db.scalar(select(func.count()).select_from(Product)) == 2
+
+
+FORMAL_HEADERS = [
+    "商品名称", "商品规格", "货号", "商品条码", "单品条码", "型号规格", "图片",
+    "品牌", "分类", "采购价", "销售价",
+]
+
+
+def formal_workbook_bytes(*, sheet_name: str, rows: list[dict]) -> bytes:
+    workbook = Workbook()
+    sheet = workbook.active
+    sheet.title = sheet_name
+    sheet.append(FORMAL_HEADERS)
+    for row in rows:
+        sheet.append([row.get(header, "") for header in FORMAL_HEADERS])
+    output = BytesIO()
+    workbook.save(output)
+    workbook.close()
+    return output.getvalue()
+
+
+def formal_row(**overrides) -> dict:
+    row = {
+        "商品名称": "秦丝正式商品",
+        "商品规格": "30g",
+        "货号": "QINSI-FORMAL-1",
+        "商品条码": "",
+        "单品条码": "4901234567894",
+        "型号规格": "M-1",
+        "图片": "https://images.qinsilk.com/formal.jpg",
+        "品牌": "秦丝品牌",
+        "分类": "秦丝分类",
+        "采购价": "120",
+        "销售价": "220",
+    }
+    row.update(overrides)
+    return row
+
+
+def test_formal_qinsi_product_list_sheet1_parses_by_headers():
+    workbook = parse_qinsi_workbook(formal_workbook_bytes(sheet_name="Sheet1", rows=[formal_row()]))
+
+    assert workbook.sheet_name == "Sheet1"
+    assert workbook.source_format == "qinsi_product_list"
+    assert len(workbook.rows) == 1
+    mapped, warnings, errors = _mapped_row(workbook.rows[0][1], workbook.config)
+    assert not warnings and not errors
+    assert mapped["name_cn"] == "秦丝正式商品"
+    assert mapped["qinsi_product_code"] == "QINSI-FORMAL-1"
+    assert mapped["jan"] == "4901234567894"
+    assert mapped["image_url"] == "https://images.qinsilk.com/formal.jpg"
+
+
+def test_formal_qinsi_product_list_product_import_sheet_name_is_compatible():
+    workbook = parse_qinsi_workbook(formal_workbook_bytes(sheet_name="商品导入", rows=[formal_row()]))
+
+    assert workbook.sheet_name == "商品导入"
+    assert workbook.source_format == "qinsi_product_list"
+
+
+def test_formal_qinsi_product_list_arbitrary_sheet_name_is_detected_by_headers():
+    workbook = parse_qinsi_workbook(formal_workbook_bytes(sheet_name="秦丝正式导出", rows=[formal_row()]))
+
+    assert workbook.sheet_name == "秦丝正式导出"
+    assert workbook.source_format == "qinsi_product_list"
+
+
+def test_products_import_preview_uses_formal_parser_regardless_of_checkbox(client):
+    http, db, _ = client
+    content = formal_workbook_bytes(sheet_name="Sheet1", rows=[formal_row()])
+    for checked in (False, True):
+        response = http.post(
+            "/products/import/preview",
+            files={"file": ("formal.xlsx", content, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")},
+            data={"use_reference": REFERENCE_BOOK.name} if checked else {},
+            follow_redirects=False,
+        )
+        assert response.status_code == 303
+        batch = db.scalar(select(QinsiImportBatch).order_by(QinsiImportBatch.id.desc()))
+        assert batch.status == "previewed"
+        assert batch.error_message is None
+        summary = json.loads(batch.summary_json)
+        assert summary["sheet"] == "Sheet1"
+        assert summary["source_format"] == "qinsi_product_list"
+
+
+def test_formal_import_overwrites_qinsi_name_image_keeps_purchase_facts_and_unique_jan(db_session):
+    location = Location(internal_code="LOC-QINSI-TEST", display_name="新日本仓库", location_type="qinsi_warehouse", is_qinsi_warehouse=True)
+    product = Product(
+        jan="4901234567894",
+        name_cn="本地人工名",
+        display_name="本地人工名",
+        name_locked=True,
+        product_data_confirmed=True,
+        main_image_locked=True,
+        main_image_path="data/products/main/manual.jpg",
+        display_image_url="/product-images/1",
+        main_image_source_url="https://example.test/old-auto.jpg",
+        image_url="https://example.test/old-qinsi.jpg",
+        status="new_pending_review",
+    )
+    db_session.add_all([location, product])
+    db_session.flush()
+    batch = ReceiptBatch(batch_no="FACT-QINSI", status="confirmed", image_status="ready", gpt_status="reviewed")
+    receipt = Receipt(batch=batch, raw_store_name="采购事实店", confirmation_status="confirmed", review_status="reviewed")
+    db_session.add_all([batch, receipt])
+    db_session.flush()
+    receipt_item = ReceiptItem(
+        receipt=receipt,
+        line_no=1,
+        raw_name="小票原始名",
+        jan_candidate=product.jan,
+        product_id=product.id,
+        match_status="matched_existing",
+        quantity=3,
+        unit_price=111,
+        discount_amount=7,
+        line_total=326,
+        review_status="confirmed",
+    )
+    purchase = PurchaseBatch(
+        batch_no="PB-FACT-QINSI",
+        receipt=receipt,
+        gpt_batch_id=batch.id,
+        status="confirmed",
+        confirmed_at=datetime.now(timezone.utc),
+        default_initial_location_id=location.id,
+        default_qinsi_warehouse_id=location.id,
+    )
+    purchase_item = PurchaseBatchItem(
+        purchase_batch=purchase,
+        product=product,
+        receipt_item=receipt_item,
+        quantity=3,
+        unit_price=111,
+        discount_amount=7,
+        actual_line_amount=326,
+        initial_location_id=location.id,
+        qinsi_target_warehouse_id=location.id,
+    )
+    db_session.add_all([receipt_item, purchase, purchase_item])
+    db_session.commit()
+
+    content = formal_workbook_bytes(sheet_name="Sheet1", rows=[formal_row(
+        **{"商品名称": "秦丝权威名", "图片": "https://images.qinsilk.com/authority.jpg"}
+    )])
+    preview = create_import_preview(db_session, "formal-authority.xlsx", content)
+    assert preview.update_count == 1
+    confirm_import(db_session, preview)
+    db_session.refresh(product)
+    db_session.refresh(receipt_item)
+    db_session.refresh(purchase_item)
+
+    assert product.name_cn == "秦丝权威名"
+    assert product.name_ja is None
+    assert product.display_name.startswith("秦丝权威名|")
+    assert "本地人工名" not in product.display_name
+    assert product.main_image_source_url == "https://images.qinsilk.com/authority.jpg"
+    assert product.image_url == "https://images.qinsilk.com/authority.jpg"
+    assert product.display_image_url == "https://images.qinsilk.com/authority.jpg"
+    assert product.main_image_path is None
+    assert product.main_image_locked is False
+    assert receipt_item.raw_name == "小票原始名"
+    assert (receipt_item.quantity, receipt_item.unit_price, receipt_item.discount_amount, receipt_item.line_total) == (3, 111, 7, 326)
+    assert (purchase_item.quantity, purchase_item.unit_price, purchase_item.discount_amount, purchase_item.actual_line_amount) == (3, 111, 7, 326)
+    assert db_session.scalar(
+        select(func.count()).select_from(Product).where(Product.jan == "4901234567894")
+    ) == 1
 
 
 def test_qinsi_import_creates_derived_barcode_alias_idempotently(db_session):
@@ -299,6 +474,8 @@ def test_qinsi_import_maps_japanese_name_and_queues_changed_image_without_cleari
     ))
     assert len(jobs) == 2
     assert product.image_url == new_url
-    assert product.display_image_url.endswith("?v=old")
-    assert product.image_localization_source_url == old_url
+    assert product.main_image_source_url == new_url
+    assert product.display_image_url == new_url
+    assert product.local_image_path is None
+    assert product.image_localization_source_url is None
     assert product.image_localization_status == "PENDING"

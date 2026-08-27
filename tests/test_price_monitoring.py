@@ -44,6 +44,7 @@ def offer(jan: str, price: int, *, stock_status: str = "in_stock") -> ProviderRe
     return ProviderResponse("success", (PriceCandidate(
         title="监控商品 100ml", url=f"https://example.test/{jan}/{price}", seller="测试店",
         item_price=price, shipping_price=0, jan=jan, stock_status=stock_status,
+        jan_verified=True, match_type="JAN_EXACT", confidence=1.0,
     ),))
 
 

@@ -24,6 +24,7 @@ from app.models import (
     AiRecognitionRun, DuplicateDetectionLog, Receipt, ReceiptBatch, ReceiptImage, ReceiptItem,
     ZipPackageItem, ZipPackageJob,
 )
+from app.receipt_pricing import purchase_unit_price
 from app.schemas import BatchReceiptInput, PurchaseConfirmationInput, RecognitionBatchInput, RecognitionInput, ReceiptDraftInput, ReceiptItemDraftInput
 
 ALLOWED_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp", ".heic", ".heif"}
@@ -895,6 +896,10 @@ def is_receipt_export_eligible(receipt: Receipt) -> bool:
     return receipt.duplicate_status != "auto_duplicate"
 
 
+def _normalized_unit_price(quantity: int, unit_price: int | None, line_total: int | None) -> int | None:
+    return purchase_unit_price(quantity, unit_price, line_total)
+
+
 def import_recognition_json(session: Session, batch: ReceiptBatch, raw_text: str) -> Receipt:
     payload = parse_recognition_json(raw_text)
 
@@ -948,7 +953,7 @@ def import_recognition_json(session: Session, batch: ReceiptBatch, raw_text: str
                 recognized_name=item.recognized_name or None,
                 jan_candidate=item.jan_candidate,
                 quantity=item.quantity,
-                unit_price=item.unit_price,
+                unit_price=_normalized_unit_price(item.quantity, item.unit_price, item.line_total),
                 discount_amount=item.discount_amount,
                 tax_rate=item.tax_rate,
                 line_total=item.line_total,
@@ -1049,7 +1054,7 @@ def import_gpt_job_json(session: Session, job: ZipPackageJob, raw_text: str) -> 
                     recognized_name=item.recognized_name or None,
                     jan_candidate=item.jan_candidate,
                     quantity=item.quantity,
-                    unit_price=item.unit_price,
+                    unit_price=_normalized_unit_price(item.quantity, item.unit_price, item.line_total),
                     discount_amount=item.discount_amount,
                     tax_rate=item.tax_rate,
                     line_total=item.line_total,
@@ -1333,7 +1338,7 @@ def apply_item_draft(item: ReceiptItem, data: ReceiptItemDraftInput) -> None:
     item.recognized_name = data.recognized_name or None
     item.jan_candidate = data.jan_candidate
     item.quantity = data.quantity
-    item.unit_price = data.unit_price
+    item.unit_price = _normalized_unit_price(data.quantity, data.unit_price, data.line_total)
     item.discount_amount = data.discount_amount
     item.tax_rate = data.tax_rate
     item.line_total = data.line_total

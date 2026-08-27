@@ -1,17 +1,26 @@
 from __future__ import annotations
 
 import hashlib
+import ipaddress
 import io
 import json
+import logging
+import os
+import re
+import socket
 import uuid
 import zipfile
 from collections import defaultdict
+from contextlib import nullcontext
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from decimal import Decimal, ROUND_HALF_UP
 from pathlib import Path, PurePosixPath
+from urllib.parse import urljoin, urlsplit
 from xml.etree import ElementTree as ET
 
+import httpx
+from PIL import Image, UnidentifiedImageError
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session, selectinload
 
@@ -28,20 +37,19 @@ from app.models import (
     ReceiptBatch,
 )
 from app.product_identity import format_product_display_name
+from app.price_providers import PriceCandidate, YahooShoppingPriceProvider
 from app.schemas import QinsiExportConfirmationInput
 
 
 GOODS_TEMPLATE_PATH = PROJECT_ROOT / "ExcelTemplate" / "goodsImportTemplate-秦丝新增商品模版.xlsx"
 PURCHASE_TEMPLATE_PATH = PROJECT_ROOT / "ExcelTemplate" / "秦丝采购单商品导入模板.xlsx"
+PURCHASE_SHEET_NAME = "采购单商品导入"
 QINSI_GOODS_TEMPLATE_HEADERS = (
     "名称（必填）", "货号（必填且唯一）", "条码", "型号规格", "品牌", "分类", "单位",
     "采购价", "销售价", "最低销售价", "排序", "状态", "启用积分", "库存预警下限",
     "库存预警上限", "保质期（天）", "启用批次", "过期预警（天）", "商品图片链接",
     "商品备注", "产地", "适用年龄", "商品重量（KG）", "启用序列号", "库位",
     "盘点库存数量", "当前库存（导入时不需要录入）", "盘点仓库:", "新日本仓库",
-)
-QINSI_PURCHASE_TEMPLATE_HEADERS = (
-    "条码", "货号", "单位", "数量(必填)", "单价", "折扣(%)", "备注(20字以内)",
 )
 QINSI_TEMPLATE_HEADERS = QINSI_GOODS_TEMPLATE_HEADERS
 QINSI_PRODUCT_EXPORTABLE_STATUSES = {
@@ -52,6 +60,9 @@ OFFICE_REL_NS = "http://schemas.openxmlformats.org/officeDocument/2006/relations
 PACKAGE_REL_NS = "http://schemas.openxmlformats.org/package/2006/relationships"
 NS = {"m": SHEET_NS, "r": OFFICE_REL_NS}
 REL_NS = {"p": PACKAGE_REL_NS}
+logger = logging.getLogger(__name__)
+SPEC_PATTERN = re.compile(r"(\d+(?:\.\d+)?)\s*(ml|mL|l|L|g|kg|個|个|本|枚|袋|包|錠|粒)", re.IGNORECASE)
+MULTIPACK_PATTERN = re.compile(r"(?:[x×*]\s*[2-9]\d*|[2-9]\d*\s*(?:個|个|本|袋|包|枚|箱|セット|パック))", re.IGNORECASE)
 
 
 @dataclass(frozen=True, slots=True)
@@ -68,6 +79,20 @@ class PurchaseAggregate:
     quantity: int
     total_paid: int
     unit_price: Decimal
+
+
+@dataclass(frozen=True, slots=True)
+class QinsiImageDiagnostic:
+    original_url: str
+    final_url: str | None
+    http_status: int | None
+    content_type: str | None
+    redirect: bool
+    width: int | None
+    height: int | None
+    is_thumbnail: bool
+    decision: str
+    reason: str
 
 
 def _column_name(number: int) -> str:
@@ -159,6 +184,22 @@ def _template_headers(source: bytes, sheet_name: str) -> tuple[str, ...]:
         return tuple(cells.get(index, "") for index in range(1, max(cells, default=0) + 1))
 
 
+def _purchase_template_headers() -> tuple[str, ...]:
+    return _template_headers(PURCHASE_TEMPLATE_PATH.read_bytes(), PURCHASE_SHEET_NAME)
+
+
+QINSI_PURCHASE_TEMPLATE_HEADERS = _purchase_template_headers()
+
+
+def _purchase_columns(headers: tuple[str, ...]) -> dict[str, int]:
+    columns = {header: index for index, header in enumerate(headers, 1) if header}
+    required = {"条码", "货号", "单位", "数量(必填)", "单价", "折扣(%)", "备注(20字以内)"}
+    missing = required - set(columns)
+    if missing:
+        raise ValueError("秦丝采购模板缺少列：" + "、".join(sorted(missing)))
+    return columns
+
+
 def _rewrite_template(
     template_path: Path,
     sheet_name: str,
@@ -247,15 +288,420 @@ def _template_bytes(rows: list[ExportRow], warehouse_name: str) -> bytes:
     return output_buffer.getvalue()
 
 
+def _usable_export_name_part(value: str | None, jan: str | None) -> str | None:
+    text = (value or "").strip()
+    if not text:
+        return None
+    if text in {"中文名待补", "日文名待补", "缺商品"}:
+        return None
+    if jan and text == jan:
+        return None
+    return text.replace("|", "·")
+
+
+def _receipt_raw_name_for_product(product: Product) -> str | None:
+    for detail in sorted(product.purchase_details, key=lambda item: item.id, reverse=True):
+        raw_name = _usable_export_name_part(
+            detail.receipt_item.raw_name if detail.receipt_item else None,
+            product.jan,
+        )
+        if raw_name:
+            return raw_name
+    return None
+
+
 def _product_export_name(product: Product) -> str:
     if not product.jan:
         raise ValueError(f"商品 {product.internal_sku} 缺少 JAN，不能生成秦丝新商品文件")
-    if product.status == "new_pending_completion" or not (product.name_cn or product.name_ja):
+    name_cn = _usable_export_name_part(product.name_cn, product.jan)
+    name_ja = _usable_export_name_part(product.name_ja, product.jan)
+    if name_cn and name_ja:
+        name = format_product_display_name(name_cn, name_ja)
+    else:
+        name = name_ja or name_cn or ""
+    if not name:
+        name = _receipt_raw_name_for_product(product) or ""
+    if not name:
         return f"{product.jan}|缺商品"
-    return format_product_display_name(product.name_cn, product.name_ja)
+    return name[:128]
 
 
-def _goods_template_bytes(products: list[Product]) -> bytes:
+def qinsi_product_has_export_name(product: Product) -> bool:
+    if not product.jan:
+        return False
+    name = _product_export_name(product)
+    return name != f"{product.jan}|缺商品"
+
+
+def qinsi_product_export_blockers(product: Product) -> list[str]:
+    blockers: list[str] = []
+    if not product.jan:
+        blockers.append("缺少合法 JAN")
+    elif not qinsi_product_has_export_name(product):
+        blockers.append("缺少可用商品名")
+    return blockers
+
+
+def qinsi_product_is_exportable(product: Product, confirmed_imported_ids: set[int] | None = None) -> bool:
+    if product.status not in QINSI_PRODUCT_EXPORTABLE_STATUSES:
+        return False
+    if product.status in {"qinsi_product_imported", "archived"}:
+        return False
+    if confirmed_imported_ids and product.id in confirmed_imported_ids:
+        return False
+    return not qinsi_product_export_blockers(product)
+
+
+def qinsi_product_requires_import(product: Product, confirmed_imported_ids: set[int] | None = None) -> bool:
+    if product.status == "qinsi_product_imported":
+        return False
+    return qinsi_product_is_exportable(product, confirmed_imported_ids)
+
+
+def _purchase_fact_unit_price(detail: PurchaseBatchItem) -> Decimal | None:
+    if detail.unit_price is not None:
+        return Decimal(detail.unit_price)
+    if detail.actual_line_amount is not None and detail.quantity:
+        return (Decimal(detail.actual_line_amount) / Decimal(detail.quantity)).quantize(
+            Decimal("1"), rounding=ROUND_HALF_UP,
+        )
+    return None
+
+
+def _purchase_fact_price_for_product(product: Product) -> Decimal | None:
+    prices = [
+        price for price in (
+            _purchase_fact_unit_price(detail)
+            for detail in sorted(product.purchase_details, key=lambda item: item.id, reverse=True)
+        )
+        if price is not None
+    ]
+    return prices[0] if prices else None
+
+
+def _ensure_qinsi_export_reference_price(product: Product) -> None:
+    fallback = _purchase_fact_price_for_product(product)
+    if product.purchase_price is None and fallback is not None:
+        product.purchase_price = fallback
+    if product.sale_price is None and product.purchase_price is not None:
+        product.sale_price = product.purchase_price
+
+
+def _qinsi_export_image_trusted_hosts() -> tuple[str, ...]:
+    configured = os.getenv("JBA_QINSI_EXPORT_IMAGE_TRUSTED_HOSTS", "")
+    values = tuple(
+        item.strip().casefold().lstrip(".")
+        for item in configured.split(",")
+        if item.strip()
+    )
+    return values or ("qinsilk.com", "item-shopping.c.yimg.jp")
+
+
+def _host_matches(hostname: str, allowed_hosts: tuple[str, ...]) -> bool:
+    host = hostname.casefold().rstrip(".")
+    return any(host == allowed or host.endswith(f".{allowed}") for allowed in allowed_hosts)
+
+
+def _public_http_url(url: str, *, trusted_required: bool = True) -> tuple[bool, str]:
+    parsed = urlsplit(url)
+    if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+        return False, "not_http_url"
+    if parsed.username or parsed.password:
+        return False, "url_has_credentials"
+    host = parsed.hostname.casefold().rstrip(".")
+    if host in {"localhost"} or host.endswith((".local", ".internal", ".lan", ".ts.net")):
+        return False, "private_or_tailscale_host"
+    if trusted_required and not _host_matches(host, _qinsi_export_image_trusted_hosts()):
+        return False, "host_not_qinsi_trusted"
+    try:
+        addresses = socket.getaddrinfo(host, None, type=socket.SOCK_STREAM)
+    except OSError:
+        return False, "dns_failed"
+    if not addresses:
+        return False, "dns_empty"
+    for address in {item[4][0] for item in addresses}:
+        try:
+            ip = ipaddress.ip_address(address)
+        except ValueError:
+            return False, "dns_invalid"
+        if not ip.is_global:
+            return False, "private_ip"
+    return True, "ok"
+
+
+def _sniff_dimensions(content: bytes) -> tuple[int | None, int | None]:
+    try:
+        with Image.open(io.BytesIO(content)) as image:
+            width, height = image.width, image.height
+            image.verify()
+            return width, height
+    except (UnidentifiedImageError, OSError, ValueError):
+        return None, None
+
+
+def qinsi_image_diagnostic(
+    url: str | None,
+    *,
+    client: httpx.Client | None = None,
+) -> QinsiImageDiagnostic | None:
+    original_url = (url or "").strip()
+    if not original_url:
+        return None
+    ok, reason = _public_http_url(original_url, trusted_required=False)
+    if not ok:
+        return QinsiImageDiagnostic(original_url, None, None, None, False, None, None, False, "blank", reason)
+    original_trusted, original_trust_reason = _public_http_url(original_url, trusted_required=True)
+    owns_client = client is None
+    context = httpx.Client(timeout=12, follow_redirects=True) if owns_client else client
+    try:
+        with context if owns_client else nullcontext(context) as http:
+            response = http.get(
+                original_url,
+                headers={"Accept": "image/*", "User-Agent": "JBA-QinSi-Export/1.0"},
+            )
+    except httpx.HTTPError as exc:
+        return QinsiImageDiagnostic(original_url, None, None, None, False, None, None, False, "blank", type(exc).__name__)
+    final_url = str(response.url)
+    final_public_ok, final_public_reason = _public_http_url(final_url, trusted_required=False)
+    final_trusted_ok, final_trust_reason = _public_http_url(final_url, trusted_required=True)
+    redirect = bool(response.history) or final_url != original_url
+    content_type = response.headers.get("content-type", "").split(";", 1)[0].strip().casefold() or None
+    width = height = None
+    is_thumbnail = False
+    decision = "blank"
+    reason = final_public_reason if not final_public_ok else "ok"
+    if final_public_ok and response.status_code == 200 and content_type and content_type.startswith("image/"):
+        content = response.content[: 10 * 1024 * 1024 + 1]
+        if len(content) > 10 * 1024 * 1024:
+            reason = "too_large"
+        else:
+            width, height = _sniff_dimensions(content)
+            is_thumbnail = bool(width and height and min(width, height) < 300)
+            obvious_thumbnail = "_ex=128x128" in original_url.casefold() or "_ex=128x128" in final_url.casefold()
+            if width is None or height is None:
+                reason = "image_decode_failed"
+            elif is_thumbnail or obvious_thumbnail:
+                reason = "thumbnail"
+            elif not original_trusted:
+                reason = original_trust_reason
+            elif not final_trusted_ok:
+                reason = final_trust_reason
+            else:
+                decision = "write"
+                reason = "trusted_public_image"
+    elif final_public_ok and response.status_code != 200:
+        reason = f"http_{response.status_code}"
+    elif final_public_ok:
+        reason = "content_type_not_image"
+    return QinsiImageDiagnostic(
+        original_url, final_url, response.status_code, content_type, redirect,
+        width, height, is_thumbnail, decision, reason,
+    )
+
+
+def _http_image_candidates(*values: str | None) -> list[str]:
+    return list(dict.fromkeys(
+        url.strip()
+        for url in values
+        if url and url.strip() and url.strip().startswith(("http://", "https://"))
+    ))
+
+
+def _qinsi_image_candidates(product: Product) -> list[str]:
+    if product.main_image_locked:
+        return _http_image_candidates(product.display_image_url)
+    return _http_image_candidates(product.main_image_source_url, product.image_url)
+
+
+def _host_of(url: str) -> str:
+    return (urlsplit(url).hostname or "").casefold().rstrip(".")
+
+
+def _public_export_image_url_candidate(url: str | None) -> str | None:
+    value = (url or "").strip()
+    if not value:
+        return None
+    parsed = urlsplit(value)
+    if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+        return None
+    if parsed.username or parsed.password:
+        return None
+    host = parsed.hostname.casefold().rstrip(".")
+    if host in {"localhost"} or host.endswith((".local", ".internal", ".lan", ".ts.net")):
+        return None
+    try:
+        ip = ipaddress.ip_address(host)
+    except ValueError:
+        return value
+    return value if ip.is_global else None
+
+
+def _product_has_local_export_image(product: Product) -> bool:
+    has_local_image = bool(product.main_image_path or product.local_image_path) or (
+        bool(product.display_image_url)
+        and product.display_image_url.startswith(("/product-images/", "/product-local-images/"))
+    )
+    return has_local_image
+
+
+def qinsi_product_export_image_warning(product: Product) -> str | None:
+    if any(_public_export_image_url_candidate(url) for url in _qinsi_image_candidates(product)):
+        return None
+    if product.main_image_locked and _product_has_local_export_image(product):
+        return "人工锁定主图只有本地文件，秦丝图片列将留空"
+    if _product_has_local_export_image(product):
+        return "本地有商品图但没有公网图片 URL，秦丝图片列将留空"
+    return None
+
+
+def _is_yahoo_qinsi_image_url(url: str) -> bool:
+    return _host_of(url) == "item-shopping.c.yimg.jp"
+
+
+def _is_rakuten_image_url(url: str) -> bool:
+    host = _host_of(url)
+    return any(host == item or host.endswith(f".{item}") for item in (
+        "thumbnail.image.rakuten.co.jp", "image.rakuten.co.jp", "r10s.jp",
+    ))
+
+
+def _qinsi_export_should_blank_image_url(url: str) -> bool:
+    return "_ex=128x128" in url.casefold()
+
+
+def _qinsi_public_image_url_from_diagnostic(
+    diagnostic: QinsiImageDiagnostic | None,
+    *,
+    allow_untrusted: bool = False,
+) -> str | None:
+    if diagnostic is None or not diagnostic.final_url:
+        return None
+    if diagnostic.decision == "write":
+        return diagnostic.final_url
+    if (
+        allow_untrusted
+        and diagnostic.http_status == 200
+        and diagnostic.content_type
+        and diagnostic.content_type.startswith("image/")
+        and diagnostic.width
+        and diagnostic.height
+        and not diagnostic.is_thumbnail
+        and diagnostic.reason == "host_not_qinsi_trusted"
+    ):
+        return diagnostic.final_url
+    return None
+
+
+def _spec_tokens(value: str | None) -> set[str]:
+    return {f"{number.lower()}{unit.lower()}" for number, unit in SPEC_PATTERN.findall(value or "")}
+
+
+def _yahoo_offer_safe_for_product(product: Product, offer: PriceCandidate) -> bool:
+    if not product.jan or offer.jan != product.jan or not offer.jan_verified:
+        return False
+    if not offer.title or not offer.image_url or not _is_yahoo_qinsi_image_url(offer.image_url):
+        return False
+    if (offer.condition or "").casefold() in {"used", "中古", "second_hand"}:
+        return False
+    if offer.listing_type != "single":
+        return False
+    local_text = " ".join(filter(None, (
+        product.name_cn, product.name_ja, product.specification, product.model_spec, product.capacity,
+    )))
+    local_specs = _spec_tokens(local_text)
+    offer_specs = _spec_tokens(offer.title)
+    if local_specs and offer_specs and local_specs.isdisjoint(offer_specs):
+        return False
+    if MULTIPACK_PATTERN.search(offer.title) and not MULTIPACK_PATTERN.search(local_text):
+        return False
+    return True
+
+
+def _lookup_yahoo_qinsi_image(product: Product) -> str | None:
+    if not product.jan:
+        return None
+    try:
+        response = YahooShoppingPriceProvider().search(product.jan, timeout_seconds=4.0)
+    except Exception as exc:
+        logger.info(
+            "qinsi_yahoo_image_lookup_failed product_id=%r jan=%r error=%r",
+            product.id, product.jan, type(exc).__name__,
+        )
+        return None
+    if response.status != "success":
+        return None
+    for offer in response.offers:
+        if not _yahoo_offer_safe_for_product(product, offer):
+            continue
+        diagnostic = qinsi_image_diagnostic(offer.image_url)
+        final_url = _qinsi_public_image_url_from_diagnostic(diagnostic)
+        logger.info(
+            "qinsi_yahoo_image_candidate product_id=%r jan=%r image_url=%r decision=%r reason=%r",
+            product.id, product.jan, offer.image_url,
+            diagnostic.decision if diagnostic else None,
+            diagnostic.reason if diagnostic else None,
+        )
+        if final_url:
+            product.qinsi_image_url = final_url
+            return final_url
+    return None
+
+
+def _diagnosed_qinsi_image_url(
+    product: Product,
+    urls: list[str],
+    *,
+    export_job_id: int | None,
+    allow_untrusted: bool,
+) -> str | None:
+    for url in urls:
+        if _qinsi_export_should_blank_image_url(url):
+            logger.info(
+                "qinsi_product_image_diagnostic export_job_id=%r product_id=%r jan=%r original_url=%r "
+                "decision='blank' reason='thumbnail'",
+                export_job_id, product.id, product.jan, url,
+            )
+            continue
+        diagnostic = qinsi_image_diagnostic(url)
+        if diagnostic is None:
+            continue
+        logger.info(
+            "qinsi_product_image_diagnostic export_job_id=%r product_id=%r jan=%r original_url=%r "
+            "http_status=%r content_type=%r redirect=%r final_url=%r width=%r height=%r "
+            "is_thumbnail=%r decision=%r reason=%r",
+            export_job_id, product.id, product.jan, diagnostic.original_url,
+            diagnostic.http_status, diagnostic.content_type, diagnostic.redirect, diagnostic.final_url,
+            diagnostic.width, diagnostic.height, diagnostic.is_thumbnail, diagnostic.decision, diagnostic.reason,
+        )
+        final_url = _qinsi_public_image_url_from_diagnostic(diagnostic, allow_untrusted=allow_untrusted)
+        if final_url:
+            return final_url
+        fallback_url = _public_export_image_url_candidate(url)
+        if fallback_url and diagnostic.reason in {"ConnectError", "ConnectTimeout", "ReadTimeout", "PoolTimeout", "dns_failed"}:
+            logger.warning(
+                "qinsi_product_image_diagnostic_fallback export_job_id=%r product_id=%r jan=%r "
+                "image_url=%r reason=%r action='write_original_public_url'",
+                export_job_id, product.id, product.jan, fallback_url, diagnostic.reason,
+            )
+            return fallback_url
+    return None
+
+
+def _qinsi_export_image_url(product: Product, *, export_job_id: int | None = None) -> str | None:
+    candidates = _qinsi_image_candidates(product)
+    yahoo_candidates = [url for url in candidates if _is_yahoo_qinsi_image_url(url)]
+    yahoo_url = _diagnosed_qinsi_image_url(product, yahoo_candidates, export_job_id=export_job_id, allow_untrusted=False)
+    if yahoo_url:
+        return yahoo_url
+    other_candidates = [url for url in candidates if not _is_yahoo_qinsi_image_url(url) and not _is_rakuten_image_url(url)]
+    other_url = _diagnosed_qinsi_image_url(product, other_candidates, export_job_id=export_job_id, allow_untrusted=True)
+    if other_url:
+        return other_url
+    rakuten_candidates = [url for url in candidates if _is_rakuten_image_url(url)]
+    return _diagnosed_qinsi_image_url(product, rakuten_candidates, export_job_id=export_job_id, allow_untrusted=True)
+
+
+def _goods_template_bytes(products: list[Product], *, export_job_id: int | None = None) -> bytes:
     unique: dict[str, Product] = {}
     for product in products:
         if not product.jan:
@@ -267,12 +713,12 @@ def _goods_template_bytes(products: list[Product]) -> bytes:
         3: product.jan,
         7: "个",
         8: product.purchase_price,
-        9: product.purchase_price,
+        9: product.sale_price if product.sale_price is not None else product.purchase_price,
         11: 100,
         12: "启用",
         13: "启用",
         17: "停用",
-        19: product.main_image_source_url or product.image_url,
+        19: _qinsi_export_image_url(product, export_job_id=export_job_id),
         24: "停用",
     } for product in unique.values()]
     return _rewrite_template(
@@ -309,16 +755,18 @@ def _purchase_template_bytes(
 ) -> bytes:
     aggregates = _aggregate_purchase_rows(details)
     note = (note or purchase_batch.batch_no or purchase_batch.store_name or "")[:20] or None
+    headers = _purchase_template_headers()
+    columns = _purchase_columns(headers)
     rows = [{
-        1: aggregate.product.jan,
-        2: aggregate.product.jan,
-        3: "个",
-        4: aggregate.quantity,
-        5: aggregate.unit_price,
-        6: None,
-        7: note,
+        columns["条码"]: aggregate.product.jan,
+        columns["货号"]: aggregate.product.jan,
+        columns["单位"]: "个",
+        columns["数量(必填)"]: aggregate.quantity,
+        columns["单价"]: aggregate.unit_price,
+        columns["折扣(%)"]: None,
+        columns["备注(20字以内)"]: note,
     } for aggregate in aggregates]
-    return _rewrite_template(PURCHASE_TEMPLATE_PATH, "采购单商品导入", QINSI_PURCHASE_TEMPLATE_HEADERS, rows)
+    return _rewrite_template(PURCHASE_TEMPLATE_PATH, PURCHASE_SHEET_NAME, headers, rows)
 
 
 def _job_options():
@@ -361,6 +809,55 @@ def qinsi_product_export_rows(session: Session, job_id: int) -> list[tuple[Qinsi
     ).all())
 
 
+def regenerate_qinsi_product_export_file(session: Session, job: QinsiExportJob) -> QinsiExportJob:
+    products = [product for _, product in qinsi_product_export_rows(session, job.id)]
+    job.file_content = _goods_template_bytes(products, export_job_id=job.id)
+    session.flush()
+    return job
+
+
+def confirmed_qinsi_product_import_product_ids(session: Session, product_ids: set[int] | None = None) -> set[int]:
+    query = (
+        select(QinsiExportLine.product_id)
+        .join(QinsiExportJob, QinsiExportJob.id == QinsiExportLine.job_id)
+        .where(QinsiExportJob.status == "confirmed", QinsiExportLine.status == "confirmed")
+    )
+    if product_ids is not None:
+        if not product_ids:
+            return set()
+        query = query.where(QinsiExportLine.product_id.in_(product_ids))
+    return set(session.scalars(query))
+
+
+@dataclass(frozen=True, slots=True)
+class PendingQinsiProductExport:
+    job_id: int
+    product_id: int
+    jan: str | None
+    label: str
+
+
+def pending_qinsi_product_exports(session: Session, product_ids: set[int]) -> list[PendingQinsiProductExport]:
+    if not product_ids:
+        return []
+    rows = session.execute(
+        select(QinsiExportJob.id, Product.id, Product.jan, Product.internal_sku, Product.name_cn, Product.name_ja)
+        .join(QinsiExportLine, QinsiExportLine.job_id == QinsiExportJob.id)
+        .join(Product, Product.id == QinsiExportLine.product_id)
+        .where(QinsiExportJob.status == "exported", QinsiExportLine.product_id.in_(product_ids))
+        .order_by(QinsiExportJob.id, QinsiExportLine.id)
+    ).all()
+    return [
+        PendingQinsiProductExport(
+            job_id=job_id,
+            product_id=product_id,
+            jan=jan,
+            label=f"{jan or internal_sku}（{format_product_display_name(name_cn, name_ja) or internal_sku}）",
+        )
+        for job_id, product_id, jan, internal_sku, name_cn, name_ja in rows
+    ]
+
+
 def create_qinsi_product_export(session: Session, product_ids: set[int]) -> QinsiExportJob:
     if not product_ids:
         raise ValueError("请至少选择一个未导入秦丝的新商品")
@@ -369,12 +866,17 @@ def create_qinsi_product_export(session: Session, product_ids: set[int]) -> Qins
     ))
     if len(products) != len(product_ids):
         raise ValueError("所选商品包含不存在的记录")
-    invalid = [product for product in products if product.status not in QINSI_PRODUCT_EXPORTABLE_STATUSES]
+    confirmed_imported = confirmed_qinsi_product_import_product_ids(session, {product.id for product in products})
+    invalid = [
+        product for product in products
+        if not qinsi_product_is_exportable(product, confirmed_imported)
+    ]
     if invalid:
-        labels = "、".join(product.jan or product.internal_sku for product in invalid)
-        raise ValueError(f"以下商品不是待导入秦丝状态：{labels}")
-    if any(not product.jan for product in products):
-        raise ValueError("所选新商品存在缺少 JAN 的记录")
+        labels = "、".join(
+            f"{product.jan or product.internal_sku}（{'；'.join(qinsi_product_export_blockers(product)) or product.status}）"
+            for product in invalid
+        )
+        raise ValueError(f"以下商品暂不能生成秦丝新商品文件：{labels}")
     if len({product.jan for product in products}) != len(products):
         raise ValueError("所选商品中 JAN 重复，已停止生成")
     already_pending = set(session.scalars(
@@ -385,16 +887,19 @@ def create_qinsi_product_export(session: Session, product_ids: set[int]) -> Qins
     if already_pending:
         labels = "、".join(product.jan or product.internal_sku for product in products if product.id in already_pending)
         raise ValueError(f"以下商品已有待确认的新商品导出：{labels}")
+    for product in products:
+        _ensure_qinsi_export_reference_price(product)
     now = datetime.now(timezone.utc)
     filename = f"qinsi_NEW_PRODUCTS_{now:%Y%m%d}_{uuid.uuid4().hex[:10].upper()}.xlsx"
     job = QinsiExportJob(
         status="exported",
         export_filename=filename,
-        file_content=_goods_template_bytes(products),
+        file_content=b"",
         exported_at=now,
     )
     session.add(job)
     session.flush()
+    job.file_content = _goods_template_bytes(products, export_job_id=job.id)
     for product in products:
         session.add(QinsiExportLine(
             job_id=job.id,
@@ -413,10 +918,9 @@ def create_qinsi_product_export(session: Session, product_ids: set[int]) -> Qins
 
 
 def confirm_qinsi_product_export(session: Session, job: QinsiExportJob, *, actor_name: str) -> QinsiExportJob:
-    if job.status == "confirmed":
-        return job
-    if job.status != "exported":
+    if job.status not in {"exported", "confirmed"}:
         raise ValueError("当前新商品导出记录不能确认")
+    now = datetime.now(timezone.utc)
     product_ids: set[int] = set()
     for line, product in qinsi_product_export_rows(session, job.id):
         line.status = "confirmed"
@@ -424,10 +928,11 @@ def confirm_qinsi_product_export(session: Session, job: QinsiExportJob, *, actor
         product.product_origin = "qinsi"
         product_ids.add(product.id)
     job.status = "confirmed"
-    job.confirmed_at = datetime.now(timezone.utc)
+    job.confirmed_at = job.confirmed_at or now
     job.confirmed_by = (actor_name or "人工确认")[:128]
     job.cancelled_at = None
     job.cancelled_by = None
+    session.flush()
     batch_ids = set(session.scalars(
         select(PurchaseBatchItem.purchase_batch_id).where(PurchaseBatchItem.product_id.in_(product_ids))
     ))
@@ -524,8 +1029,12 @@ def _create_job(
     for row_no, detail in enumerate(sorted(details, key=lambda item: item.id), 2):
         product = detail.product
         if export_type == "new_product":
+            _ensure_qinsi_export_reference_price(product)
             product.status = "pending_qinsi_product_import"
         code = product.jan or product.qinsi_product_code or product.internal_sku
+        line_purchase_price = (
+            int(product.purchase_price) if product.purchase_price is not None else None
+        ) if export_type == "new_product" else detail.unit_price
         line = QinsiPurchaseExportLine(
             export_job_id=job.id,
             purchase_batch_id=detail.purchase_batch_id,
@@ -540,14 +1049,14 @@ def _create_job(
             qinsi_product_code=code,
             product_name=_product_export_name(product) if export_type == "new_product" else format_product_display_name(product.name_cn, product.name_ja),
             quantity=detail.quantity,
-            purchase_price=detail.unit_price if detail.unit_price is not None else product.purchase_price,
+            purchase_price=line_purchase_price,
             status="generated",
         )
         if export_type == "restock":
             line.source = QinsiPurchaseExportLineSource(purchase_batch_item_id=detail.id, is_active=True)
         session.add(line)
     job.file_content = (
-        _goods_template_bytes(list({detail.product.id: detail.product for detail in details}.values()))
+        _goods_template_bytes(list({detail.product.id: detail.product for detail in details}.values()), export_job_id=job.id)
         if export_type == "new_product"
         else _purchase_template_bytes(
             details, purchase_batch,
@@ -565,7 +1074,7 @@ def generate_merged_purchase_batch_export(
 ) -> QinsiPurchaseExportJob:
     batch_ids = sorted(purchase_batch_ids)
     if len(batch_ids) < 2:
-        raise ValueError("请至少选择两个待入库采购批次")
+        raise ValueError("请至少选择2个待入库批次")
     batches = [_loaded_purchase_batch(session, batch_id) for batch_id in batch_ids]
     if any(batch is None for batch in batches):
         raise LookupError("所选采购批次包含不存在的记录")
@@ -576,7 +1085,7 @@ def generate_merged_purchase_batch_export(
     blocking_products = list({
         detail.product.id: detail.product
         for batch in selected for detail in batch.items
-        if detail.product.status != "qinsi_product_imported"
+        if qinsi_product_requires_import(detail.product)
     }.values())
     if blocking_products:
         labels = "、".join(
@@ -623,7 +1132,7 @@ def generate_purchase_batch_exports(session: Session, purchase_batch_id: int) ->
         raise ValueError("已取消的采购批次不能生成秦丝文件")
     blocking_products = list({
         detail.product.id: detail.product for detail in purchase_batch.items
-        if detail.product.status != "qinsi_product_imported"
+        if qinsi_product_requires_import(detail.product)
     }.values())
     if blocking_products:
         labels = "、".join(

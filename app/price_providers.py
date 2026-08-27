@@ -1,13 +1,16 @@
 from __future__ import annotations
 
 import os
+import json
 import re
+from html import unescape
+from html.parser import HTMLParser
 from email.utils import parsedate_to_datetime
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any
-from urllib.parse import quote_plus, urlparse
+from urllib.parse import parse_qs, quote_plus, unquote, urljoin, urlparse
 
 import httpx
 from sqlalchemy.orm import Session
@@ -15,11 +18,33 @@ from sqlalchemy.orm import Session
 from app.config import clean_env_value, rakuten_http_referer
 from app.local_product import resolve_local_product_by_jan
 from app.product_image_localization import preferred_product_image_url
+from app.product_specs import extract_spec_text, parse_product_specs
 from app.rakuten_ip_monitor import rakuten_ip_warning_message, rakuten_public_ip_status
 
 
 SUBSCRIPTION_PATTERN = re.compile(r"定期(?:購入|便)|サブスク|subscription", re.IGNORECASE)
 JAN_PATTERN = re.compile(r"(?<!\d)(\d{8}|\d{12,14})(?!\d)")
+YEN_PRICE_PATTERNS = (
+    re.compile(r"(?:税込価格|販売価格|通常価格|価格|税込み?|税抜)\D{0,24}(?:￥|¥)?\s*([1-9][0-9,]{1,8})\s*円?", re.IGNORECASE),
+    re.compile(r"(?:￥|¥)\s*([1-9][0-9,]{1,8})"),
+    re.compile(r"([1-9][0-9,]{1,8})\s*円\s*(?:\(?(?:税込|税抜)\)?)", re.IGNORECASE),
+)
+TRUSTED_WEB_DOMAINS = (
+    "toei-anim.co.jp",
+    "hands.net",
+    "loft.co.jp",
+    "0101.co.jp",
+    "marui.co.jp",
+    "yodobashi.com",
+    "wowma.jp",
+    "aupay.market",
+    "cosme.net",
+    "rakuten.co.jp",
+    "yahoo.co.jp",
+    "shopping.yahoo.co.jp",
+    "amazon.co.jp",
+)
+MAX_WEB_FALLBACK_OFFERS = 3
 
 
 @dataclass(frozen=True, slots=True)
@@ -117,6 +142,336 @@ def _jan_evidence(text: str, searched_jan: str) -> str | None:
     if searched_jan in values:
         return searched_jan
     return values[0] if values else None
+
+
+def _host(value: str) -> str:
+    return (urlparse(value).hostname or "").casefold().removeprefix("www.")
+
+
+def _trusted_web_rank(value: str) -> int | None:
+    host = _host(value)
+    if not host:
+        return None
+    for index, domain in enumerate(TRUSTED_WEB_DOMAINS):
+        if host == domain or host.endswith(f".{domain}"):
+            return index
+    if host.endswith(".co.jp") or host.endswith(".jp"):
+        return len(TRUSTED_WEB_DOMAINS) + 10
+    return None
+
+
+class _SearchResultParser(HTMLParser):
+    def __init__(self, base_url: str):
+        super().__init__()
+        self.base_url = base_url
+        self.links: list[str] = []
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        if tag != "a":
+            return
+        values = dict(attrs)
+        href = values.get("href") or ""
+        if not href:
+            return
+        url = urljoin(self.base_url, unescape(href))
+        parsed = urlparse(url)
+        if parsed.path.startswith("/l/"):
+            target = parse_qs(parsed.query).get("uddg", [""])[0]
+            if target:
+                url = unquote(target)
+        if url.startswith("http"):
+            self.links.append(url)
+
+
+class _ProductPageParser(HTMLParser):
+    def __init__(self):
+        super().__init__()
+        self.title_parts: list[str] = []
+        self.h1_parts: list[str] = []
+        self.text_parts: list[str] = []
+        self.meta: dict[str, str] = {}
+        self.images: list[str] = []
+        self.json_ld_parts: list[str] = []
+        self._tag_stack: list[str] = []
+        self._json_ld_depth = 0
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        self._tag_stack.append(tag)
+        values = {key.casefold(): value for key, value in attrs if value}
+        if tag == "script" and "ld+json" in (values.get("type") or "").casefold():
+            self._json_ld_depth += 1
+            return
+        if tag in {"img", "source"}:
+            for key in ("src", "data-src", "data-original", "data-lazy", "data-srcset", "srcset"):
+                raw = values.get(key)
+                if not raw:
+                    continue
+                for item in str(raw).split(","):
+                    url = item.strip().split(" ", 1)[0]
+                    if url and not url.startswith("data:"):
+                        self.images.append(unescape(url))
+        if tag != "meta":
+            return
+        key = values.get("property") or values.get("name") or values.get("itemprop") or ""
+        content = values.get("content") or ""
+        if key and content:
+            self.meta[key.casefold()] = unescape(content).strip()
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag == "script" and self._json_ld_depth:
+            self._json_ld_depth -= 1
+        if self._tag_stack:
+            self._tag_stack.pop()
+
+    def handle_data(self, data: str) -> None:
+        if self._json_ld_depth:
+            self.json_ld_parts.append(data)
+            return
+        text = re.sub(r"\s+", " ", unescape(data or "")).strip()
+        if not text:
+            return
+        self.text_parts.append(text)
+        current = self._tag_stack[-1] if self._tag_stack else ""
+        if current == "title":
+            self.title_parts.append(text)
+        elif current == "h1":
+            self.h1_parts.append(text)
+
+    @property
+    def text(self) -> str:
+        return " ".join(self.text_parts)
+
+    @property
+    def title(self) -> str:
+        return (
+            " ".join(self.h1_parts)
+            or self.meta.get("og:title")
+            or self.meta.get("twitter:title")
+            or " ".join(self.title_parts)
+        ).strip()
+
+    @property
+    def image(self) -> str | None:
+        return self.meta.get("og:image") or self.meta.get("twitter:image") or self.meta.get("image")
+
+
+def _json_ld_objects(parser: _ProductPageParser) -> list[dict[str, Any]]:
+    output: list[dict[str, Any]] = []
+
+    def walk(value: Any) -> None:
+        if isinstance(value, list):
+            for item in value:
+                walk(item)
+            return
+        if not isinstance(value, dict):
+            return
+        output.append(value)
+        if "@graph" in value:
+            walk(value["@graph"])
+
+    for raw in parser.json_ld_parts:
+        try:
+            walk(json.loads(raw.strip()))
+        except (TypeError, ValueError, json.JSONDecodeError):
+            continue
+    return output
+
+
+def _json_ld_products(parser: _ProductPageParser) -> list[dict[str, Any]]:
+    products: list[dict[str, Any]] = []
+    for item in _json_ld_objects(parser):
+        type_value = item.get("@type")
+        types = {str(value).casefold() for value in type_value} if isinstance(type_value, list) else {str(type_value).casefold()}
+        if "product" in types:
+            products.append(item)
+    return products
+
+
+def _first_text(*values: Any) -> str | None:
+    for value in values:
+        if isinstance(value, dict):
+            value = value.get("name") or value.get("value") or value.get("@id")
+        if isinstance(value, list):
+            found = _first_text(*value)
+            if found:
+                return found
+            continue
+        text = re.sub(r"\s+", " ", str(value or "")).strip()
+        if text:
+            return unescape(text)
+    return None
+
+
+def _json_ld_product_for_jan(products: list[dict[str, Any]], searched_jan: str) -> dict[str, Any] | None:
+    for item in products:
+        haystack = json.dumps(item, ensure_ascii=False)
+        if searched_jan in JAN_PATTERN.findall(haystack):
+            return item
+    return products[0] if len(products) == 1 else None
+
+
+def _json_ld_price(product: dict[str, Any] | None) -> int | None:
+    if not product:
+        return None
+    offers = product.get("offers")
+    candidates = offers if isinstance(offers, list) else [offers]
+    for offer in candidates:
+        if not isinstance(offer, dict):
+            continue
+        for value in (
+            offer.get("price"),
+            (offer.get("priceSpecification") or {}).get("price") if isinstance(offer.get("priceSpecification"), dict) else None,
+            offer.get("lowPrice"),
+        ):
+            text = str(value or "").replace(",", "")
+            if re.fullmatch(r"\d+(?:\.\d+)?", text):
+                return int(float(text))
+    return None
+
+
+def _json_ld_image(product: dict[str, Any] | None) -> str | None:
+    if not product:
+        return None
+    return _first_image(product.get("image"))
+
+
+def _extract_price(text: str) -> int | None:
+    for pattern in YEN_PRICE_PATTERNS:
+        for match in pattern.finditer(text):
+            start = max(0, match.start() - 18)
+            end = min(len(text), match.end() + 18)
+            context = text[start:end]
+            if re.search(r"送料|送料無料|以上購入|手数料", context):
+                continue
+            value = match.group(1).replace(",", "")
+            if value.isdigit():
+                return int(value)
+    return None
+
+
+def _seller_or_site_name(parser: _ProductPageParser, host: str) -> str:
+    return (
+        parser.meta.get("og:site_name")
+        or parser.meta.get("application-name")
+        or host
+        or "Web"
+    )
+
+
+def _looks_like_site_name(title: str, parser: _ProductPageParser, host: str) -> bool:
+    clean = normalize_product_name_whitespace(title).casefold()
+    if not clean:
+        return True
+    site = normalize_product_name_whitespace(_seller_or_site_name(parser, host)).casefold()
+    if site and clean == site:
+        return True
+    site_markers = (
+        "東映アニメーションオフィシャルストア",
+        "東映動畫官方商店",
+        "东映动画官方商店",
+        "ロフトネットストア",
+        "loft",
+    )
+    product_markers = ("【", "】", "(", "（", "ml", "g", "mm", "cm", "個", "本", "枚", "セット", "jan")
+    return any(marker.casefold() == clean or marker.casefold() in clean for marker in site_markers) and not any(
+        marker.casefold() in clean for marker in product_markers
+    )
+
+
+def _clean_title_for_host(title: str | None, parser: _ProductPageParser, host: str) -> str | None:
+    title = normalize_web_title(title)
+    if not title or _looks_like_site_name(title, parser, host):
+        return None
+    return title
+
+
+def _official_page_title(parser: _ProductPageParser, product: dict[str, Any] | None, host: str) -> str | None:
+    json_name = _first_text((product or {}).get("name"))
+    if title := _clean_title_for_host(json_name, parser, host):
+        return title
+    for h1 in parser.h1_parts:
+        if title := _clean_title_for_host(h1, parser, host):
+            return title
+    for key in ("og:title", "twitter:title"):
+        if title := _clean_title_for_host(parser.meta.get(key), parser, host):
+            return title
+    if title := _clean_title_for_host(" ".join(parser.title_parts), parser, host):
+        return title
+    return None
+
+
+def _official_page_image(parser: _ProductPageParser, product: dict[str, Any] | None, host: str) -> str | None:
+    if image := _json_ld_image(product):
+        return image
+    candidates = list(dict.fromkeys(parser.images + [parser.image] if parser.image else parser.images))
+    if not candidates:
+        return None
+
+    def rank(url: str) -> tuple[int, int]:
+        text = url.casefold()
+        if "goods/l/" in text or "/img/goods/l/" in text:
+            return (0, -len(url))
+        if "/shop_assets/img/goods/l/" in text:
+            return (0, -len(url))
+        if "goods/m/" in text or "goods/s/" in text or "/shop_assets/img/goods/" in text:
+            return (1, -len(url))
+        if "goods" in text and not re.search(r"logo|ogp|banner|bnr|icon", text):
+            return (2, -len(url))
+        if re.search(r"logo|ogp|banner|bnr|icon|sprite", text):
+            return (9, -len(url))
+        return (5, -len(url))
+
+    return min(candidates, key=rank)
+
+
+def _official_page_raw_data(
+    jan: str,
+    parser: _ProductPageParser,
+    product: dict[str, Any] | None,
+    *,
+    host: str,
+    source_url: str,
+    price: int | None,
+    image_url: str | None,
+    spec_text: str | None,
+) -> dict[str, Any]:
+    specs = parse_product_specs(spec_text or "", parser.text)
+    brand = _first_text((product or {}).get("brand"), parser.meta.get("brand"))
+    manufacturer = _first_text((product or {}).get("manufacturer"), parser.meta.get("manufacturer"))
+    raw = {
+        "janCode": jan,
+        "shopName": _seller_or_site_name(parser, host),
+        "seller": _seller_or_site_name(parser, host),
+        "source": "web_fallback",
+        "source_url": source_url,
+        "source_domain": host,
+        "availability": "unknown",
+        "specification": spec_text,
+        "spec_text": spec_text,
+        "brand": brand,
+        "manufacturer": manufacturer,
+        "productImageUrl": image_url,
+        "originalImageUrl": image_url,
+        "price": price,
+    }
+    raw.update({key: value for key, value in specs.as_dict().items() if value is not None})
+    return {key: value for key, value in raw.items() if value not in {None, ""}}
+
+
+def normalize_product_name_whitespace(value: str | None) -> str:
+    return re.sub(r"\s+", " ", value or "").strip()
+
+
+def normalize_web_title(value: str | None) -> str:
+    title = normalize_product_name_whitespace(value)
+    title = re.sub(
+        r"\s*[\|\-｜]\s*(?:通販|公式(?:通販|サイト)?|商品情報|楽天市場|Yahoo!ショッピング|"
+        r"東映アニメーションオフィシャルストア|ロフトネットストア).*$",
+        "",
+        title,
+        flags=re.IGNORECASE,
+    ).strip()
+    return title[:128]
 
 
 class RakutenPriceProvider(PriceProvider):
@@ -778,7 +1133,7 @@ class YahooShoppingPriceProvider(PriceProvider):
             "results": 20,
             "sort": "+price",
             "condition": "new",
-            "image_size": 300,
+            "image_size": 600,
         }
         if self.client is None:
             with httpx.Client(timeout=timeout_seconds) as client:
@@ -924,6 +1279,135 @@ class AmazonCreatorsPriceProvider(PriceProvider):
         )
 
 
+class WebFallbackPriceProvider(PriceProvider):
+    code = "web_fallback"
+    display_name = "Web Fallback"
+    base_url = "https://duckduckgo.com/html/"
+    user_agent = "JapanBuyingAgent/1.0"
+
+    def __init__(self, client: Any | None = None):
+        self.client = client
+
+    def search_link(self, jan: str) -> str:
+        return f"https://duckduckgo.com/html/?q={quote_plus('\"' + jan + '\"')}"
+
+    def _get(self, url: str, timeout_seconds: float, **kwargs) -> httpx.Response:
+        headers = {"User-Agent": self.user_agent, **kwargs.pop("headers", {})}
+        if self.client is None:
+            with httpx.Client(timeout=timeout_seconds, follow_redirects=True) as client:
+                return client.get(url, headers=headers, **kwargs)
+        return self.client.get(url, timeout=timeout_seconds, follow_redirects=True, headers=headers, **kwargs)
+
+    def _search_links(self, jan: str, timeout_seconds: float) -> list[str]:
+        response = self._get(
+            self.base_url,
+            timeout_seconds,
+            params={"q": f'"{jan}"', "kl": "jp-jp"},
+        )
+        response.raise_for_status()
+        parser = _SearchResultParser(str(response.url))
+        parser.feed(response.text)
+        seen: set[str] = set()
+        trusted: list[tuple[int, int, str]] = []
+        for index, url in enumerate(parser.links):
+            clean = url.split("#", 1)[0]
+            rank = _trusted_web_rank(clean)
+            if rank is None or clean in seen:
+                continue
+            seen.add(clean)
+            trusted.append((rank, index, clean))
+        return [url for _, _, url in sorted(trusted)[:5]]
+
+    def _candidate_from_page(self, jan: str, url: str, timeout_seconds: float) -> PriceCandidate | None:
+        response = self._get(url, timeout_seconds)
+        if response.status_code >= 400:
+            return None
+        content_type = response.headers.get("content-type", "")
+        if content_type and "html" not in content_type.casefold():
+            return None
+        parser = _ProductPageParser()
+        parser.feed(response.text[:500_000])
+        json_products = _json_ld_products(parser)
+        json_product = _json_ld_product_for_jan(json_products, jan)
+        page_jans = JAN_PATTERN.findall(parser.text)
+        json_jans = JAN_PATTERN.findall(json.dumps(json_product or {}, ensure_ascii=False))
+        if jan not in set(page_jans + json_jans):
+            return None
+        host = _host(str(response.url))
+        title = _official_page_title(parser, json_product, host)
+        if not title:
+            return None
+        image = _official_page_image(parser, json_product, host)
+        image_url = urljoin(str(response.url), image) if image else None
+        price = _json_ld_price(json_product)
+        if price is None:
+            price = _extract_price(parser.text)
+        spec_text = extract_spec_text(parser.text)
+        return PriceCandidate(
+            title=title,
+            url=str(response.url),
+            image_url=image_url,
+            seller=host or "Web",
+            item_price=price or 0,
+            shipping_price=0,
+            shipping_known=False,
+            jan=jan,
+            stock_status="unknown",
+            condition="new",
+            listing_type="single",
+            link_type="product",
+            jan_verified=True,
+            match_type="EXACT_JAN",
+            confidence=0.8 if _trusted_web_rank(str(response.url)) is not None else 0.55,
+            fetched_at=datetime.now(timezone.utc),
+            raw_data=_official_page_raw_data(
+                jan,
+                parser,
+                json_product,
+                host=host,
+                source_url=str(response.url),
+                price=price,
+                image_url=image_url,
+                spec_text=spec_text,
+            ),
+        )
+
+    def search(self, jan: str, timeout_seconds: float) -> ProviderResponse:
+        if self.client is None and os.getenv("JBA_TESTING") == "1" and os.getenv("JBA_WEB_FALLBACK_ENABLED") is None:
+            return ProviderResponse(
+                "manual_only",
+                message="测试环境未注入 Web fallback client，跳过真实 Web 请求",
+                search_url=self.search_link(jan),
+                error_code="TESTING_DISABLED",
+            )
+        try:
+            links = self._search_links(jan, timeout_seconds)
+        except Exception as exc:
+            return ProviderResponse(
+                "error",
+                message=f"Web 搜索失败：{type(exc).__name__}",
+                search_url=self.search_link(jan),
+                error_code="WEB_SEARCH_FAILED",
+            )
+        offers: list[PriceCandidate] = []
+        for url in links:
+            try:
+                candidate = self._candidate_from_page(jan, url, timeout_seconds)
+            except Exception:
+                candidate = None
+            if candidate is not None:
+                offers.append(candidate)
+            if len(offers) >= MAX_WEB_FALLBACK_OFFERS:
+                break
+        return ProviderResponse(
+            "success" if offers else "empty",
+            tuple(offers),
+            None if offers else "Web fallback 未找到 JAN 一致的可信商品页",
+            search_url=self.search_link(jan),
+            error_code=None if offers else "NOT_FOUND",
+        )
+
+
 class ManualFallbackPriceProvider(PriceProvider):
     code = "manual"
     display_name = "Manual/Fallback"
@@ -942,5 +1426,6 @@ def get_default_price_providers() -> list[PriceProvider]:
         YahooShoppingPriceProvider(),
         RakutenPriceProvider(),
         AmazonCreatorsPriceProvider(),
+        WebFallbackPriceProvider(),
         ManualFallbackPriceProvider(),
     ]

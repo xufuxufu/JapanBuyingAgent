@@ -7,7 +7,6 @@
   <p>扫描包装条码或手动输入 JAN。结果仅表示各平台本次查询，不承诺全网最低价。</p>
 </section>
 
-{% include "_rakuten_ip_status.html" %}
 {% if error %}<div class="error" role="alert">{{ error }}</div>{% endif %}
 <section class="scan-layout">
   <div class="card scanner-card">
@@ -16,10 +15,7 @@
       <div class="scanner-guide" aria-hidden="true"></div>
       <p id="scannerPlaceholder">点击下方按钮开启后置摄像头</p>
     </div>
-    <div class="button-row">
-      <button id="startScan" type="button">开启扫码</button>
-      <button id="stopScan" class="secondary" type="button" disabled>停止</button>
-    </div>
+    <button id="startScan" class="full scan-toggle" type="button">开启扫码</button>
     <details class="camera-advanced">
       <summary>切换镜头 / 高级设置</summary>
       <select id="priceCameraSelect" aria-label="切换摄像头" hidden></select>
@@ -42,7 +38,7 @@
     <label>当前实体店采购价（日元，可选）
       <input name="current_store_price" value="{{ current_store_price }}" type="number" min="0" step="1" inputmode="numeric" placeholder="例：1280">
     </label>
-    <label class="inline-check"><input name="force_refresh" type="checkbox" value="true">忽略短时缓存，重新查询</label>
+    <label class="inline-check"><input name="force_refresh" type="checkbox" value="true" checked>忽略短时缓存，重新查询</label>
     <button id="lookupSubmit" type="submit">查询商品</button>
     <small class="muted">本地已有商品会立即显示，不等待平台；勾选“重新查询”时才同步刷新线上结果。未知 JAN 会保存为待补全/待确认商品。</small>
   </form>
@@ -68,7 +64,6 @@
 (() => {
   const video = document.querySelector('#janCamera');
   const start = document.querySelector('#startScan');
-  const stop = document.querySelector('#stopScan');
   const status = document.querySelector('#scannerStatus');
   const placeholder = document.querySelector('#scannerPlaceholder');
   const input = document.querySelector('#janInput');
@@ -103,7 +98,7 @@
   function stopCamera(message) {
     scanner.stop('price_check_stop');
     start.disabled = false;
-    stop.disabled = true;
+    start.textContent = '开启扫码';
     if (message) status.textContent = message;
   }
 
@@ -112,7 +107,8 @@
     status.textContent = '正在请求摄像头权限…';
     try {
       await scanner.start(deviceId);
-      stop.disabled = false;
+      start.disabled = false;
+      start.textContent = '停止扫码';
       copyDiagnostic.hidden = true;
     } catch (error) {
       const details=window.JBACamera.cameraErrorDetails(error,{secureContext:globalThis.isSecureContext,platform:scanner.cameraAdapter.platform,mediaDevices:navigator.mediaDevices});
@@ -122,14 +118,13 @@
       copyDiagnostic.hidden=false;
     }
   }
-  start.addEventListener('click',()=>{status.textContent='正在请求摄像头…';startCamera()});
+  start.addEventListener('click',()=>{if(scanner.track){stopCamera('扫码已停止，可手动输入 JAN。');return;}status.textContent='正在请求摄像头…';startCamera()});
   cameraSelect.addEventListener('change',()=>scanner.switchDevice(cameraSelect.value));
   zoomOut.addEventListener('click',()=>scanner.setZoom(scanner.zoomValue-(scanner.capabilities.zoom?.step||.2)));
   zoomReset.addEventListener('click',()=>scanner.setZoom(1));
   zoomIn.addEventListener('click',()=>scanner.setZoom(scanner.zoomValue+(scanner.capabilities.zoom?.step||.2)));
   torchButton.addEventListener('click',()=>scanner.setTorch(!scanner.torchOn));
   stage.addEventListener('click',async(event)=>{if(!scanner.track)return;const rect=video.getBoundingClientRect();await scanner.focusAt({x:Math.min(1,Math.max(0,(event.clientX-rect.left)/rect.width)),y:Math.min(1,Math.max(0,(event.clientY-rect.top)/rect.height))})});
-  stop.addEventListener('click', () => stopCamera('扫码已停止，可手动输入 JAN。'));
   copyDiagnostic.addEventListener('click',async()=>{try{await navigator.clipboard.writeText(debug.textContent||'');status.textContent='安全诊断已复制。'}catch(_){status.textContent='无法自动复制；请长按诊断文本手动复制。'}});
   form.addEventListener('submit', () => { submit.disabled = true; submit.textContent = '查询中…'; });
   window.addEventListener('pagehide', () => stopCamera());

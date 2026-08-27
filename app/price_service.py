@@ -28,10 +28,18 @@ PROVIDER_TIMEOUT_SECONDS = 4.0
 MAX_TRUSTED_RESULTS = 3
 SUBSCRIPTION_PATTERN = re.compile(r"定期(?:購入|便)|サブスク|subscription", re.IGNORECASE)
 MULTIPACK_PATTERN = re.compile(r"(?:[x×*]\s*[2-9]\d*|[2-9]\d*\s*(?:個|本|袋|包|枚|箱|セット|パック))", re.IGNORECASE)
+RELIABLE_PACK_PATTERNS = (
+    re.compile(r"(?:^|[^\d])([2-9]\d{0,2})\s*(?:個|个|本|袋|包|枚|箱|錠|粒)\s*(?:装|裝|入り|入|セット|パック)", re.IGNORECASE),
+    re.compile(r"(?:^|[^\d])([2-9]\d{0,2})\s*(?:セット|パック)", re.IGNORECASE),
+    re.compile(r"(?:[x×*]\s*([2-9]\d{0,2})|([2-9]\d{0,2})\s*[x×])", re.IGNORECASE),
+)
 SPEC_PATTERN = re.compile(r"(\d+(?:\.\d+)?)\s*(ml|mL|l|L|g|kg|個|本|枚|袋|包|錠|粒)", re.IGNORECASE)
 PROVIDER_SUMMARY_KEYS = {
     "brand", "brandName", "manufacturer", "maker", "category", "categoryName",
     "model", "modelNumber", "color", "capacity", "size", "janCode", "shopName", "seller",
+    "specification", "spec_text", "net_weight_g", "volume_ml", "length_mm", "width_mm",
+    "height_mm", "depth_mm", "pack_quantity", "source_url", "source_domain", "productImageUrl",
+    "originalImageUrl", "price",
 }
 PROVIDER_INFLIGHT_LOCK = threading.Lock()
 PROVIDER_INFLIGHT: dict[tuple[str, str], Future[ProviderResponse]] = {}
@@ -51,11 +59,12 @@ class PriceLookupView:
     trusted_offers: tuple[ProductOffer, ...]
     incomplete_offers: tuple[ProductOffer, ...]
     flagged_offers: tuple[ProductOffer, ...]
+    result_offers: tuple[ProductOffer, ...]
     fallback_results: tuple[PlatformLookupResult, ...]
     attempts: tuple[PriceProviderAttempt, ...]
     current_store_price: int | None
-    online_min_price: int | None
-    difference: int | None
+    online_min_price: int | Decimal | None
+    difference: int | Decimal | None
     comparison_status: str | None
 
 
@@ -189,6 +198,128 @@ def _provider_summary(raw_data: dict) -> dict[str, object]:
     return summary
 
 
+def _collect_image_urls(value: object) -> list[str]:
+    if isinstance(value, str):
+        return [value.strip()] if value.strip() else []
+    if isinstance(value, dict):
+        output: list[str] = []
+        for key in (
+            "original", "originalUrl", "originalImageUrl", "large", "largeUrl",
+            "productImageUrl", "url", "imageUrl", "medium", "small",
+        ):
+            output.extend(_collect_image_urls(value.get(key)))
+        return output
+    if isinstance(value, list):
+        output: list[str] = []
+        for item in value:
+            output.extend(_collect_image_urls(item))
+        return output
+    return []
+
+
+def _provider_image_candidates(raw_data: dict, fallback_url: str | None) -> list[dict[str, str]]:
+    buckets: list[tuple[str, object]] = [
+        ("provider_original", raw_data.get("originalImageUrl") or raw_data.get("productImageUrl") or raw_data.get("largeImageUrl")),
+        ("provider_detail", raw_data.get("exImage") or raw_data.get("mediumImageUrl") or raw_data.get("mediumImageUrls")),
+        ("search_thumbnail", raw_data.get("image") or raw_data.get("smallImageUrl") or raw_data.get("smallImageUrls") or fallback_url),
+    ]
+    output: list[dict[str, str]] = []
+    seen: set[str] = set()
+    for kind, value in buckets:
+        for url in _collect_image_urls(value):
+            if url and url not in seen:
+                seen.add(url)
+                output.append({"kind": kind, "url": url})
+    return output
+
+
+def _reliable_pack_quantity(title: str | None, raw_data: dict | None = None) -> int | None:
+    raw_data = raw_data or {}
+    raw_quantity = raw_data.get("pack_quantity") or raw_data.get("quantity_per_pack") or raw_data.get("lot_quantity")
+    if isinstance(raw_quantity, int) and raw_quantity > 1:
+        return raw_quantity
+    if isinstance(raw_quantity, str) and raw_quantity.isdigit() and int(raw_quantity) > 1:
+        return int(raw_quantity)
+    for pattern in RELIABLE_PACK_PATTERNS:
+        match = pattern.search(title or "")
+        if match:
+            value = next((item for item in match.groups() if item), None)
+            if value and int(value) > 1:
+                return int(value)
+    return None
+
+
+def _normalized_unit_price(listing_price: int, pack_quantity: int | None) -> Decimal | None:
+    if pack_quantity is None or pack_quantity <= 1:
+        return None
+    return (Decimal(listing_price) / Decimal(pack_quantity)).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+
+
+def _format_yen_amount(value: int | Decimal | None) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, Decimal) and value == value.to_integral_value():
+        return f"{int(value):,}"
+    return f"{value:,.2f}".rstrip("0").rstrip(".")
+
+
+def _platform_display_name(offer: ProductOffer) -> str:
+    code = (offer.marketplace.code if offer.marketplace else "").casefold()
+    name = offer.marketplace.name if offer.marketplace else ""
+    if code == "rakuten":
+        return "乐天"
+    if code == "yahoo_shopping":
+        return "Yahoo"
+    if code == "amazon":
+        return "Amazon"
+    if code in {"official", "brand_site"}:
+        return "官网"
+    return name or code or "平台"
+
+
+def _stock_label(stock_status: str | None) -> str:
+    if stock_status in {"in_stock", "limited"}:
+        return "有货"
+    if stock_status == "out_of_stock":
+        return "无货"
+    return "库存未知"
+
+
+def _hydrate_offer_display(offer: ProductOffer) -> ProductOffer:
+    try:
+        raw = json.loads(offer.raw_data_json or "{}")
+    except json.JSONDecodeError:
+        raw = {}
+    pack_quantity = raw.get("pack_quantity") if raw.get("pack_quantity_reliable") else None
+    normalized_unit_price = raw.get("normalized_unit_price") if pack_quantity else None
+    if isinstance(normalized_unit_price, str):
+        normalized_unit_price = Decimal(normalized_unit_price)
+    elif isinstance(normalized_unit_price, (int, float)):
+        normalized_unit_price = Decimal(str(normalized_unit_price))
+    else:
+        normalized_unit_price = None
+    listing_price = int(raw.get("listing_price") or offer.item_price or 0)
+    offer.listing_price = listing_price
+    offer.pack_quantity = int(pack_quantity) if pack_quantity else None
+    offer.normalized_unit_price = normalized_unit_price
+    offer.display_price = normalized_unit_price if normalized_unit_price is not None else (listing_price if listing_price > 0 else None)
+    offer.display_price_text = _format_yen_amount(offer.display_price)
+    offer.listing_price_text = _format_yen_amount(listing_price)
+    offer.platform_display_name = _platform_display_name(offer)
+    offer.stock_label = _stock_label(offer.stock_status)
+    offer.seller_display_name = offer.seller or "店铺未提供"
+    return offer
+
+
+def _offer_sort_price(offer: ProductOffer) -> Decimal:
+    display_price = getattr(offer, "display_price", None)
+    if display_price is not None:
+        return Decimal(str(display_price))
+    if not offer.item_price:
+        return Decimal(10**12)
+    return Decimal(offer.item_price or 10**12)
+
+
 def _latest_purchase_price(session: Session, product: Product | None) -> int | None:
     if product is None:
         return None
@@ -272,6 +403,28 @@ def _history(
     return item
 
 
+def offer_reference_price(offer: ProductOffer) -> int | Decimal:
+    return offer.total_price if offer.shipping_known else offer.item_price
+
+
+def online_reference_price_from_offers(offers: list[ProductOffer] | tuple[ProductOffer, ...], limit: int = MAX_TRUSTED_RESULTS) -> tuple[int | None, tuple[ProductOffer, ...]]:
+    valid = [
+        offer for offer in offers
+        if offer.is_trusted
+        and offer.stock_status in {"in_stock", "limited", "unknown", None}
+        and offer_reference_price(offer) > 0
+    ]
+    ordered = tuple(sorted(
+        valid,
+        key=lambda offer: (_offer_sort_price(offer), offer_reference_price(offer), offer.item_price, offer.id),
+    )[:limit])
+    if not ordered:
+        return None, ()
+    total = sum(Decimal(offer_reference_price(offer)) for offer in ordered)
+    average = (total / Decimal(len(ordered))).quantize(Decimal("1"), rounding=ROUND_HALF_UP)
+    return int(average), ordered
+
+
 def _cached_run(session: Session, jan: str, now: datetime) -> PriceSearchRun | None:
     runs = list(session.scalars(
         select(PriceSearchRun)
@@ -289,6 +442,15 @@ def _cached_run(session: Session, jan: str, now: datetime) -> PriceSearchRun | N
 
 def _provider_request_id(provider: PriceProvider, jan: str, started_at: datetime) -> str:
     return f"{provider.code}:{jan}:{int(started_at.timestamp() * 1000)}"
+
+
+def _response_has_enrichment_data(jan: str, response: ProviderResponse) -> bool:
+    return response.status == "success" and any(
+        candidate.jan == jan
+        and candidate.title
+        and (candidate.url or candidate.image_url or candidate.item_price > 0)
+        for candidate in response.offers
+    )
 
 
 def _search_provider_coalesced(provider: PriceProvider, jan: str, timeout_seconds: float) -> ProviderResponse:
@@ -380,7 +542,11 @@ def query_prices(
     session.add(run)
     session.flush()
     summary: dict[str, dict[str, object]] = {}
+    has_enrichment_data = False
     for provider in providers if providers is not None else get_default_price_providers():
+        if provider.code == "web_fallback" and has_enrichment_data:
+            summary[provider.code] = {"status": "skipped", "count": 0, "message": "已有正式平台资料，未执行 Web fallback"}
+            continue
         marketplace = _marketplace(session, provider)
         started_at = datetime.now(timezone.utc)
         request_id = _provider_request_id(provider, lookup.jan, started_at)
@@ -404,6 +570,8 @@ def query_prices(
             response.status, response.error_code,
         )
         _record_provider_state(session, provider, response, tested_at=completed_at)
+        if _response_has_enrichment_data(lookup.jan, response):
+            has_enrichment_data = True
         attempt = PriceProviderAttempt(
             search_run_id=run.id,
             marketplace_id=marketplace.id,
@@ -433,6 +601,8 @@ def query_prices(
             jan_status, spec_status, subscription, reasons = _offer_quality(lookup.jan, product, candidate)
             total_price = candidate.item_price + candidate.shipping_price
             unified = candidate.unified(provider.code)
+            pack_quantity = _reliable_pack_quantity(candidate.title, candidate.raw_data)
+            normalized_unit_price = _normalized_unit_price(candidate.item_price, pack_quantity)
             session.add(PlatformLookupResult(
                 price_search_run_id=run.id,
                 platform=provider.code,
@@ -481,6 +651,11 @@ def query_prices(
                 raw_data_json=json.dumps(
                     {
                         **_provider_summary(candidate.raw_data),
+                        "listing_price": candidate.item_price,
+                        "pack_quantity": pack_quantity,
+                        "pack_quantity_reliable": pack_quantity is not None,
+                        "normalized_unit_price": str(normalized_unit_price) if normalized_unit_price is not None else None,
+                        "image_candidates": _provider_image_candidates(candidate.raw_data, candidate.image_url),
                         "link_type": candidate.link_type,
                         "jan_verified": candidate.jan_verified,
                         "match_type": candidate.match_type,
@@ -517,27 +692,29 @@ def build_lookup_view(session: Session, history_id: int) -> PriceLookupView:
         raise LookupError("查价历史不存在")
     run = history.search_run
     product = run.product
-    def offer_sort_key(offer: ProductOffer) -> tuple[int, int, int]:
-        return (offer.total_price or 10**12, offer.item_price or 10**12, offer.id)
+    offers = tuple(_hydrate_offer_display(offer) for offer in run.offers)
+
+    def offer_sort_key(offer: ProductOffer) -> tuple[int, Decimal, int, int]:
+        stock_rank = 1 if offer.stock_status == "out_of_stock" else 0
+        return (stock_rank, _offer_sort_price(offer), offer.item_price or 10**12, offer.id)
 
     trusted = tuple(sorted((
-        offer for offer in run.offers
-        if offer.is_trusted and offer.shipping_known and offer.stock_status in {"in_stock", "limited"}
-    ), key=offer_sort_key)[:MAX_TRUSTED_RESULTS])
+        offer for offer in offers
+        if offer.is_trusted and offer.stock_status in {"in_stock", "limited", "unknown", None}
+    ), key=offer_sort_key))
     trusted_ids = {offer.id for offer in trusted}
     incomplete = tuple(sorted((
-        offer for offer in run.offers
+        offer for offer in offers
         if offer.is_trusted
         and offer.id not in trusted_ids
         and (
-            not offer.shipping_known
-            or offer.stock_status == "unknown"
-            or offer.jan_match_status != "exact"
+            offer.jan_match_status != "exact"
             or offer.spec_match_status == "unknown"
         )
     ), key=offer_sort_key))
-    flagged = tuple(sorted((offer for offer in run.offers if not offer.is_trusted), key=offer_sort_key))
-    online_min = trusted[0].total_price if trusted else None
+    flagged = tuple(sorted((offer for offer in offers if not offer.is_trusted), key=offer_sort_key))
+    result_offers = tuple(sorted(offers, key=offer_sort_key))
+    online_min = _offer_sort_price(trusted[0]) if trusted else None
     difference = history.current_store_price - online_min if history.current_store_price is not None and online_min is not None else None
     comparison = None
     if difference is not None:
@@ -555,6 +732,7 @@ def build_lookup_view(session: Session, history_id: int) -> PriceLookupView:
         trusted_offers=trusted,
         incomplete_offers=incomplete,
         flagged_offers=flagged,
+        result_offers=result_offers,
         fallback_results=tuple(item for item in run.platform_results if item.link_type == "search"),
         attempts=tuple(run.provider_attempts),
         current_store_price=history.current_store_price,

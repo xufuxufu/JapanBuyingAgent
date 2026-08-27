@@ -5,7 +5,7 @@ from datetime import datetime, timezone
 from sqlalchemy import func, select
 
 from app.location_service import initialize_default_locations
-from app.models import Location, Product, PurchaseBatch, PurchaseBatchItem, Receipt, ReceiptBatch, ReceiptItem, Store, StoreAlias
+from app.models import DuplicateDetectionLog, Location, Product, PurchaseBatch, PurchaseBatchItem, QinsiPurchaseExportJob, Receipt, ReceiptBatch, ReceiptItem, Store, StoreAlias
 from app.purchase_service import ensure_purchase_batch_for_receipt
 from app.schemas import PurchaseConfirmationInput
 from app.schemas import StoreBrandCreateInput, StoreCreateInput
@@ -38,6 +38,35 @@ def make_confirmable_receipt(db, *, item_count: int = 2, duplicate_status: str =
     return batch, receipt, products, {location.display_name: location for location in locations}
 
 
+def make_two_receipts_with_second_conflict(db):
+    initialize_default_locations(db)
+    first_product = Product(jan="4901234567894", name_cn="第一张商品", product_origin="qinsi")
+    conflict_one = Product(jan="4955814719333", qinsi_product_code="Q-CONFLICT-1", name_cn="冲突商品一", product_origin="qinsi")
+    conflict_two = Product(jan="4955814719340", qinsi_product_code="Q-CONFLICT-2", name_cn="冲突商品二", product_origin="qinsi")
+    batch = ReceiptBatch(batch_no=f"RCPT-CONFLICT-{id(db)}", status="review", image_status="ready", gpt_status="json_imported")
+    first = Receipt(
+        batch=batch, raw_store_name="PLAZA 心斎橋パルコ店", purchased_at=datetime(2026, 8, 21, 6, 25, tzinfo=timezone.utc),
+        confirmation_status="pending", review_status="pending",
+    )
+    second = Receipt(
+        batch=batch, raw_store_name="HANDS 心斎橋店", purchased_at=datetime(2026, 8, 21, 6, 35, tzinfo=timezone.utc),
+        confirmation_status="pending", review_status="pending",
+    )
+    first.items.append(ReceiptItem(
+        line_no=1, raw_name="第一张商品", jan_candidate=first_product.jan,
+        quantity=5, unit_price=2178, discount_amount=0, line_total=10890,
+        confidence=1, review_status="pending", match_status="unmatched",
+    ))
+    second.items.append(ReceiptItem(
+        line_no=3, raw_name="第二张冲突商品", jan_candidate="4955814719333",
+        quantity=6, unit_price=1320, discount_amount=0, line_total=7920,
+        confidence=1, review_status="pending", match_status="unmatched",
+    ))
+    db.add_all([first_product, conflict_one, conflict_two, batch])
+    db.commit()
+    return batch, first, second, conflict_one, conflict_two
+
+
 def test_confirmation_creates_one_batch_and_one_detail_per_receipt_item_with_defaults(db_session):
     batch, receipt, products, locations = make_confirmable_receipt(db_session)
     confirm_receipt(db_session, batch, receipt)
@@ -51,7 +80,7 @@ def test_confirmation_creates_one_batch_and_one_detail_per_receipt_item_with_def
     assert [detail.product_id for detail in details] == [product.id for product in products]
     assert all(detail.initial_location_id == locations["日本家里库存"].id for detail in details)
     assert details[0].qinsi_target_warehouse_id == locations["新日本仓库"].id
-    assert details[1].qinsi_target_warehouse_id == locations["无条码商品"].id
+    assert details[1].qinsi_target_warehouse_id == locations["新日本仓库"].id
     assert (details[0].quantity, details[0].unit_price, details[0].discount_amount, details[0].actual_line_amount) == (1, 100, 10, 90)
 
 
@@ -65,6 +94,92 @@ def test_repeated_confirmation_and_ensure_do_not_duplicate_batch(db_session):
     assert first.id == second.id
     assert db_session.scalar(select(func.count()).select_from(PurchaseBatch)) == 1
     assert db_session.scalar(select(func.count()).select_from(PurchaseBatchItem)) == 2
+
+
+def test_same_receipt_batch_multiple_receipts_create_separate_purchase_batches(db_session):
+    batch, first_receipt, products, _ = make_confirmable_receipt(db_session, item_count=1)
+    second_product = Product(jan="00123457", name_cn="第二张小票商品")
+    second_receipt = Receipt(
+        batch=batch, raw_store_name="第二张店铺", purchased_at=datetime(2026, 7, 16, 4, 0, tzinfo=timezone.utc),
+        confirmation_status="pending", review_status="pending",
+    )
+    db_session.add_all([second_product, second_receipt])
+    db_session.flush()
+    second_receipt.items.append(ReceiptItem(
+        line_no=1, raw_name=second_product.name_cn, jan_candidate=second_product.jan,
+        product_id=second_product.id, match_method="manual", match_status="matched_existing",
+        quantity=2, unit_price=300, discount_amount=0, line_total=600,
+        confidence=1, review_status="pending",
+    ))
+    db_session.add(second_receipt)
+    db_session.commit()
+
+    confirm_receipt(db_session, batch, first_receipt)
+    confirm_receipt(db_session, batch, second_receipt)
+    purchases = list(db_session.scalars(select(PurchaseBatch).order_by(PurchaseBatch.id)))
+    details = list(db_session.scalars(select(PurchaseBatchItem).order_by(PurchaseBatchItem.receipt_item_id)))
+
+    assert db_session.scalar(select(func.count()).select_from(PurchaseBatch)) == 2
+    assert [purchase.gpt_batch_id for purchase in purchases] == [batch.id, batch.id]
+    assert [purchase.receipt_id for purchase in purchases] == [first_receipt.id, second_receipt.id]
+    assert len(details) == 2
+    assert {detail.purchase_batch_id for detail in details} == {purchase.id for purchase in purchases}
+    assert {detail.receipt_item.receipt_id for detail in details} == {first_receipt.id, second_receipt.id}
+
+
+def test_confirmed_second_receipt_conflict_shows_blocker_and_manual_bind_creates_purchase(client):
+    http, db, _ = client
+    batch, first, second, conflict_one, conflict_two = make_two_receipts_with_second_conflict(db)
+    confirm_receipt(db, batch, first)
+    confirm_receipt(db, batch, second)
+
+    first_purchase = db.scalar(select(PurchaseBatch).where(PurchaseBatch.receipt_id == first.id))
+    assert first_purchase is not None
+    second_purchase = db.scalar(select(PurchaseBatch).where(PurchaseBatch.receipt_id == second.id))
+    assert second_purchase is not None and second_purchase.receipt_id == second.id
+    assert second.items[0].match_status == "matched_existing" and second.items[0].product_id == conflict_one.id
+
+    review = http.get(f"/receipts/{batch.id}/review?receipt_id={second.id}")
+    assert review.status_code == 200
+    assert "尚未生成采购批次" not in review.text
+    assert conflict_one.internal_sku in review.text
+    assert "Q-CONFLICT-1" in review.text
+    assert db.scalar(select(func.count()).select_from(PurchaseBatch)) == 2
+    assert db.scalar(select(PurchaseBatchItem).where(PurchaseBatchItem.receipt_item_id == second.items[0].id)).product_id == conflict_one.id
+
+
+def test_confirmed_old_conflict_auto_refreshes_after_duplicate_product_deleted(client):
+    http, db, _ = client
+    batch, first, second, conflict_one, conflict_two = make_two_receipts_with_second_conflict(db)
+    confirm_receipt(db, batch, first)
+    confirm_receipt(db, batch, second)
+    db.delete(conflict_two)
+    db.commit()
+
+    review = http.get(f"/receipts/{batch.id}/review?receipt_id={second.id}")
+    assert review.status_code == 200
+    db.refresh(second.items[0])
+    assert second.items[0].match_status == "matched_existing"
+    assert second.items[0].product_id == conflict_one.id
+    assert "尚未生成采购批次" not in review.text
+    assert db.scalar(select(PurchaseBatch).where(PurchaseBatch.receipt_id == second.id)) is not None
+    assert db.scalar(select(func.count()).select_from(PurchaseBatch)) == 2
+
+
+def test_missing_unit_price_is_derived_from_line_amount_before_purchase_batch(db_session):
+    batch, receipt, _, _ = make_confirmable_receipt(db_session, item_count=1)
+    item = receipt.items[0]
+    item.quantity = 10
+    item.unit_price = None
+    item.discount_amount = 0
+    item.line_total = 2970
+    db_session.commit()
+
+    confirm_receipt(db_session, batch, receipt)
+    detail = db_session.scalar(select(PurchaseBatchItem))
+
+    assert detail.unit_price == 297
+    assert detail.actual_line_amount == 2970
 
 
 def test_batch_level_locations_apply_to_all_lines(db_session):
@@ -84,7 +199,7 @@ def test_line_level_qinsi_target_override_wins_over_batch_setting(client):
     batch, receipt, _, locations = make_confirmable_receipt(db, item_count=3)
     override_item = receipt.items[2]
     review = http.get(f"/receipts/{batch.id}/review?receipt_id={receipt.id}")
-    assert review.status_code == 200 and "采购批次默认位置" in review.text and "异常行单独覆盖目标仓" in review.text
+    assert review.status_code == 200 and "采购批次默认位置" in review.text and "自动：新日本仓库" in review.text and "异常行单独覆盖目标仓" in review.text
     response = http.post(f"/receipts/{batch.id}/review/confirm", data={
         "receipt_id": str(receipt.id),
         "initial_location_id": str(locations["日本家里库存"].id),
@@ -121,6 +236,115 @@ def test_cancelled_or_abnormal_receipt_does_not_generate_purchase_batch(db_sessi
     receipt.confirmed_at = datetime.now(timezone.utc)
     db_session.commit()
     assert ensure_purchase_batch_for_receipt(db_session, receipt) is None
+
+
+def test_manual_not_duplicate_unblocks_confirmed_receipt_and_backfills_purchase_batch(client):
+    http, db, _ = client
+    batch, receipt, _, _ = make_confirmable_receipt(db, item_count=1, duplicate_status="auto_duplicate")
+    confirm_receipt(db, batch, receipt)
+    assert db.scalar(select(PurchaseBatch)) is None
+
+    response = http.post(
+        f"/receipts/{batch.id}/review/receipts/{receipt.id}/not-duplicate",
+        follow_redirects=False,
+    )
+
+    assert response.status_code == 303
+    db.refresh(receipt)
+    assert receipt.duplicate_status == "distinct"
+    assert db.scalar(select(PurchaseBatch).where(PurchaseBatch.receipt_id == receipt.id)) is not None
+    log = db.scalar(select(DuplicateDetectionLog).where(DuplicateDetectionLog.entity_type == "receipt"))
+    assert log and log.decision == "manual_distinct"
+
+
+def test_confirmed_receipt_item_jan_correction_syncs_purchase_detail_and_marks_qinsi_stale(client):
+    http, db, _ = client
+    batch, receipt, products, _ = make_confirmable_receipt(db, item_count=1)
+    corrected = Product(jan="4901008316130", name_cn="纠错后商品")
+    db.add(corrected)
+    db.commit()
+    confirm_receipt(db, batch, receipt)
+    purchase = db.scalar(select(PurchaseBatch).where(PurchaseBatch.receipt_id == receipt.id))
+    item = receipt.items[0]
+    export = QinsiPurchaseExportJob(
+        export_no=f"QINSI-CORRECTION-{id(db)}",
+        selection_key=f"qinsi-correction-{id(db)}",
+        export_type="restock",
+        purchase_batch_id=purchase.id,
+        qinsi_target_warehouse_id=purchase.default_qinsi_warehouse_id,
+        filename="old.xlsx",
+        file_content=b"old",
+        status="generated",
+        line_count=1,
+    )
+    db.add(export)
+    db.commit()
+
+    response = http.post(
+        f"/receipts/{batch.id}/review/items/{item.id}",
+        data={
+            "raw_name": item.raw_name,
+            "recognized_name": item.recognized_name or "",
+            "jan_candidate": "49010083161.30",
+            "quantity": "3",
+            "unit_price": "220",
+            "discount_amount": "20",
+            "tax_rate": item.tax_rate or "",
+            "line_total": "640",
+            "confidence": str(item.confidence),
+            "review_status": "confirmed",
+        },
+        follow_redirects=False,
+    )
+
+    assert response.status_code == 303
+    db.refresh(item)
+    detail = db.scalar(select(PurchaseBatchItem).where(PurchaseBatchItem.receipt_item_id == item.id))
+    db.refresh(export)
+    assert item.jan_candidate == "4901008316130"
+    assert item.product_id == corrected.id
+    assert (detail.product_id, detail.quantity, detail.unit_price, detail.discount_amount, detail.actual_line_amount) == (
+        corrected.id,
+        3,
+        220,
+        20,
+        640,
+    )
+    assert "需要重新导出/重新确认" in (export.confirmation_note or "")
+    assert db.scalar(select(DuplicateDetectionLog).where(DuplicateDetectionLog.entity_type == "receipt_item")).decision == "correction"
+
+
+def test_bulk_confirm_normal_receipts_skips_abnormal_receipts(client):
+    http, db, _ = client
+    initialize_default_locations(db)
+    product = Product(jan="4901234567894", name_cn="正常商品")
+    db.add(product)
+    db.flush()
+    batch = ReceiptBatch(batch_no=f"BULK-CONFIRM-{id(db)}", status="review", image_status="ready", gpt_status="json_imported")
+    normal = Receipt(batch=batch, raw_store_name="正常店", confirmation_status="pending", review_status="pending")
+    abnormal = Receipt(batch=batch, raw_store_name="异常店", confirmation_status="pending", review_status="pending")
+    normal.items.append(ReceiptItem(
+        line_no=1, raw_name="正常商品", jan_candidate=product.jan, product_id=product.id,
+        match_status="matched_existing", match_method="manual", quantity=1, unit_price=100,
+        discount_amount=0, line_total=100, confidence=1, review_status="pending",
+    ))
+    abnormal.items.append(ReceiptItem(
+        line_no=1, raw_name="无效JAN", jan_candidate="49010083161.30", product_id=None,
+        match_status="invalid_jan", quantity=1, unit_price=100,
+        discount_amount=0, line_total=100, confidence=1, review_status="pending",
+    ))
+    db.add(batch)
+    db.commit()
+
+    response = http.post(f"/receipts/{batch.id}/review/confirm-normal", follow_redirects=False)
+
+    assert response.status_code == 303
+    db.refresh(normal)
+    db.refresh(abnormal)
+    assert normal.confirmation_status == "confirmed"
+    assert abnormal.confirmation_status == "pending"
+    assert db.scalar(select(PurchaseBatch).where(PurchaseBatch.receipt_id == normal.id)) is not None
+    assert "%201%20" in response.headers["location"]
 
 
 def test_store_creation_deduplicates_phone_and_code_and_exact_match_is_high_confidence(db_session):

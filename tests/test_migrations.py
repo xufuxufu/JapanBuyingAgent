@@ -4,8 +4,12 @@ import sqlite3
 import json
 from pathlib import Path
 
+import pytest
 from alembic import command
 from alembic.config import Config
+
+
+HEAD_REVISION = "20260825_0037"
 
 
 def test_migration_from_empty_and_repeat_safe(tmp_path, monkeypatch):
@@ -23,13 +27,14 @@ def test_migration_from_empty_and_repeat_safe(tmp_path, monkeypatch):
     assert {"qinsi_inventory_snapshots", "qinsi_inventory_snapshot_lines", "qinsi_product_mappings"} <= tables
     assert {
         "qinsi_import_batches", "qinsi_goods_import_rows", "qinsi_master_values", "product_barcodes",
+        "qinsi_conflict_resolutions",
         "field_purchase_batches", "field_purchase_items", "tag_evidence",
         "durable_background_jobs", "platform_provider_states", "platform_lookup_results",
             "enrichment_audit_logs", "product_operation_logs",
     } <= tables
     assert {"restock_lists", "restock_list_items"} <= tables
     assert {"low_stock_threshold", "unit_name", "weight_kg", "qinsi_brand_master_id"} <= product_columns
-    assert revision == ("20260731_0028",)
+    assert revision == (HEAD_REVISION,)
 
 
 def test_upgrade_from_phase1_preserves_old_data(tmp_path, monkeypatch):
@@ -55,11 +60,166 @@ def test_upgrade_from_phase1_preserves_old_data(tmp_path, monkeypatch):
     assert image[:3] == ("old.jpg", "original", 0)
     assert image[3] == "RCPT-20260714-0900-0001_P01.jpg"
     assert receipt == ("旧店", None)
-    assert revision == ("20260731_0028",)
+    assert revision == (HEAD_REVISION,)
 
 
 def test_sqlite_foreign_keys_enabled(db_session):
     assert db_session.connection().exec_driver_sql("PRAGMA foreign_keys").scalar_one() == 1
+
+
+def test_0036_restores_unique_product_jan_index(tmp_path, monkeypatch):
+    db_path = tmp_path / "from-0035-unique-jan.sqlite3"
+    with sqlite3.connect(db_path) as connection:
+        connection.executescript("""
+        CREATE TABLE alembic_version (version_num VARCHAR(32) NOT NULL PRIMARY KEY);
+        INSERT INTO alembic_version VALUES ('20260820_0035');
+        CREATE TABLE products (
+            id INTEGER PRIMARY KEY,
+            jan VARCHAR(32),
+            qinsi_product_code VARCHAR(100),
+            internal_sku VARCHAR(32) NOT NULL
+        );
+        CREATE INDEX ix_products_jan_not_null ON products (jan) WHERE jan IS NOT NULL;
+        INSERT INTO products VALUES (1,'4571609352419','QINSI-A','NJ-A');
+        INSERT INTO products VALUES (2,NULL,'QINSI-B','NJ-B');
+        """)
+    monkeypatch.setenv("JBA_DATABASE_URL", f"sqlite:///{db_path.as_posix()}")
+    config = Config(str(Path(__file__).resolve().parents[1] / "alembic.ini"))
+
+    command.upgrade(config, "head")
+
+    with sqlite3.connect(db_path) as connection:
+        indexes = {row[1]: row[2] for row in connection.execute("PRAGMA index_list(products)")}
+        revision = connection.execute("SELECT version_num FROM alembic_version").fetchone()
+    assert indexes["uq_products_jan_not_null"] == 1
+    assert "ix_products_jan_not_null" not in indexes
+    assert revision == (HEAD_REVISION,)
+
+
+def test_0036_blocks_when_duplicate_product_jan_remains(tmp_path, monkeypatch):
+    db_path = tmp_path / "from-0035-duplicate-jan.sqlite3"
+    with sqlite3.connect(db_path) as connection:
+        connection.executescript("""
+        CREATE TABLE alembic_version (version_num VARCHAR(32) NOT NULL PRIMARY KEY);
+        INSERT INTO alembic_version VALUES ('20260820_0035');
+        CREATE TABLE products (
+            id INTEGER PRIMARY KEY,
+            jan VARCHAR(32),
+            qinsi_product_code VARCHAR(100),
+            internal_sku VARCHAR(32) NOT NULL
+        );
+        CREATE INDEX ix_products_jan_not_null ON products (jan) WHERE jan IS NOT NULL;
+        INSERT INTO products VALUES (1,'4571609352419','QINSI-A','NJ-A');
+        INSERT INTO products VALUES (2,'4571609352419',NULL,'NJ-B');
+        """)
+    monkeypatch.setenv("JBA_DATABASE_URL", f"sqlite:///{db_path.as_posix()}")
+    config = Config(str(Path(__file__).resolve().parents[1] / "alembic.ini"))
+
+    with pytest.raises(RuntimeError, match="products\\.jan still has duplicates"):
+        command.upgrade(config, "head")
+
+    with sqlite3.connect(db_path) as connection:
+        indexes = {row[1]: row[2] for row in connection.execute("PRAGMA index_list(products)")}
+        revision = connection.execute("SELECT version_num FROM alembic_version").fetchone()
+    assert indexes["ix_products_jan_not_null"] == 0
+    assert "uq_products_jan_not_null" not in indexes
+    assert revision == ("20260820_0035",)
+
+
+def test_0033_removes_product_jan_unique_index_and_preserves_product_history(tmp_path, monkeypatch):
+    db_path = tmp_path / "from-0031-jan-unique-index.sqlite3"
+    with sqlite3.connect(db_path) as connection:
+        connection.executescript("""
+        CREATE TABLE alembic_version (version_num VARCHAR(32) NOT NULL PRIMARY KEY);
+        INSERT INTO alembic_version VALUES ('20260819_0031');
+        CREATE TABLE products (
+            id INTEGER PRIMARY KEY,
+            jan VARCHAR(32),
+            qinsi_product_code VARCHAR(100),
+            internal_sku VARCHAR(32) NOT NULL
+        );
+        CREATE UNIQUE INDEX uq_products_internal_sku ON products (internal_sku);
+        CREATE UNIQUE INDEX uq_products_jan_not_null ON products (jan) WHERE jan IS NOT NULL;
+        CREATE UNIQUE INDEX uq_products_qinsi_code_not_null ON products (qinsi_product_code) WHERE qinsi_product_code IS NOT NULL;
+        CREATE TABLE receipt_items (id INTEGER PRIMARY KEY, product_id INTEGER);
+        CREATE TABLE purchase_batch_items (id INTEGER PRIMARY KEY, product_id INTEGER);
+        INSERT INTO products VALUES (10,'020373218215','QINSI-OLD','NJ-OLD-000010');
+        INSERT INTO receipt_items VALUES (20,10);
+        INSERT INTO purchase_batch_items VALUES (30,10);
+        """)
+    monkeypatch.setenv("JBA_DATABASE_URL", f"sqlite:///{db_path.as_posix()}")
+    config = Config(str(Path(__file__).resolve().parents[1] / "alembic.ini"))
+
+    command.upgrade(config, "20260820_0033")
+
+    with sqlite3.connect(db_path) as connection:
+        indexes = {
+            row[1]: row[2]
+            for row in connection.execute("PRAGMA index_list(products)")
+        }
+        connection.execute(
+            "INSERT INTO products (id,jan,qinsi_product_code,internal_sku) VALUES (11,'020373218215','QINSI-NEW','NJ-NEW-000011')"
+        )
+        try:
+            connection.execute(
+                "INSERT INTO products (id,jan,qinsi_product_code,internal_sku) VALUES (12,'0490000000001','QINSI-NEW','NJ-NEW-000012')"
+            )
+        except sqlite3.IntegrityError:
+            qinsi_code_still_unique = True
+        else:
+            qinsi_code_still_unique = False
+        rows = connection.execute("SELECT id,jan,qinsi_product_code FROM products ORDER BY id").fetchall()
+        receipt_product_id = connection.execute("SELECT product_id FROM receipt_items WHERE id=20").fetchone()[0]
+        purchase_product_id = connection.execute("SELECT product_id FROM purchase_batch_items WHERE id=30").fetchone()[0]
+        revision = connection.execute("SELECT version_num FROM alembic_version").fetchone()
+
+    assert indexes["ix_products_jan_not_null"] == 0
+    assert indexes["uq_products_qinsi_code_not_null"] == 1
+    assert ("uq_products_jan_not_null" not in indexes)
+    assert rows[:2] == [(10, "020373218215", "QINSI-OLD"), (11, "020373218215", "QINSI-NEW")]
+    assert qinsi_code_still_unique is True
+    assert receipt_product_id == purchase_product_id == 10
+    assert revision == ("20260820_0033",)
+
+
+def test_0033_repairs_schema_when_0032_was_marked_but_table_unique_remained(tmp_path, monkeypatch):
+    db_path = tmp_path / "from-0032-table-unique.sqlite3"
+    with sqlite3.connect(db_path) as connection:
+        connection.executescript("""
+        CREATE TABLE alembic_version (version_num VARCHAR(32) NOT NULL PRIMARY KEY);
+        INSERT INTO alembic_version VALUES ('20260820_0032');
+        CREATE TABLE products (
+            id INTEGER PRIMARY KEY,
+            jan VARCHAR(32) UNIQUE,
+            qinsi_product_code VARCHAR(100),
+            internal_sku VARCHAR(32) NOT NULL
+        );
+        CREATE UNIQUE INDEX uq_products_internal_sku ON products (internal_sku);
+        CREATE UNIQUE INDEX uq_products_qinsi_code_not_null ON products (qinsi_product_code) WHERE qinsi_product_code IS NOT NULL;
+        INSERT INTO products VALUES (10,'020373218215','QINSI-OLD','NJ-OLD-000010');
+        """)
+    monkeypatch.setenv("JBA_DATABASE_URL", f"sqlite:///{db_path.as_posix()}")
+    config = Config(str(Path(__file__).resolve().parents[1] / "alembic.ini"))
+
+    command.upgrade(config, "20260820_0033")
+
+    with sqlite3.connect(db_path) as connection:
+        table_sql = connection.execute("SELECT sql FROM sqlite_master WHERE type='table' AND name='products'").fetchone()[0]
+        indexes = {
+            row[1]: row[2]
+            for row in connection.execute("PRAGMA index_list(products)")
+        }
+        connection.execute(
+            "INSERT INTO products (id,jan,qinsi_product_code,internal_sku) VALUES (11,'020373218215','QINSI-NEW','NJ-NEW-000011')"
+        )
+        rows = connection.execute("SELECT id,jan,qinsi_product_code FROM products ORDER BY id").fetchall()
+        revision = connection.execute("SELECT version_num FROM alembic_version").fetchone()
+
+    assert "UNIQUE" not in table_sql.upper()
+    assert indexes["ix_products_jan_not_null"] == 0
+    assert indexes["uq_products_qinsi_code_not_null"] == 1
+    assert rows == [(10, "020373218215", "QINSI-OLD"), (11, "020373218215", "QINSI-NEW")]
+    assert revision == ("20260820_0033",)
 
 
 def test_upgrade_from_current_0004_preserves_rows_and_defers_visual_hashes(tmp_path, monkeypatch):
@@ -78,7 +238,7 @@ def test_upgrade_from_current_0004_preserves_rows_and_defers_visual_hashes(tmp_p
         revision = connection.execute("SELECT version_num FROM alembic_version").fetchone()
     assert row == ("old.jpg", "abc123", None, None, "none")
     assert status == ("ready", "not_packaged", "not_matched", "not_exported")
-    assert revision == ("20260731_0028",)
+    assert revision == (HEAD_REVISION,)
 
 
 def test_upgrade_from_0007_backfills_stable_unique_internal_skus(tmp_path, monkeypatch):
@@ -107,7 +267,7 @@ def test_upgrade_from_0007_backfills_stable_unique_internal_skus(tmp_path, monke
     assert rows[0][:3] == (1, None, "Q-OLD-1") and rows[1][:3] == (2, "00123457", "Q-OLD-2")
     assert rows[0][3] == "NJ-20260715-000001" and rows[1][3] == "NJ-20260715-000002"
     assert internal_sku_column[3] == 1
-    assert revision == ("20260731_0028",)
+    assert revision == (HEAD_REVISION,)
 
 
 def test_upgrade_from_0008_creates_and_seeds_location_master(tmp_path, monkeypatch):
@@ -123,7 +283,7 @@ def test_upgrade_from_0008_creates_and_seeds_location_master(tmp_path, monkeypat
         revision = connection.execute("SELECT version_num FROM alembic_version").fetchone()
     assert len(rows) == 9
     assert rows[0] == ("QW-2025-QIANYU", "2025千羽", "qinsi_warehouse", 1)
-    assert revision == ("20260731_0028",)
+    assert revision == (HEAD_REVISION,)
 
 
 def test_upgrade_from_0009_creates_purchase_batch_tables(tmp_path, monkeypatch):
@@ -138,7 +298,7 @@ def test_upgrade_from_0009_creates_purchase_batch_tables(tmp_path, monkeypatch):
         tables = {row[0] for row in connection.execute("SELECT name FROM sqlite_master WHERE type='table'")}
         revision = connection.execute("SELECT version_num FROM alembic_version").fetchone()
     assert {"purchase_batches", "purchase_batch_items"} <= tables
-    assert revision == ("20260731_0028",)
+    assert revision == (HEAD_REVISION,)
 
 
 def test_upgrade_from_0010_creates_qinsi_purchase_export_loop_tables(tmp_path, monkeypatch):
@@ -151,7 +311,7 @@ def test_upgrade_from_0010_creates_qinsi_purchase_export_loop_tables(tmp_path, m
         tables = {row[0] for row in connection.execute("SELECT name FROM sqlite_master WHERE type='table'")}
         revision = connection.execute("SELECT version_num FROM alembic_version").fetchone()
     assert {"qinsi_purchase_export_jobs", "qinsi_purchase_export_lines", "qinsi_purchase_export_line_sources"} <= tables
-    assert revision == ("20260731_0028",)
+    assert revision == (HEAD_REVISION,)
 
 
 def test_upgrade_from_0011_creates_price_lookup_p0_tables(tmp_path, monkeypatch):
@@ -166,7 +326,7 @@ def test_upgrade_from_0011_creates_price_lookup_p0_tables(tmp_path, monkeypatch)
         product_columns = {row[1] for row in connection.execute("PRAGMA table_info(products)")}
     assert {"price_provider_attempts", "price_lookup_histories"} <= tables
     assert {"display_name", "main_image_path", "main_image_source_url", "product_data_confirmed"} <= product_columns
-    assert revision == ("20260731_0028",)
+    assert revision == (HEAD_REVISION,)
 
 
 def test_upgrade_from_0012_preserves_receipt_product_and_purchase_text(tmp_path, monkeypatch):
@@ -178,11 +338,11 @@ def test_upgrade_from_0012_preserves_receipt_product_and_purchase_text(tmp_path,
         CREATE TABLE stores (id INTEGER PRIMARY KEY, name VARCHAR(255) NOT NULL, created_at DATETIME NOT NULL);
         CREATE TABLE receipt_batches (id INTEGER PRIMARY KEY, batch_no VARCHAR(40) NOT NULL);
         CREATE TABLE receipts (id INTEGER PRIMARY KEY, batch_id INTEGER NOT NULL, raw_store_name VARCHAR(255));
-        CREATE TABLE products (id INTEGER PRIMARY KEY, internal_sku VARCHAR(32) NOT NULL, name_cn VARCHAR(255));
+        CREATE TABLE products (id INTEGER PRIMARY KEY, internal_sku VARCHAR(32) NOT NULL, jan VARCHAR(32), name_cn VARCHAR(255));
         CREATE TABLE purchase_batches (id INTEGER PRIMARY KEY, receipt_id INTEGER NOT NULL, store_name VARCHAR(255));
         INSERT INTO receipt_batches VALUES (1,'OLD-BATCH');
         INSERT INTO receipts VALUES (1,1,'旧门店原始文字');
-        INSERT INTO products VALUES (1,'NJ-20260716-000001','旧商品');
+        INSERT INTO products VALUES (1,'NJ-20260716-000001',NULL,'旧商品');
         INSERT INTO purchase_batches VALUES (1,1,'旧采购门店文字');
         """)
     monkeypatch.setenv("JBA_DATABASE_URL", f"sqlite:///{db_path.as_posix()}")
@@ -197,7 +357,7 @@ def test_upgrade_from_0012_preserves_receipt_product_and_purchase_text(tmp_path,
     assert receipt == (1, "旧门店原始文字", None)
     assert product == (1, "NJ-20260716-000001", "旧商品")
     assert purchase == (1, "旧采购门店文字", None)
-    assert revision == ("20260731_0028",)
+    assert revision == (HEAD_REVISION,)
 
 
 def test_0021_backfills_safe_qinsi_derived_barcode_and_allows_null_field_store(
@@ -213,9 +373,9 @@ def test_0021_backfills_safe_qinsi_derived_barcode_and_allows_null_field_store(
             """
             INSERT INTO products (
                 internal_sku, jan, qinsi_product_code, product_data_confirmed,
-                name_locked, main_image_locked,
+                name_locked, main_image_locked, needs_review, has_jan,
                 status, source, product_origin, created_at, updated_at
-            ) VALUES (?, NULL, ?, 0, 0, 0, 'active', 'qinsi_import', 'qinsi', ?, ?)
+            ) VALUES (?, NULL, ?, 0, 0, 0, 0, 0, 'active', 'qinsi_import', 'qinsi', ?, ?)
             """,
             (
                 "NJ-20260720-900001",
@@ -228,15 +388,16 @@ def test_0021_backfills_safe_qinsi_derived_barcode_and_allows_null_field_store(
             """
             INSERT INTO products (
                 internal_sku, jan, qinsi_product_code, product_data_confirmed,
-                name_locked, main_image_locked,
+                name_locked, main_image_locked, needs_review, has_jan,
                 status, source, product_origin, created_at, updated_at
-            ) VALUES (?, ?, ?, 0, 0, 0, 'active', 'qinsi_import', 'qinsi', ?, ?)
+            ) VALUES (?, ?, ?, 0, 0, 0, 0, ?, 'active', 'qinsi_import', 'qinsi', ?, ?)
             """,
             (
                 (
                     "NJ-20260720-900002",
                     None,
                     "/4901234567894",
+                    0,
                     "2026-07-20 00:00:00",
                     "2026-07-20 00:00:00",
                 ),
@@ -244,6 +405,7 @@ def test_0021_backfills_safe_qinsi_derived_barcode_and_allows_null_field_store(
                     "NJ-20260720-900003",
                     "4901234567894",
                     "Q-CONFLICT",
+                    1,
                     "2026-07-20 00:00:00",
                     "2026-07-20 00:00:00",
                 ),
@@ -286,7 +448,7 @@ def test_0021_backfills_safe_qinsi_derived_barcode_and_allows_null_field_store(
     assert store_column[3] == 0
     assert alias_count == 1
     assert conflict_alias_count == 0
-    assert revision == ("20260731_0028",)
+    assert revision == (HEAD_REVISION,)
 
 
 def test_0022_moves_product_note_to_name_ja_with_conflict_audit_and_stats(
@@ -303,8 +465,9 @@ def test_0022_moves_product_note_to_name_ja_with_conflict_audit_and_stats(
             INSERT INTO products (
                 internal_sku, name_cn, name_ja, display_name, product_note,
                 product_data_confirmed, name_locked, main_image_locked,
+                needs_review, has_jan,
                 status, source, product_origin, created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, 0, 0, 0, 'active', 'qinsi_import', 'qinsi', ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, 0, 0, 0, 0, 0, 'active', 'qinsi_import', 'qinsi', ?, ?)
             """,
             (
                 (

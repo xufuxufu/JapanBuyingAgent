@@ -51,6 +51,9 @@ class DownloadedImage:
     extension: str
     mime_type: str
     source_url: str
+    width: int
+    height: int
+    quality: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -79,18 +82,13 @@ def _product_source_image_url(product: Product | None) -> tuple[str | None, str 
 def product_display_image(product: Product | None) -> ProductDisplayImage:
     if product is None:
         return ProductDisplayImage(None, "placeholder")
-    if product.display_image_url and (
-        _stored_product_image_exists(product.local_image_path)
-        or _stored_product_image_exists(product.main_image_path)
-        or product.display_image_url.startswith(("http://", "https://"))
-    ):
-        status = "remote" if product.display_image_url.startswith(("http://", "https://")) else "local"
-        return ProductDisplayImage(product.display_image_url, status, "display_image_url")
     if product.local_image_path and product.id and _stored_product_image_exists(product.local_image_path):
         version = f"?v={(product.image_sha256 or '')[:12]}" if product.image_sha256 else ""
         return ProductDisplayImage(f"/product-local-images/{product.id}{version}", "local", "local_image_path")
     if product.main_image_path and product.id and _stored_product_image_exists(product.main_image_path):
         return ProductDisplayImage(f"/product-images/{product.id}", "local", "main_image_path")
+    if product.display_image_url and product.display_image_url.startswith(("http://", "https://")):
+        return ProductDisplayImage(product.display_image_url, "remote", "display_image_url")
     source_url, source_field = _product_source_image_url(product)
     if source_url:
         return ProductDisplayImage(source_url, "remote", source_field)
@@ -198,7 +196,20 @@ def _sniff_image(content: bytes) -> tuple[str, str]:
     raise ImageLocalizationError("下载内容不是真实支持的图片格式")
 
 
-def _verify_decodable_image(content: bytes, expected_mime: str) -> None:
+def _image_quality(width: int, height: int) -> str:
+    minimum = min(width, height)
+    if minimum < 300:
+        return "thumbnail"
+    if minimum < 600:
+        return "low"
+    return "normal"
+
+
+def _quality_score(value: str | None) -> int:
+    return {"thumbnail": 0, "low": 1, "normal": 2, "original": 3}.get(value or "", 2)
+
+
+def _verify_decodable_image(content: bytes, expected_mime: str) -> tuple[int, int, str]:
     format_mimes = {
         "JPEG": "image/jpeg",
         "PNG": "image/png",
@@ -212,7 +223,9 @@ def _verify_decodable_image(content: bytes, expected_mime: str) -> None:
                 raise ImageLocalizationError("图片解码格式与文件头不一致")
             if image.width * image.height > 50_000_000:
                 raise ImageLocalizationError("图片像素尺寸超过安全上限")
+            width, height = image.width, image.height
             image.verify()
+            return width, height, _image_quality(width, height)
     except ImageLocalizationError:
         raise
     except (UnidentifiedImageError, OSError, ValueError) as exc:
@@ -263,7 +276,7 @@ def download_remote_image(
                 if not content:
                     raise ImageLocalizationError("图片响应为空")
                 sniffed_mime, extension = _sniff_image(content)
-                _verify_decodable_image(content, sniffed_mime)
+                width, height, quality = _verify_decodable_image(content, sniffed_mime)
                 declared_mime = response.headers.get("content-type", "").split(";", 1)[0].strip().casefold()
                 if declared_mime == "image/jpg":
                     declared_mime = "image/jpeg"
@@ -275,6 +288,9 @@ def download_remote_image(
                     extension=extension,
                     mime_type=sniffed_mime,
                     source_url=current_url,
+                    width=width,
+                    height=height,
+                    quality=quality,
                 )
     raise ImageLocalizationError("图片重定向次数过多")
 
@@ -418,10 +434,23 @@ def process_product_image_job(
     if current_source_url != source_url:
         return "STALE"
     image = download_remote_image(source_url, client=client, resolver=resolver)
+    if (
+        product.local_image_path
+        and _stored_product_image_exists(product.local_image_path)
+        and _quality_score(image.quality) < _quality_score(product.image_quality)
+    ):
+        product.image_localization_status = "COMPLETED"
+        product.image_localization_source_url = source_url
+        product.image_localized_at = utcnow()
+        product.image_localization_error = None
+        return "COMPLETED"
     destination = _content_path(product, image)
     _atomic_write(destination, image.content)
     product.local_image_path = destination.relative_to(PROJECT_ROOT.resolve()).as_posix()
     product.image_sha256 = image.sha256
+    product.image_width = image.width
+    product.image_height = image.height
+    product.image_quality = image.quality
     product.display_image_url = f"/product-local-images/{product.id}?v={image.sha256[:12]}"
     product.image_localization_status = "COMPLETED"
     product.image_localization_source_url = source_url

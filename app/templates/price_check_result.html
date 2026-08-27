@@ -38,61 +38,27 @@
 </section>
 
 <section>
-  <div class="section-head"><div><h2>当前可购买</h2><p class="muted">有货、价格有效且链接可打开；按到手总价排序，最多显示 3 个</p></div><span class="badge">当前查询最低价</span></div>
-  {% if view.trusted_offers %}
-  <div class="offer-grid">
-    {% for offer in view.trusted_offers %}
-    <article class="card offer-card">
-      {% if offer.image_url %}<img src="{{ offer.image_url }}" alt="{{ offer.title }}" loading="lazy" referrerpolicy="no-referrer">{% else %}<div class="offer-image-empty">暂无图片</div>{% endif %}
-      <div class="offer-body"><span class="badge">{{ offer.marketplace.name }}</span><h3>{{ offer.title }}</h3><strong class="offer-total">到手 ¥{{ '{:,}'.format(offer.total_price) }}</strong><p>商品 ¥{{ '{:,}'.format(offer.item_price) }} · 运费 ¥{{ '{:,}'.format(offer.shipping_price) }}</p><p class="muted">{{ offer.seller or '店铺未提供' }} · {{ offer.fetched_at|tokyo_datetime(true) }}</p><a class="button" href="{{ offer.url }}" target="_blank" rel="noopener noreferrer">打开商品页</a></div>
-    </article>
+  <div class="section-head"><div><h2>线上商品结果一览</h2><p class="muted">当前按商品价格排序，未计入配送费。</p></div></div>
+  {% if view.result_offers %}
+  <div class="offer-list">
+    {% for offer in view.result_offers %}
+    <a class="offer-result-row" href="{{ offer.url }}" target="_blank" rel="noopener noreferrer">
+      {% if offer.image_url %}<img src="{{ offer.image_url }}" alt="{{ offer.title }}" loading="lazy" referrerpolicy="no-referrer">{% else %}<div class="offer-image-empty">暂无图</div>{% endif %}
+      <div class="offer-result-main">
+        <h3>{{ offer.title }}</h3>
+        <p>{{ offer.platform_display_name }} · {{ offer.seller_display_name }}</p>
+        {% if offer.pack_quantity and offer.pack_quantity > 1 %}
+        <small>{{ offer.pack_quantity }}个装 ¥{{ offer.listing_price_text }}</small>
+        {% endif %}
+      </div>
+      <div class="offer-result-price">
+        <strong>{% if offer.display_price is not none %}¥{{ offer.display_price_text }}{% if offer.normalized_unit_price %}/个{% endif %}{% else %}暂无{% endif %}</strong>
+        <small>{{ offer.stock_label }}</small>
+      </div>
+    </a>
     {% endfor %}
   </div>
-  {% else %}<div class="card info">当前没有通过 JAN、库存、商品状态和规格校验的可购买结果。</div>{% endif %}
-</section>
-
-{% if view.incomplete_offers %}
-<section class="card incomplete-results">
-  <details>
-    <summary>信息不完整（{{ view.incomplete_offers|length }}）</summary>
-    <div class="offer-list-compact">
-      {% for offer in view.incomplete_offers %}
-      <article class="offer-row-compact">
-        {% if offer.image_url %}<img src="{{ offer.image_url }}" alt="{{ offer.title }}" loading="lazy" referrerpolicy="no-referrer">{% else %}<div class="offer-image-empty">暂无图片</div>{% endif %}
-        <div><span class="badge">{{ offer.marketplace.name }}</span><h3>{{ offer.title }}</h3><p>商品价 ¥{{ '{:,}'.format(offer.item_price) }}{% if offer.shipping_known %} · 运费 ¥{{ '{:,}'.format(offer.shipping_price) }}{% else %} · 运费：进入商城确认{% endif %}</p><p class="muted">{{ offer.seller or '店铺未提供' }} · {{ offer.stock_status or '库存未知' }}</p></div>
-        <a class="button secondary compact" href="{{ offer.url }}" target="_blank" rel="noopener noreferrer">打开</a>
-      </article>
-      {% endfor %}
-    </div>
-  </details>
-</section>
-{% endif %}
-
-{% if view.flagged_offers %}
-<section class="card flagged-results">
-  <details><summary>缺货/不可信结果 {{ view.flagged_offers|length }} 条</summary>
-    {% for offer in view.flagged_offers %}<div class="flagged-row"><div><strong>{{ offer.title }}</strong><small>{{ offer.marketplace.name }} · 到手 ¥{{ '{:,}'.format(offer.total_price) }}</small></div><span class="badge warning">{{ offer.exclusion_reason }}</span></div>{% endfor %}
-  </details>
-</section>
-{% endif %}
-
-{% if view.fallback_results %}
-<section class="card">
-  <h2>手动核对 / 平台搜索</h2>
-  <p><span class="badge warning">SEARCH_ONLY</span> <span class="muted">API未配置或需人工核对；JAN 未验证，不能自动采用。</span></p>
-  <div class="button-row">
-    {% for fallback in view.fallback_results %}
-    <a class="button secondary" href="{{ fallback.product_url }}" target="_blank" rel="noopener noreferrer">{{ fallback.platform }} 搜索</a>
-    {% endfor %}
-  </div>
-</section>
-{% endif %}
-
-<section class="card">
-  <h2>查询状态</h2>
-  <div class="provider-status-list">
-    {% for attempt in view.attempts %}<div class="provider-status"><span><strong>{{ attempt.marketplace.name if attempt.marketplace else attempt.provider_code }}</strong><small>{{ attempt.message or (attempt.result_count ~ ' 个原始结果') }}</small></span><span class="badge provider-{{ attempt.status }}">{{ provider_status_cn.get(attempt.status, attempt.status) }}</span></div>{% endfor %}
-  </div>
+  {% else %}<div class="card info">当前没有线上商品结果。</div>{% endif %}
 </section>
 <div class="scan-bottom-action"><a class="button" href="/price-check">继续扫码</a></div>
 {% endblock %}

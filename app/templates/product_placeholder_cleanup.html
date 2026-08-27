@@ -1,0 +1,45 @@
+{% extends "base.html" %}
+{% block title %}清理临时缺商品{% endblock %}
+{% block content %}
+<div class="section-head"><div><h1>清理临时缺商品</h1><p class="muted">仅处理同 JAN 的缺商品占位 Product 与唯一正式秦丝 Product。</p></div><a class="button secondary" href="/products">返回商品</a></div>
+{% if message %}<div class="success message">{{ message }}</div>{% endif %}
+{% if error %}<div class="error message">{{ error }}</div>{% endif %}
+<section class="card">
+  <div class="section-head"><div><h2>预览统计</h2><p class="muted">确认前不会修改商品或采购记录。</p></div></div>
+  <div class="summary-grid">
+    <span><strong>{{ stats.temporary_product_count }}</strong>临时商品总数</span>
+    <span><strong>{{ stats.direct_delete_count }}</strong>可直接删除</span>
+    <span><strong>{{ stats.purchase_needs_migration_count }}</strong>有采购需迁移</span>
+    <span><strong>{{ stats.auto_migrate_count }}</strong>可唯一自动迁移</span>
+    <span><strong>{{ stats.multiple_formal_count }}</strong>同JAN多正式需人工</span>
+    <span><strong>{{ stats.no_formal_count }}</strong>无正式商品对应</span>
+    <span><strong>{{ stats.estimated_delete_count }}</strong>预计删除数量</span>
+    <span><strong>{{ stats.estimated_migration_association_count }}</strong>预计迁移采购关联数量</span>
+  </div>
+  <form method="post" action="/products/placeholder-cleanup/confirm" onsubmit="return confirm('将按当前预览执行自动清理。继续？');">
+    <label>操作人<input name="actor" value="system"></label>
+    <button type="submit">确认执行自动清理</button>
+  </form>
+</section>
+<section class="card table-wrap">
+  <table>
+    <thead><tr><th>临时Product.id</th><th>JAN</th><th>临时名称</th><th>采购关联数</th><th>正式Product.id</th><th>正式秦丝商品名</th><th>qinsi_goods_no</th><th>处理方式</th></tr></thead>
+    <tbody>
+    {% for row in preview.rows %}
+      <tr>
+        <td><a href="/products/{{ row.old_product_id }}">{{ row.old_product_id }}</a></td>
+        <td><code>{{ row.jan }}</code></td>
+        <td>{{ row.placeholder_name }}</td>
+        <td>{{ row.purchase_association_count }}</td>
+        <td>{% if row.new_product_id %}<a href="/products/{{ row.new_product_id }}">{{ row.new_product_id }}</a>{% else %}—{% endif %}</td>
+        <td>{{ row.qinsi_product_name or '—' }}</td>
+        <td>{{ row.qinsi_goods_no or '—' }}</td>
+        <td>{{ action_labels.get(row.action, row.action) }}</td>
+      </tr>
+    {% else %}
+      <tr><td colspan="8">暂无临时缺商品候选。</td></tr>
+    {% endfor %}
+    </tbody>
+  </table>
+</section>
+{% endblock %}
