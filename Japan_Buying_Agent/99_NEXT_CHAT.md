@@ -1,5 +1,7 @@
 # Next Chat
 
+Deprecated historical handoff, last reviewed 2026-08-27. Use `../AI_HANDOFF.md` for current model-agnostic handoff.
+
 ## Start Here
 
 - Current branch: `dev`.

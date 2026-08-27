@@ -1,5 +1,7 @@
 # Decisions
 
+Deprecated historical note, last reviewed 2026-08-27. Current business rules live in `../BUSINESS_RULES.md`; keep this file only as early decision history.
+
 1. 秦丝是实时可售库存权威。
 2. 本地不维护销售扣减后的实时库存。
 3. 商品使用稳定 `internal_sku`。

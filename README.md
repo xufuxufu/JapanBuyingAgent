@@ -1,6 +1,21 @@
-# Japan Buying Agent — Receipt MVP
+# Japan Buying Agent
 
-Independent FastAPI/SQLite MVP for uploading Japanese receipt images, retaining originals, viewing receipt history, and transactionally importing manually obtained GPT JSON.
+FastAPI/SQLite field purchasing assistant for Japanese buying work: receipts, local product handling, JAN/barcode lookup, price/enrichment, purchase batches, and QinSi import/export support.
+
+## Documentation
+
+New developer and AI handoff entry:
+
+- [PROJECT_BIBLE.md](PROJECT_BIBLE.md) - positioning, boundaries, and rules that must not be broken.
+- [AI_HANDOFF.md](AI_HANDOFF.md) - first file for Claude Code, Codex, ChatGPT, or another coding assistant.
+- [BUSINESS_RULES.md](BUSINESS_RULES.md) - QinSi, JAN/barcode, receipt, purchase, image, and conflict rules.
+- [ARCHITECTURE.md](ARCHITECTURE.md) - current modules, routes/services/templates/migrations/tests, and data flows.
+- [FEATURES_CURRENT.md](FEATURES_CURRENT.md) - implemented feature inventory.
+- [DATA_MODEL.md](DATA_MODEL.md) - core models, relationships, unique/index constraints.
+- [OPERATIONS.md](OPERATIONS.md) - clone/setup/migration/start/test guide for a new machine.
+- [KNOWN_ISSUES_AND_ROADMAP.md](KNOWN_ISSUES_AND_ROADMAP.md) - unresolved gaps only.
+
+Older phase notes under `docs/` and `Japan_Buying_Agent/` are historical references. When they conflict with current code, migrations, tests, or the docs above, trust the current sources and update the stale note.
 
 ## Windows setup
 
@@ -13,13 +28,15 @@ run_dev_8020_py314.bat
 
 Open `http://127.0.0.1:8020`. Health endpoint: `GET /health`.
 
+The dev script does not use `--reload`; restart after Python code changes with `restart_dev_8020_py314.bat`.
+
 ## Test
 
 ```powershell
 .\.venv\Scripts\python.exe -m pytest -q --basetemp=.pytest-tmp
 ```
 
-The default database is `data/db/japan_buying_agent.sqlite3`. Override only for this project with `JBA_DATABASE_URL`. Uploaded originals and previews stay under `data/uploads/`.
+The default database is `data/db/japan_buying_agent.sqlite3`. Override only for this project with `JBA_DATABASE_URL`. Uploaded originals and previews stay under `data/uploads/`. Do not commit SQLite files, uploads, product images, `.env`, or private QinSi workbooks.
 
 HEIC is accepted only when the installed Pillow build has a compatible HEIC decoder. Unsupported HEIC uploads return a clear message and do not create a batch.
 

@@ -1,5 +1,7 @@
 # Data architecture reservations
 
+Deprecated historical note, last reviewed 2026-08-27. This file preserves useful early architecture rationale, but it contains outdated "future phase" statements. Use `../ARCHITECTURE.md`, `../DATA_MODEL.md`, and `../BUSINESS_RULES.md` as the current entry points.
+
 ## Ownership boundary
 
 - QinSi owns current inventory balances. This local application never mirrors or overwrites QinSi's current inventory balance.

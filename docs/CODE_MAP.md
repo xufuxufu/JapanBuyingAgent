@@ -1,5 +1,7 @@
 # Code Map
 
+Deprecated historical note, last reviewed 2026-08-27. This compact map is still useful, but `../ARCHITECTURE.md` and `../FEATURES_CURRENT.md` are now the maintained current entries.
+
 | 业务模块 | 主要文件 | 核心函数或职责 | 相关测试文件 |
 |---|---|---|---|
 | 小票 | `app/main.py`、`app/services.py`、`app/models.py`、`app/schemas.py`、`app/templates/detail.html`、`app/templates/product_enrichment.html` | 上传、预处理、识别包、JSON 导入、审核、确认、原始资料留存；任务页小票入口；小票详情真实商品行 | `tests/test_receipts.py`、`tests/test_stage2.py`、`tests/test_async_upload.py`、`tests/test_workflow_dedup_zip.py`、`tests/test_product_import_matching_tracking.py` |

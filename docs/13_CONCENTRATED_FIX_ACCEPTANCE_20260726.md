@@ -1,5 +1,7 @@
 # 2026-07-26 Concentrated Fix Acceptance
 
+Deprecated historical acceptance note, last reviewed 2026-08-27. Use `../FEATURES_CURRENT.md` for current implemented features and `../KNOWN_ISSUES_AND_ROADMAP.md` for unresolved items.
+
 ## 已实现并由自动测试验证
 
 - 现场采购 iPhone P0：吊牌照片返回网页后先显示保存状态，读取 Blob、预览、IndexedDB 写入、服务器待同步状态均有安全诊断；本地保存成功即可下一件。

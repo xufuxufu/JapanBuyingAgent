@@ -1,5 +1,7 @@
 # Concentrated Fix Acceptance 2026-07-26
 
+Deprecated historical acceptance note, last reviewed 2026-08-27. Use `../FEATURES_CURRENT.md` and `../KNOWN_ISSUES_AND_ROADMAP.md` for current status.
+
 See also `docs/13_CONCENTRATED_FIX_ACCEPTANCE_20260726.md`.
 
 ## Verified By Automation

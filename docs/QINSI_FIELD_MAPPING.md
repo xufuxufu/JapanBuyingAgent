@@ -1,5 +1,7 @@
 # QinSi field mapping
 
+Deprecated historical note, last reviewed 2026-08-27. Current QinSi import/export behavior is documented in `../BUSINESS_RULES.md`, `../ARCHITECTURE.md`, and `../DATA_MODEL.md`. This file remains a field-mapping reference, but statements saying import/export is only future work are outdated.
+
 This mapping is a field reference for future import/export work. No workbook row is imported in this MVP.
 
 ## Locked identifier mapping

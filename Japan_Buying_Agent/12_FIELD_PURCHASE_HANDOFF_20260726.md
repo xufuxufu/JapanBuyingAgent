@@ -1,5 +1,7 @@
 # Field Purchase Handoff 2026-07-26
 
+Deprecated historical handoff, last reviewed 2026-08-27. Use `../AI_HANDOFF.md`, `../FEATURES_CURRENT.md`, and `../BUSINESS_RULES.md` for current behavior.
+
 ## Root Fixes
 
 - iPhone scan feedback is visible outside the video frame: fixed high-z Toast `✓ 已识别 {JAN}`, green scan-frame flash, AudioContext unlock on `开始扫码`, short success tone, and about 950ms decode pause after success. It does not depend on vibration; Android vibration remains an optional enhancement.

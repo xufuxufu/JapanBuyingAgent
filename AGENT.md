@@ -1,5 +1,7 @@
 # Agent Rules
 
+Deprecated historical agent note, last reviewed 2026-08-27. Use `AI_HANDOFF.md` first for current model-agnostic handoff. Some phase restrictions below are obsolete because price lookup, monitoring, QinSi import/export, and product workflows now exist.
+
 This repository is the independent **Japan Buying Agent** project.
 
 - Never read, import, modify, overwrite, or connect to the video-processing project or its database.

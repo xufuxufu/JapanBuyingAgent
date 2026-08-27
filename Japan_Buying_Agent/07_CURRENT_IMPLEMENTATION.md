@@ -1,5 +1,7 @@
 # Current Implementation
 
+Deprecated historical implementation snapshot, last reviewed 2026-08-27. Use `../FEATURES_CURRENT.md` and `../ARCHITECTURE.md` for the current implementation inventory.
+
 Updated: 2026-07-26
 
 ## 已实现并自动验证

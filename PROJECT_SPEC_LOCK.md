@@ -1,5 +1,7 @@
 # Project Specification Lock
 
+Deprecated historical lock, last reviewed 2026-08-27. This file contains early phase restrictions that are no longer current, including statements that price search, monitoring, and formal QinSi import are not implemented. Use `PROJECT_BIBLE.md`, `BUSINESS_RULES.md`, and `AI_HANDOFF.md` as the current source.
+
 ## Identity and isolation
 
 - Project: `Japan Buying Agent`

@@ -1,5 +1,7 @@
 # Codex Context
 
+Deprecated historical Codex-specific context, last reviewed 2026-08-27. Use `AI_HANDOFF.md`, `PROJECT_BIBLE.md`, and `BUSINESS_RULES.md` first. The migration head and completed-feature list below are stale.
+
 ## 项目
 
 - 项目：Japan Buying Agent
