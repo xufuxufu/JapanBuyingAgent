@@ -154,7 +154,12 @@ class PurchaseFact:
     reference_unit_price: Decimal | None
 
 
-def purchase_facts(session: Session, *, product_id: int | None = None, store_id: int | None = None) -> list[PurchaseFact]:
+def purchase_facts(
+    session: Session, *, product_id: int | None = None, product_ids: list[int] | None = None,
+    store_id: int | None = None,
+) -> list[PurchaseFact]:
+    if product_ids is not None and not product_ids:
+        return []
     query = (
         select(PurchaseBatchItem)
         .join(PurchaseBatch, PurchaseBatch.id == PurchaseBatchItem.purchase_batch_id)
@@ -169,6 +174,8 @@ def purchase_facts(session: Session, *, product_id: int | None = None, store_id:
     )
     if product_id is not None:
         query = query.where(PurchaseBatchItem.product_id == product_id)
+    elif product_ids is not None:
+        query = query.where(PurchaseBatchItem.product_id.in_(product_ids))
     items = list(session.scalars(query.order_by(PurchaseBatch.purchased_at, PurchaseBatchItem.id)))
     facts = []
     for item in items:
@@ -202,6 +209,30 @@ def product_store_summaries(session: Session, product_id: int) -> list[dict]:
             "latest_batch": latest.batch, "latest_receipt": latest.receipt,
         })
     return sorted(rows, key=lambda row: (row["latest_date"] or datetime.min), reverse=True)
+
+
+def product_store_summaries_bulk(session: Session, product_ids: list[int]) -> dict[int, list[dict]]:
+    """Same per-store rows as product_store_summaries, batched for many products in one query."""
+    if not product_ids:
+        return {}
+    groups: dict[int, dict[int, list[PurchaseFact]]] = {product_id: {} for product_id in product_ids}
+    for fact in purchase_facts(session, product_ids=product_ids):
+        if fact.store is None:
+            continue
+        groups[fact.item.product_id].setdefault(fact.store.id, []).append(fact)
+    result: dict[int, list[dict]] = {}
+    for product_id, by_store in groups.items():
+        rows = []
+        for facts in by_store.values():
+            latest = max(facts, key=_date_key)
+            prices = [fact.reference_unit_price for fact in facts if fact.reference_unit_price is not None]
+            rows.append({
+                "store": latest.store, "purchase_count": len({fact.batch.id for fact in facts}),
+                "quantity": sum(fact.item.quantity for fact in facts), "minimum_price": min(prices) if prices else None,
+                "latest_price": latest.reference_unit_price, "latest_date": latest.batch.purchased_at,
+            })
+        result[product_id] = sorted(rows, key=lambda row: (row["latest_date"] or datetime.min), reverse=True)
+    return result
 
 
 def store_product_summaries(session: Session, store_id: int) -> tuple[list[dict], list[PurchaseFact]]:

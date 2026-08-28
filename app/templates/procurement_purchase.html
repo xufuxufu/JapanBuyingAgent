@@ -1,0 +1,45 @@
+{% extends "base.html" %}
+{% block title %}{{ store.display_name if store else '未确定来源' }}采购清单{% endblock %}
+{% block content %}
+<div class="section-head"><div><h1>{{ store.display_name if store else '未确定来源' }}采购清单</h1><p class="muted">只勾选实际买到的商品；没买到的会继续留在待采购里。</p></div><a class="button secondary" href="/procurement-demands?view=planned&group_by=store">返回已安排采购</a></div>
+{% if error %}<div class="warning"><strong>提交失败：</strong>{{ error }}</div>{% endif %}
+
+<form id="purchaseForm" method="post" action="/procurement-demands/purchase">
+  <input type="hidden" name="store_id" value="{{ store_id_param }}">
+  <input type="hidden" name="executions_json" id="purchaseExecutionsInput">
+  <section class="pd-purchase-list">
+    {% for plan in plans %}
+    {% set summary = summaries.get(plan.id) %}
+    <article class="card pd-purchase-card" data-plan-id="{{ plan.id }}" data-remaining="{{ summary.remaining_quantity }}">
+      <div class="pd-card-main">
+        {% if plan.product and plan.product.preferred_image_url %}
+        <img class="product-thumb" loading="lazy" src="{{ plan.product.preferred_image_url }}" alt="商品主图">
+        {% else %}<div class="product-image-empty product-thumb">无图</div>{% endif %}
+        <div class="pd-card-info">
+          <h2>{{ plan.product_name_snapshot }}</h2>
+          <p class="muted">{{ plan.jan_snapshot or 'JAN 未填写' }}</p>
+          <p class="pd-purchase-qty-grid"><span>计划：<strong>{{ summary.planned_quantity }}</strong></span><span>已买：<strong>{{ summary.purchased_quantity }}</strong></span><span>剩余：<strong>{{ summary.remaining_quantity }}</strong></span></p>
+        </div>
+      </div>
+      <div class="pd-purchase-actions">
+        <label class="pd-select"><input type="checkbox" class="pd-purchase-checkbox"> 买到了</label>
+        <label class="pd-qty">实际数量<input type="number" class="pd-purchase-qty-input" min="1" step="1" inputmode="numeric" value="{{ summary.remaining_quantity }}"></label>
+        {% if not store %}
+        <label class="pd-purchase-store-pick">在哪买的<select class="pd-purchase-store-select">
+          <option value="">请选择门店</option>
+          {% for s in active_stores %}<option value="{{ s.id }}">{{ s.display_name }}</option>{% endfor %}
+        </select></label>
+        {% endif %}
+      </div>
+      <p class="muted pd-overbuy-hint" hidden></p>
+    </article>
+    {% else %}<section class="card empty-state">这里暂时没有待采购的商品。</section>{% endfor %}
+  </section>
+  {% if plans %}
+  <div class="pd-batch-bar">
+    <button type="submit" id="purchaseSubmit" disabled>完成本次采购（<span id="purchaseSelectedCount">0</span>）</button>
+  </div>
+  {% endif %}
+</form>
+<script src="/static/procurement_purchase.js" defer></script>
+{% endblock %}

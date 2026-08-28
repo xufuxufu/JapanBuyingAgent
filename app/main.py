@@ -135,11 +135,16 @@ from app.sales_order_service import (
 )
 from app.sales_order_shipping import resolve_shipping_label_path
 from app.procurement_service import (
-    DEMAND_TYPE_LABELS, FRESHNESS_LABELS, SOURCE_TYPE_LABELS, STATUS_LABELS as PROCUREMENT_STATUS_LABELS,
-    PlanSelectionInput, aggregate_all_demand_groups, aggregate_open_demand_groups,
-    build_group_inventory_contexts, build_plan_inventory_contexts,
-    close_investigation_demand, create_channel_shortage_demand, create_investigation_demand,
-    create_plans, default_planned_quantity_for_group, get_group, list_investigation_demands, list_plans,
+    CONFIDENCE_LABELS, DEMAND_TYPE_LABELS, EXECUTION_STATUS_LABELS, FRESHNESS_LABELS, SOURCE_TYPE_LABELS,
+    STATUS_LABELS as PROCUREMENT_STATUS_LABELS, UNASSIGNED_STORE_GROUP_NAME,
+    ExecutionInput, ExecutionMatchInput, PlanSelectionInput, aggregate_all_demand_groups, aggregate_open_demand_groups,
+    build_group_inventory_contexts, build_plan_execution_summaries, build_plan_executions,
+    build_plan_inventory_contexts, build_plan_reconciliation_summaries, build_plan_store_overview,
+    build_store_purchase_entries, cancel_purchase_execution, close_investigation_demand,
+    create_channel_shortage_demand, create_investigation_demand, create_plans, default_planned_quantity_for_group,
+    find_execution_candidates_for_receipt_items, get_group, group_plans_by_selected_store,
+    list_investigation_demands, list_plans, list_plans_for_store_purchase,
+    record_purchase_executions_bulk, set_plan_selected_store, set_plans_selected_store_bulk,
 )
 from app.provider_config import diagnostic_summary, provider_status_rows, test_provider_connection
 from app.rakuten_ip_monitor import rakuten_public_ip_status
@@ -1405,6 +1410,10 @@ def review_page(batch_id: int, request: Request, receipt_id: int | None = Query(
         for item in candidate.items
     }
     stores = list(db.scalars(select(Store).where(Store.is_active.is_(True)).order_by(Store.name_cn, Store.name_ja, Store.id)))
+    execution_candidates_by_item = (
+        {} if receipt.confirmation_status == "confirmed"
+        else find_execution_candidates_for_receipt_items(db, receipt)
+    )
     return templates.TemplateResponse(request, "review.html", {
         "batch": batch, "receipt": receipt, "warnings": amount_warnings(receipt), "error": None,
         "products": products, "product_by_id": product_by_id, "recommendations": recommendations,
@@ -1415,6 +1424,7 @@ def review_page(batch_id: int, request: Request, receipt_id: int | None = Query(
         "purchase_blockers_by_receipt": purchase_blockers_by_receipt,
         "stores": stores,
         "jan_suggestions_by_item": jan_suggestions_by_item,
+        "execution_candidates_by_item": execution_candidates_by_item, "confidence_labels": CONFIDENCE_LABELS,
         "receipt_status_cn": RECEIPT_STATUS_CN, "item_status_cn": ITEM_STATUS_CN, "match_status_cn": MATCH_STATUS_CN,
         "enrichment_summary": enrichment_summary_for_receipt(db, receipt.id),
         "product_display_label": product_display_label,
@@ -1564,10 +1574,22 @@ async def confirm_review(batch_id: int, request: Request, db: Session = Depends(
             "qinsi_target_warehouse_id": int(form["qinsi_target_warehouse_id"]) if form.get("qinsi_target_warehouse_id") else None,
             "line_qinsi_target_overrides": overrides,
         })
-        confirm_receipt(db, batch, receipt, settings)
+        # execution_match_{item_id} -> chosen execution id ("" = leave unlinked,
+        # the default -- see rule that auto-suggestions are never auto-confirmed);
+        # execution_match_qty_{item_id} -> how much of it she's confirming.
+        execution_matches = []
+        for key, value in form.items():
+            if not key.startswith("execution_match_") or key.startswith("execution_match_qty_") or not str(value).strip():
+                continue
+            item_id = int(key.removeprefix("execution_match_"))
+            qty_raw = str(form.get(f"execution_match_qty_{item_id}") or "").strip()
+            if not qty_raw.isdigit() or int(qty_raw) <= 0:
+                raise ValueError("对账数量必须大于0")
+            execution_matches.append(ExecutionMatchInput(item_id=item_id, execution_id=int(value), matched_quantity=int(qty_raw)))
+        confirm_receipt(db, batch, receipt, settings, execution_matches)
     except ValidationError as exc:
         raise HTTPException(422, _validation_message(exc)) from exc
-    except ValueError as exc:
+    except (ValueError, LookupError) as exc:
         raise HTTPException(422, str(exc)) from exc
     return RedirectResponse(_review_url(batch_id, receipt), status_code=303)
 
@@ -3128,15 +3150,31 @@ def sales_order_shipping_label_delete(label_id: int, db: Session = Depends(get_d
 PROCUREMENT_DEMAND_VIEWS = ("open", "investigation", "planned", "all")
 
 
+PROCUREMENT_PLAN_GROUP_BY = ("product", "store")
+
+
 @app.get("/procurement-demands", response_class=HTMLResponse)
-def procurement_demands_page(request: Request, view: str = Query("open"), db: Session = Depends(get_db)):
+def procurement_demands_page(
+    request: Request, view: str = Query("open"), group_by: str = Query("product"),
+    db: Session = Depends(get_db),
+):
     if view not in PROCUREMENT_DEMAND_VIEWS:
         view = "open"
+    if group_by not in PROCUREMENT_PLAN_GROUP_BY:
+        group_by = "product"
     groups: list = []
     investigations: list = []
     plans: list = []
     inventory_contexts: dict = {}
     plan_inventories: dict = {}
+    plan_store_contexts: dict = {}
+    store_coverage: list = []
+    store_groups: list = []
+    active_stores: list = []
+    execution_summaries: dict = {}
+    plan_executions: dict = {}
+    store_purchase_entries: list = []
+    reconciliation_summaries: dict = {}
     if view == "open":
         groups = [g for g in aggregate_open_demand_groups(db) if g.confirmed_demands]
         inventory_contexts = build_group_inventory_contexts(db, groups)
@@ -3145,13 +3183,29 @@ def procurement_demands_page(request: Request, view: str = Query("open"), db: Se
     elif view == "planned":
         plans = list_plans(db, status="planned")
         plan_inventories = build_plan_inventory_contexts(db, plans)
+        plan_store_contexts, store_coverage = build_plan_store_overview(db, plans)
+        execution_summaries = build_plan_execution_summaries(db, plans)
+        plan_executions = build_plan_executions(db, plans)
+        reconciliation_summaries = build_plan_reconciliation_summaries(db, plans)
+        active_stores = list(db.scalars(
+            select(Store).where(Store.is_active.is_(True)).order_by(Store.name_cn, Store.name_ja, Store.id)
+        ))
+        if group_by == "store":
+            store_groups = group_plans_by_selected_store(plans)
+            store_purchase_entries = build_store_purchase_entries(store_groups, execution_summaries)
     else:
         groups = aggregate_all_demand_groups(db)
     return templates.TemplateResponse(request, "procurement_demands.html", {
-        "view": view, "groups": groups, "investigations": investigations, "plans": plans,
+        "view": view, "group_by": group_by, "groups": groups, "investigations": investigations, "plans": plans,
         "demand_type_labels": DEMAND_TYPE_LABELS, "source_type_labels": SOURCE_TYPE_LABELS,
         "status_labels": PROCUREMENT_STATUS_LABELS, "default_qty": default_planned_quantity_for_group,
         "inventory_contexts": inventory_contexts, "plan_inventories": plan_inventories,
+        "plan_store_contexts": plan_store_contexts, "store_coverage": store_coverage,
+        "store_groups": store_groups, "active_stores": active_stores,
+        "execution_summaries": execution_summaries, "plan_executions": plan_executions,
+        "store_purchase_entries": store_purchase_entries, "execution_status_labels": EXECUTION_STATUS_LABELS,
+        "reconciliation_summaries": reconciliation_summaries,
+        "unassigned_group_name": UNASSIGNED_STORE_GROUP_NAME,
         "freshness_labels": FRESHNESS_LABELS, "error": request.query_params.get("error"),
     })
 
@@ -3245,6 +3299,96 @@ def procurement_demand_close(demand_id: int, note: str = Form(""), db: Session =
         db.rollback()
         return RedirectResponse(f"/procurement-demands?view=investigation&error={quote(str(exc))}", status_code=303)
     return RedirectResponse("/procurement-demands?view=investigation", status_code=303)
+
+
+def _redirect_back_to_planned(group_by: str, error: str | None = None) -> RedirectResponse:
+    target = f"/procurement-demands?view=planned&group_by={group_by}"
+    if error:
+        target += f"&error={quote(error)}"
+    return RedirectResponse(target, status_code=303)
+
+
+@app.post("/procurement-demands/plans/{plan_id}/store")
+def procurement_demand_plan_set_store(
+    plan_id: int, store_id: str = Form(""), group_by: str = Form("product"), db: Session = Depends(get_db),
+):
+    try:
+        set_plan_selected_store(db, plan_id, int(store_id) if store_id.isdigit() else None)
+    except LookupError as exc:
+        db.rollback()
+        raise HTTPException(404, str(exc)) from exc
+    except ValueError as exc:
+        db.rollback()
+        return _redirect_back_to_planned(group_by, str(exc))
+    return _redirect_back_to_planned(group_by)
+
+
+@app.post("/procurement-demands/plans/store-bulk")
+async def procurement_demand_plans_set_store_bulk(request: Request, db: Session = Depends(get_db)):
+    form = await request.form()
+    store_id = str(form.get("store_id") or "")
+    group_by = str(form.get("group_by") or "product")
+    plan_ids = [int(value) for value in form.getlist("plan_ids") if str(value).isdigit()]
+    try:
+        set_plans_selected_store_bulk(db, plan_ids, int(store_id) if store_id.isdigit() else None)
+    except (ValueError, LookupError) as exc:
+        db.rollback()
+        return _redirect_back_to_planned(group_by, str(exc))
+    return _redirect_back_to_planned(group_by)
+
+
+@app.get("/procurement-demands/purchase", response_class=HTMLResponse)
+def procurement_purchase_page(request: Request, store_id: str = Query(""), db: Session = Depends(get_db)):
+    resolved_store_id = int(store_id) if store_id.isdigit() else None
+    store = db.get(Store, resolved_store_id) if resolved_store_id is not None else None
+    if resolved_store_id is not None and store is None:
+        raise HTTPException(404, "门店不存在")
+    plans = list_plans_for_store_purchase(db, resolved_store_id)
+    summaries = build_plan_execution_summaries(db, plans)
+    active_stores = list(db.scalars(
+        select(Store).where(Store.is_active.is_(True)).order_by(Store.name_cn, Store.name_ja, Store.id)
+    ))
+    return templates.TemplateResponse(request, "procurement_purchase.html", {
+        "store": store, "store_id_param": store_id, "plans": plans, "summaries": summaries,
+        "active_stores": active_stores, "error": request.query_params.get("error"),
+    })
+
+
+@app.post("/procurement-demands/purchase")
+async def procurement_purchase_submit(request: Request, db: Session = Depends(get_db)):
+    form = await request.form()
+    store_id_param = str(form.get("store_id") or "")
+    target = f"/procurement-demands/purchase?store_id={store_id_param}" if store_id_param else "/procurement-demands/purchase"
+    try:
+        raw = json.loads(form.get("executions_json") or "[]")
+        if not isinstance(raw, list):
+            raise ValueError("提交数据格式错误")
+        entries = []
+        for item in raw:
+            item_store_id = item.get("store_id")
+            entries.append(ExecutionInput(
+                plan_id=int(item.get("plan_id")), quantity=int(item.get("quantity")),
+                store_id=int(item_store_id) if item_store_id not in (None, "") else None,
+            ))
+        record_purchase_executions_bulk(db, entries)
+    except (ValueError, LookupError, TypeError) as exc:
+        db.rollback()
+        joiner = "&" if "?" in target else "?"
+        return RedirectResponse(f"{target}{joiner}error={quote(str(exc))}", status_code=303)
+    return RedirectResponse(target, status_code=303)
+
+
+@app.post("/procurement-demands/executions/{execution_id}/cancel")
+def procurement_purchase_execution_cancel(execution_id: int, group_by: str = Form("product"), db: Session = Depends(get_db)):
+    try:
+        cancel_purchase_execution(db, execution_id)
+    except LookupError as exc:
+        db.rollback()
+        raise HTTPException(404, str(exc)) from exc
+    except ValueError as exc:
+        db.rollback()
+        return _redirect_back_to_planned(group_by, str(exc))
+    return _redirect_back_to_planned(group_by)
 
 
 @app.get("/stores", response_class=HTMLResponse)

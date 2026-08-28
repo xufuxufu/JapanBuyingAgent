@@ -9,7 +9,7 @@ from alembic import command
 from alembic.config import Config
 
 
-HEAD_REVISION = "20260828_0041"
+HEAD_REVISION = "20260828_0044"
 
 
 def test_migration_from_empty_and_repeat_safe(tmp_path, monkeypatch):

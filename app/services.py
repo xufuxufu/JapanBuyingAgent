@@ -1349,6 +1349,7 @@ def apply_item_draft(item: ReceiptItem, data: ReceiptItemDraftInput) -> None:
 def confirm_receipt(
     session: Session, batch: ReceiptBatch, receipt: Receipt,
     purchase_settings: PurchaseConfirmationInput | None = None,
+    execution_matches: list | None = None,
 ) -> list[str]:
     active = [item for item in receipt.items if item.review_status != "ignored"]
     if not active:
@@ -1377,6 +1378,13 @@ def confirm_receipt(
         if receipt.store_match_status != "confirmed":
             match_receipt_store(session, receipt)
         ensure_purchase_batch_for_receipt(session, receipt, purchase_settings)
+        # Same transaction as the PurchaseBatch creation above: either both
+        # land or neither does (see procurement_service.confirm_execution_receipt_matches).
+        # A receipt with no matches submitted (the common "wasn't planned" case)
+        # is untouched -- this never blocks an ordinary receipt confirm.
+        if execution_matches:
+            from app.procurement_service import confirm_execution_receipt_matches
+            confirm_execution_receipt_matches(session, receipt, execution_matches)
         session.commit()
         from app.product_enrichment import safe_trigger_receipt_items
         safe_trigger_receipt_items(session, active, "receipt_confirmation")

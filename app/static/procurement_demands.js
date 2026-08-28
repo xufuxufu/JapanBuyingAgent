@@ -49,3 +49,25 @@
 
   updateBar();
 })();
+
+(() => {
+  // Per-item "采购来源" selects submit their own tiny form as soon as she
+  // picks a store -- no separate save button needed.
+  document.querySelectorAll(".pd-store-select").forEach((select) => {
+    select.addEventListener("change", () => select.form?.requestSubmit());
+  });
+
+  const bulkForm = document.getElementById("planStoreBulkForm");
+  const bulkApply = document.getElementById("bulkStoreApply");
+  const bulkCount = document.getElementById("bulkSelectedCount");
+  const planCheckboxes = [...document.querySelectorAll(".pd-plan-checkbox")];
+  if (!bulkForm || !bulkApply || !planCheckboxes.length) return;
+
+  function updateBulkBar() {
+    const checked = planCheckboxes.filter((box) => box.checked).length;
+    bulkCount.textContent = String(checked);
+    bulkApply.disabled = checked === 0;
+  }
+  planCheckboxes.forEach((box) => box.addEventListener("change", updateBulkBar));
+  updateBulkBar();
+})();

@@ -1812,12 +1812,82 @@ class ProcurementDemandPlan(Base):
     status: Mapped[str] = mapped_column(String(20), default="planned", nullable=False, index=True)
     created_by: Mapped[str | None] = mapped_column(String(20))
     note: Mapped[str | None] = mapped_column(Text)
+    # Phase 2C: where 老婆 decided to actually buy this -- a decision fact, set
+    # only by her explicit choice. Never populated from a recommendation; system
+    # suggestions are computed on the fly in procurement_service and never written
+    # here. Recommendations are computed on the fly (not stored) because they
+    # would go stale the moment new purchase history comes in.
+    selected_store_id: Mapped[int | None] = mapped_column(ForeignKey("stores.id", ondelete="SET NULL"), index=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False, index=True)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow, nullable=False)
     product: Mapped[Product | None] = relationship()
+    selected_store: Mapped[Store | None] = relationship()
     sources: Mapped[list[ProcurementDemandPlanSource]] = relationship(
         back_populates="plan", cascade="all, delete-orphan", order_by="ProcurementDemandPlanSource.id",
     )
+    executions: Mapped[list[ProcurementPurchaseExecution]] = relationship(
+        back_populates="plan", cascade="all, delete-orphan", order_by="ProcurementPurchaseExecution.created_at",
+    )
+
+
+class ProcurementPurchaseExecution(Base):
+    """One real trip's worth of actually-bought quantity for a plan -- not yet a formal PurchaseBatch.
+
+    A plan can have several of these over time (partial buys, different stores
+    on different visits). planned_quantity on the plan never changes; purchased/
+    remaining are always computed by summing non-cancelled executions.
+    """
+
+    __tablename__ = "procurement_purchase_executions"
+    __table_args__ = (
+        CheckConstraint("quantity > 0", name="ck_procurement_purchase_executions_quantity_positive"),
+        CheckConstraint(
+            "status IN ('pending_receipt','reconciled','cancelled')", name="ck_procurement_purchase_executions_status",
+        ),
+        Index("ix_procurement_purchase_executions_plan_status", "plan_id", "status"),
+    )
+    id: Mapped[int] = mapped_column(primary_key=True)
+    plan_id: Mapped[int] = mapped_column(ForeignKey("procurement_demand_plans.id", ondelete="CASCADE"), nullable=False, index=True)
+    # Snapshot, not a live pointer: plan.selected_store_id can change later without
+    # rewriting where a past execution actually happened. SET NULL (not RESTRICT)
+    # so deleting a Store can never block/cascade-delete real purchase history.
+    store_id: Mapped[int | None] = mapped_column(ForeignKey("stores.id", ondelete="SET NULL"), index=True)
+    quantity: Mapped[int] = mapped_column(Integer, nullable=False)
+    status: Mapped[str] = mapped_column(String(20), default="pending_receipt", nullable=False, index=True)
+    note: Mapped[str | None] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False, index=True)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow, nullable=False)
+    plan: Mapped[ProcurementDemandPlan] = relationship(back_populates="executions")
+    store: Mapped[Store | None] = relationship()
+    receipt_matches: Mapped[list[ProcurementExecutionReceiptMatch]] = relationship(
+        back_populates="execution", cascade="all, delete-orphan", order_by="ProcurementExecutionReceiptMatch.id",
+    )
+
+
+class ProcurementExecutionReceiptMatch(Base):
+    """A human-confirmed link: this much of a receipt line is this execution's real evidence.
+
+    Written only once reconciliation is confirmed as part of the existing
+    receipt confirm transaction (Phase 2E) -- there is no separate "suggested"
+    row and nothing here is ever auto-created. The link to the eventual
+    PurchaseBatchItem is derived through receipt_item_id (PurchaseBatchItem
+    already has a 1:1 receipt_item_id), so it isn't duplicated here.
+    """
+
+    __tablename__ = "procurement_execution_receipt_matches"
+    __table_args__ = (
+        CheckConstraint("matched_quantity > 0", name="ck_procurement_execution_receipt_matches_quantity_positive"),
+        UniqueConstraint("execution_id", "receipt_item_id", name="uq_procurement_execution_receipt_matches_pair"),
+    )
+    id: Mapped[int] = mapped_column(primary_key=True)
+    execution_id: Mapped[int] = mapped_column(
+        ForeignKey("procurement_purchase_executions.id", ondelete="CASCADE"), nullable=False, index=True,
+    )
+    receipt_item_id: Mapped[int] = mapped_column(ForeignKey("receipt_items.id", ondelete="RESTRICT"), nullable=False, index=True)
+    matched_quantity: Mapped[int] = mapped_column(Integer, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
+    execution: Mapped[ProcurementPurchaseExecution] = relationship(back_populates="receipt_matches")
+    receipt_item: Mapped[ReceiptItem] = relationship()
 
 
 class ProcurementDemandPlanSource(Base):
