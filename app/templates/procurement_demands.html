@@ -1,0 +1,123 @@
+{% extends "base.html" %}
+{% block title %}采购需求{% endblock %}
+{% block content %}
+<div class="section-head"><div><h1>采购需求中心</h1><p class="muted">秀的客户需求、丈母娘的渠道缺货，按商品自动汇总；先勾选，再决定采购多少。</p></div><a class="button secondary" href="/procurement-demands/report-shortage">报缺货</a></div>
+{% if error %}<div class="warning"><strong>操作失败：</strong>{{ error }}</div>{% endif %}
+
+<nav class="so-tabs" aria-label="采购需求分类">
+  <a class="so-tab{% if view == 'open' %} active{% endif %}" href="/procurement-demands?view=open">待处理</a>
+  <a class="so-tab{% if view == 'investigation' %} active{% endif %}" href="/procurement-demands?view=investigation">调查</a>
+  <a class="so-tab{% if view == 'planned' %} active{% endif %}" href="/procurement-demands?view=planned">已安排</a>
+  <a class="so-tab{% if view == 'all' %} active{% endif %}" href="/procurement-demands?view=all">全部</a>
+</nav>
+
+{% if view in ('open', 'all') %}
+<form id="demandPlanForm" method="post" action="/procurement-demands/plan">
+  <input type="hidden" name="selections_json" id="demandSelectionsInput">
+  <section class="pd-list">
+    {% for group in groups %}
+    {% set ctx = inventory_contexts.get(group.group_ref) %}
+    <article class="card pd-card" data-kind="{{ group.kind }}" data-key="{{ group.key }}" data-default-qty="{{ ctx.default_planned_quantity if ctx else group.confirmed_quantity }}">
+      <div class="pd-card-main">
+        {% if group.product and group.product.preferred_image_url %}
+        <img class="product-thumb" loading="lazy" src="{{ group.product.preferred_image_url }}" alt="商品主图">
+        {% else %}<div class="product-image-empty product-thumb">无图</div>{% endif %}
+        <div class="pd-card-info">
+          <h2>{{ group.display_name }}</h2>
+          <p class="muted">{{ group.jan or 'JAN 未填写' }}</p>
+          <p class="pd-confirmed">明确需求：<strong>{{ group.confirmed_quantity }}</strong></p>
+          <div class="pd-sources">
+            {% for demand in group.confirmed_demands[:3] %}
+            <span class="pd-source-line">{{ demand.source_person }} {{ demand_type_labels.get(demand.demand_type, demand.demand_type) }} {{ '×' ~ demand.requested_quantity if demand.requested_quantity else '数量未填' }}</span>
+            {% endfor %}
+            {% if group.confirmed_demands|length > 3 %}<span class="muted">还有 {{ group.confirmed_demands|length - 3 }} 条来源…</span>{% endif %}
+          </div>
+          <p class="muted">调查：{{ group.investigation_demands|length ~ ' 条' if group.investigation_demands else '无' }}</p>
+        </div>
+      </div>
+      {% if ctx %}
+      <div class="pd-inventory">
+        <p class="pd-inv-row"><span>中国参考：<strong>{{ ctx.inventory.china_quantity if ctx.inventory.china_known else '未知' }}</strong></span><span>日本参考：<strong>{{ ctx.inventory.japan_quantity if ctx.inventory.japan_known else '未知' }}</strong></span></p>
+        <p class="muted">快照：{{ ctx.inventory.snapshot_at|tokyo_datetime if ctx.inventory.snapshot_at else '暂无快照' }}{% if freshness_labels.get(ctx.inventory.freshness) %} · {{ freshness_labels[ctx.inventory.freshness] }}{% endif %}</p>
+        <p class="pd-shortage">{% if ctx.domestic_shortage_known %}国内明确缺口：<strong>{{ '参考库存可覆盖' if ctx.domestic_shortage == 0 else ctx.domestic_shortage }}</strong>{% else %}国内明确缺口：<strong>库存未知，请人工确认</strong>{% endif %}</p>
+        {% if ctx.inventory.japan_known and ctx.inventory.japan_quantity > 0 %}<p class="muted">日本有 {{ ctx.inventory.japan_quantity }} 件参考库存，可考虑调拨/避免重复采购。</p>{% endif %}
+      </div>
+      {% endif %}
+      {% if view == 'open' %}
+      <div class="pd-card-actions">
+        <label class="pd-select"><input type="checkbox" class="pd-checkbox"> 采购</label>
+        <label class="pd-qty">计划采购数量<input type="number" class="pd-qty-input" min="1" step="1" inputmode="numeric" value="{{ ctx.default_planned_quantity if ctx else group.confirmed_quantity }}"></label>
+        <a class="link-button" href="/procurement-demands/groups/{{ group.kind }}/{{ group.key }}">查看详情</a>
+      </div>
+      {% else %}
+      <div class="pd-card-actions">
+        <span class="badge">{{ group.all_demands|length }} 条来源</span>
+        <a class="link-button" href="/procurement-demands/groups/{{ group.kind }}/{{ group.key }}">查看详情</a>
+      </div>
+      {% endif %}
+    </article>
+    {% else %}<section class="card empty-state">暂无{{ '需要处理的' if view == 'open' else '' }}采购需求。</section>{% endfor %}
+  </section>
+  {% if view == 'open' and groups %}
+  <div class="pd-batch-bar">
+    <button type="submit" id="demandPlanSubmit" disabled>加入采购清单（<span id="demandPlanCount">0</span>）</button>
+  </div>
+  {% endif %}
+</form>
+{% endif %}
+
+{% if view == 'investigation' %}
+<section class="pd-list">
+  {% for demand in investigations %}
+  <article class="card pd-card">
+    <div class="pd-card-main">
+      <div class="pd-card-info">
+        <h2>{{ demand.product_name_snapshot }}</h2>
+        <p class="muted">{{ demand.source_person }} · {{ demand.source_channel or '' }} · {{ demand.created_at|tokyo_datetime }}</p>
+        <p class="muted">数量：{{ demand.requested_quantity if demand.requested_quantity else '未填' }}</p>
+        {% if demand.note %}<p>{{ demand.note }}</p>{% endif %}
+      </div>
+    </div>
+    <form method="post" action="/procurement-demands/{{ demand.id }}/close" class="pd-close-form">
+      <input type="text" name="note" maxlength="500" placeholder="处理结果（可选，例如：现场有粉色大号）">
+      <button type="submit">标记已处理</button>
+    </form>
+  </article>
+  {% else %}<section class="card empty-state">暂无调查任务。</section>{% endfor %}
+</section>
+{% endif %}
+
+{% if view == 'planned' %}
+<section class="pd-list">
+  {% for plan in plans %}
+  {% set inv = plan_inventories.get(plan.id) %}
+  <article class="card pd-card">
+    <div class="pd-card-main">
+      {% if plan.product and plan.product.preferred_image_url %}
+      <img class="product-thumb" loading="lazy" src="{{ plan.product.preferred_image_url }}" alt="商品主图">
+      {% else %}<div class="product-image-empty product-thumb">无图</div>{% endif %}
+      <div class="pd-card-info">
+        <h2>{{ plan.product_name_snapshot }}</h2>
+        <p class="muted">{{ plan.jan_snapshot or 'JAN 未填写' }} · {{ plan.created_at|tokyo_datetime }}</p>
+        <p class="pd-confirmed">计划采购数量：<strong>{{ plan.planned_quantity }}</strong>{% if plan.confirmed_demand_quantity_snapshot is not none %} <span class="muted">（决策时明确需求 {{ plan.confirmed_demand_quantity_snapshot }}）</span>{% endif %}</p>
+        <div class="pd-sources">
+          <p class="muted">为什么买：</p>
+          {% for source in plan.sources %}
+          <span class="pd-source-line">{{ source.demand.source_person }} {{ demand_type_labels.get(source.demand.demand_type, source.demand.demand_type) }} {{ '×' ~ source.quantity_snapshot if source.quantity_snapshot else '' }}</span>
+          {% endfor %}
+        </div>
+      </div>
+    </div>
+    {% if inv %}
+    <div class="pd-inventory">
+      <p class="pd-inv-row"><span>中国参考：<strong>{{ inv.china_quantity if inv.china_known else '未知' }}</strong></span><span>日本参考：<strong>{{ inv.japan_quantity if inv.japan_known else '未知' }}</strong></span></p>
+      <p class="muted">当前参考库存快照：{{ inv.snapshot_at|tokyo_datetime if inv.snapshot_at else '暂无快照' }}{% if freshness_labels.get(inv.freshness) %} · {{ freshness_labels[inv.freshness] }}{% endif %}（计划采购数量不会因新快照自动变化）</p>
+    </div>
+    {% endif %}
+  </article>
+  {% else %}<section class="card empty-state">暂无已安排采购。</section>{% endfor %}
+</section>
+{% endif %}
+
+<script src="/static/procurement_demands.js" defer></script>
+{% endblock %}

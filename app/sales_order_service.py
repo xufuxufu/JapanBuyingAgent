@@ -8,6 +8,7 @@ from sqlalchemy import func, or_, select
 from sqlalchemy.orm import Session, selectinload
 
 from app.models import Customer, Product, SalesOrder, SalesOrderItem, SalesOrderShippingLabel, Salesperson
+from app.procurement_service import sync_demands_for_sales_order
 from app.sales_order_shipping import delete_shipping_label_file, save_shipping_label_file
 
 
@@ -192,6 +193,10 @@ def create_sales_order(
             quantity=entry.quantity, unit_sale_price=entry.unit_sale_price,
             note=(entry.note or "").strip() or None,
         ))
+    session.flush()
+    # Every confirmed order line is a procurement demand from the moment it's
+    # placed; the demand center is what surfaces it, not this function.
+    sync_demands_for_sales_order(session, order, commit=False)
     session.commit()
     return get_sales_order(session, order.id)
 

@@ -1,0 +1,26 @@
+{% extends "base.html" %}
+{% block title %}报缺货{% endblock %}
+{% block content %}
+<div class="section-head"><div><h1>报缺货</h1><p class="muted">告诉老婆哪个商品卖完了，不用打开采购系统。</p></div><a class="button secondary" href="/procurement-demands">查看采购需求</a></div>
+{% if error %}<div class="warning"><strong>提交失败：</strong>{{ error }}</div>{% endif %}
+{% if request.query_params.get('ok') %}<div class="badge state-completed">已提交，老婆会看到这条缺货信息。</div>{% endif %}
+<form id="shortageForm" method="post" action="/procurement-demands/report-shortage" class="stack">
+  <input type="hidden" name="product_id" id="shortageProductIdInput">
+  <section class="card">
+    <div id="shortagePicked" hidden><p><strong id="shortagePickedName"></strong> <button type="button" class="link-button" id="shortageChange">更换</button></p></div>
+    <div id="shortageSearchBlock">
+      <label>商品<input type="search" id="shortageSearchInput" autocomplete="off" placeholder="输入中文名/日文名/JAN搜索"></label>
+      <div id="shortageSearchResults" class="search-results" hidden></div>
+      <button type="button" class="link-button" id="shortageManualToggle">找不到商品，手工输入名称</button>
+      <label id="shortageManualLabel" hidden>商品名称<input id="shortageManualInput" maxlength="255"></label>
+    </div>
+  </section>
+  <section class="card">
+    <label>数量（可空，估计一下就行）<input name="quantity" type="number" min="1" step="1" inputmode="numeric"></label>
+    <label>备注（可选，比如是淘宝还是小红书）<textarea name="note" rows="2" maxlength="500"></textarea></label>
+  </section>
+  <button class="full" type="submit" id="shortageSubmitButton">提交缺货</button>
+  <p id="shortageFormError" class="error" hidden></p>
+</form>
+<script src="/static/procurement_demand_shortage.js" defer></script>
+{% endblock %}

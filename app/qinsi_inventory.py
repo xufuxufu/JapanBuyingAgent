@@ -55,6 +55,34 @@ MATCH_METHOD_LABELS = {
     "manual": "人工选择",
 }
 
+INVENTORY_REGION_CHINA = "china"
+INVENTORY_REGION_JAPAN = "japan"
+
+# Which physical region a QinSi/JBA warehouse sits in, for splitting reference
+# stock into China vs Japan (procurement demand center, Phase 2B). Location has
+# no country/region column -- adding one was considered and deliberately
+# deferred (see AI_HANDOFF Phase 2B notes) -- so this stays a small, explicitly
+# reviewed table keyed by the location's stable internal_code. It is never
+# inferred from display_name: QinSi imports can spell the same real warehouse
+# differently across imports (the seeded "2025招财猫" and the later
+# auto-created "招财猫店" -- see qinsi_goods_import._warehouse_code -- are the
+# same China warehouse under two different raw names/codes). A location not
+# listed here contributes to neither region (unclassified, not guessed); when
+# a genuinely new warehouse name shows up, add one line here.
+INVENTORY_REGION_BY_LOCATION_CODE: dict[str, str] = {
+    "QW-2025-QIANYU": INVENTORY_REGION_CHINA,
+    "QW-2025-ZHAOCAIMAO": INVENTORY_REGION_CHINA,
+    "QW-QINSI-1DE1039D20FB": INVENTORY_REGION_CHINA,  # "招财猫店", same warehouse as QW-2025-ZHAOCAIMAO under a later raw name
+    "QW-NEW-JAPAN": INVENTORY_REGION_JAPAN,
+    "LOC-JP-HOME": INVENTORY_REGION_JAPAN,
+}
+
+
+def inventory_region_for_location(location: Location | None) -> str | None:
+    if location is None:
+        return None
+    return INVENTORY_REGION_BY_LOCATION_CODE.get(location.internal_code)
+
 
 @dataclass(frozen=True, slots=True)
 class InventorySettings:

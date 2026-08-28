@@ -3,6 +3,25 @@
 {% block content %}
 <div class="section-head"><div><h1>新建微信订单</h1><p class="muted">只记录客户需求事实；不判断库存、不生成采购、不联系微信。</p></div><a class="button secondary" href="/sales-orders">返回列表</a></div>
 {% if error %}<div class="warning"><strong>提交失败：</strong>{{ error }}</div>{% endif %}
+{% if request.query_params.get('investigation_ok') %}<div class="badge state-completed">调查需求已提交，老婆会在采购需求中心看到。</div>{% endif %}
+
+<section class="card">
+  <h2>客户需求类型</h2>
+  <div class="button-row">
+    <label><input type="radio" name="demandMode" value="order" id="demandModeOrder" checked> 确定购买</label>
+    <label><input type="radio" name="demandMode" value="investigation" id="demandModeInvestigation"> 只是想看看 / 调查</label>
+  </div>
+</section>
+
+<form id="investigationForm" method="post" action="/procurement-demands/investigations" hidden>
+  <section class="card">
+    <label>商品 / 关键词（必填）<input name="manual_name" maxlength="255" placeholder="例如：粉色大号系列"></label>
+    <label>数量（可空）<input name="quantity" type="number" min="1" step="1" inputmode="numeric"></label>
+    <label>备注<textarea name="note" rows="3" maxlength="500" placeholder="例如：看看有没有粉色、大号，拍照片"></textarea></label>
+    <button class="full" type="submit">提交调查需求</button>
+  </section>
+</form>
+
 <form id="salesOrderForm" method="post" action="/sales-orders">
   <input type="hidden" name="customer_id" id="customerIdInput">
   <input type="hidden" name="salesperson_id" value="{{ default_salesperson.id }}">

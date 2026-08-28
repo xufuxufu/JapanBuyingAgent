@@ -1,4 +1,18 @@
 (() => {
+  const orderForm = document.getElementById("salesOrderForm");
+  const investigationForm = document.getElementById("investigationForm");
+  const orderModeRadio = document.getElementById("demandModeOrder");
+  const investigationModeRadio = document.getElementById("demandModeInvestigation");
+  function applyDemandMode() {
+    const isInvestigation = investigationModeRadio?.checked;
+    if (orderForm) orderForm.hidden = Boolean(isInvestigation);
+    if (investigationForm) investigationForm.hidden = !isInvestigation;
+  }
+  orderModeRadio?.addEventListener("change", applyDemandMode);
+  investigationModeRadio?.addEventListener("change", applyDemandMode);
+})();
+
+(() => {
   const form = document.getElementById("salesOrderForm");
   if (!form) return;
 

@@ -134,6 +134,13 @@ from app.sales_order_service import (
     status_counts as sales_order_status_counts, update_sales_order_status,
 )
 from app.sales_order_shipping import resolve_shipping_label_path
+from app.procurement_service import (
+    DEMAND_TYPE_LABELS, FRESHNESS_LABELS, SOURCE_TYPE_LABELS, STATUS_LABELS as PROCUREMENT_STATUS_LABELS,
+    PlanSelectionInput, aggregate_all_demand_groups, aggregate_open_demand_groups,
+    build_group_inventory_contexts, build_plan_inventory_contexts,
+    close_investigation_demand, create_channel_shortage_demand, create_investigation_demand,
+    create_plans, default_planned_quantity_for_group, get_group, list_investigation_demands, list_plans,
+)
 from app.provider_config import diagnostic_summary, provider_status_rows, test_provider_connection
 from app.rakuten_ip_monitor import rakuten_public_ip_status
 from app.product_translation_service import (
@@ -3116,6 +3123,128 @@ def sales_order_shipping_label_delete(label_id: int, db: Session = Depends(get_d
         db.rollback()
         return RedirectResponse(f"/sales-orders/{order_id}?error={quote(str(exc))}", status_code=303)
     return RedirectResponse(f"/sales-orders/{order_id}", status_code=303)
+
+
+PROCUREMENT_DEMAND_VIEWS = ("open", "investigation", "planned", "all")
+
+
+@app.get("/procurement-demands", response_class=HTMLResponse)
+def procurement_demands_page(request: Request, view: str = Query("open"), db: Session = Depends(get_db)):
+    if view not in PROCUREMENT_DEMAND_VIEWS:
+        view = "open"
+    groups: list = []
+    investigations: list = []
+    plans: list = []
+    inventory_contexts: dict = {}
+    plan_inventories: dict = {}
+    if view == "open":
+        groups = [g for g in aggregate_open_demand_groups(db) if g.confirmed_demands]
+        inventory_contexts = build_group_inventory_contexts(db, groups)
+    elif view == "investigation":
+        investigations = list_investigation_demands(db, status="open")
+    elif view == "planned":
+        plans = list_plans(db, status="planned")
+        plan_inventories = build_plan_inventory_contexts(db, plans)
+    else:
+        groups = aggregate_all_demand_groups(db)
+    return templates.TemplateResponse(request, "procurement_demands.html", {
+        "view": view, "groups": groups, "investigations": investigations, "plans": plans,
+        "demand_type_labels": DEMAND_TYPE_LABELS, "source_type_labels": SOURCE_TYPE_LABELS,
+        "status_labels": PROCUREMENT_STATUS_LABELS, "default_qty": default_planned_quantity_for_group,
+        "inventory_contexts": inventory_contexts, "plan_inventories": plan_inventories,
+        "freshness_labels": FRESHNESS_LABELS, "error": request.query_params.get("error"),
+    })
+
+
+@app.get("/procurement-demands/groups/{kind}/{key}", response_class=HTMLResponse)
+def procurement_demand_group_detail(kind: str, key: str, request: Request, db: Session = Depends(get_db)):
+    group = get_group(db, kind, key)
+    if group is None:
+        raise HTTPException(404, "需求分组不存在")
+    inventory_context = build_group_inventory_contexts(db, [group])[group.group_ref]
+    return templates.TemplateResponse(request, "procurement_demand_detail.html", {
+        "group": group, "demand_type_labels": DEMAND_TYPE_LABELS, "source_type_labels": SOURCE_TYPE_LABELS,
+        "status_labels": PROCUREMENT_STATUS_LABELS, "default_qty": default_planned_quantity_for_group(group),
+        "inventory_context": inventory_context, "freshness_labels": FRESHNESS_LABELS,
+    })
+
+
+@app.post("/procurement-demands/plan")
+async def procurement_demand_create_plans(request: Request, db: Session = Depends(get_db)):
+    form = await request.form()
+    try:
+        raw_selections = json.loads(form.get("selections_json") or "[]")
+        if not isinstance(raw_selections, list):
+            raise ValueError("提交数据格式错误")
+        selections = []
+        for raw in raw_selections:
+            selections.append(PlanSelectionInput(
+                kind=str(raw.get("kind")), key=str(raw.get("key")),
+                planned_quantity=int(raw.get("planned_quantity")),
+            ))
+        create_plans(db, selections)
+    except (ValueError, LookupError, TypeError) as exc:
+        db.rollback()
+        return RedirectResponse(f"/procurement-demands?error={quote(str(exc))}", status_code=303)
+    return RedirectResponse("/procurement-demands?view=planned", status_code=303)
+
+
+@app.get("/procurement-demands/report-shortage", response_class=HTMLResponse)
+def procurement_demand_report_shortage_page(request: Request):
+    return templates.TemplateResponse(request, "procurement_demand_shortage_new.html", {
+        "error": request.query_params.get("error"),
+    })
+
+
+@app.post("/procurement-demands/report-shortage")
+async def procurement_demand_report_shortage_submit(request: Request, db: Session = Depends(get_db)):
+    form = await request.form()
+    product_id = str(form.get("product_id") or "")
+    manual_name = str(form.get("manual_name") or "")
+    quantity_raw = str(form.get("quantity") or "")
+    note = str(form.get("note") or "")
+    try:
+        create_channel_shortage_demand(
+            db, product_id=int(product_id) if product_id.isdigit() else None,
+            manual_name=manual_name or None, quantity=int(quantity_raw) if quantity_raw.isdigit() else None,
+            note=note or None,
+        )
+    except (ValueError, LookupError) as exc:
+        db.rollback()
+        return RedirectResponse(f"/procurement-demands/report-shortage?error={quote(str(exc))}", status_code=303)
+    return RedirectResponse("/procurement-demands/report-shortage?ok=1", status_code=303)
+
+
+@app.post("/procurement-demands/investigations")
+async def procurement_demand_investigation_submit(request: Request, db: Session = Depends(get_db)):
+    form = await request.form()
+    product_id = str(form.get("product_id") or "")
+    manual_name = str(form.get("manual_name") or "")
+    quantity_raw = str(form.get("quantity") or "")
+    note = str(form.get("note") or "")
+    try:
+        create_investigation_demand(
+            db, product_id=int(product_id) if product_id.isdigit() else None,
+            manual_name=manual_name or None, quantity=int(quantity_raw) if quantity_raw.isdigit() else None,
+            note=note or None,
+        )
+    except (ValueError, LookupError) as exc:
+        db.rollback()
+        return RedirectResponse(f"/sales-orders/new?error={quote(str(exc))}", status_code=303)
+    return RedirectResponse("/sales-orders/new?investigation_ok=1", status_code=303)
+
+
+@app.post("/procurement-demands/{demand_id}/close")
+def procurement_demand_close(demand_id: int, note: str = Form(""), db: Session = Depends(get_db)):
+    try:
+        close_investigation_demand(db, demand_id, note=note or None)
+    except LookupError as exc:
+        db.rollback()
+        raise HTTPException(404, str(exc)) from exc
+    except ValueError as exc:
+        db.rollback()
+        return RedirectResponse(f"/procurement-demands?view=investigation&error={quote(str(exc))}", status_code=303)
+    return RedirectResponse("/procurement-demands?view=investigation", status_code=303)
 
 
 @app.get("/stores", response_class=HTMLResponse)

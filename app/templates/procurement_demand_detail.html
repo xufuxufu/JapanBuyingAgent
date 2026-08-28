@@ -1,0 +1,34 @@
+{% extends "base.html" %}
+{% block title %}需求详情{% endblock %}
+{% block content %}
+<div class="section-head"><div><h1>{{ group.display_name }}</h1><p class="muted">{{ group.jan or 'JAN 未填写' }}</p></div><a class="button secondary" href="/procurement-demands">返回采购需求</a></div>
+
+<section class="card">
+  <p class="pd-confirmed">明确需求合计：<strong>{{ group.confirmed_quantity }}</strong>（默认计划采购数量：{{ inventory_context.default_planned_quantity }}）</p>
+  <p class="muted">调查任务：{{ group.investigation_demands|length ~ ' 条' if group.investigation_demands else '无' }}</p>
+</section>
+
+<section class="card">
+  <h2>参考库存</h2>
+  <p class="pd-inv-row"><span>中国参考：<strong>{{ inventory_context.inventory.china_quantity if inventory_context.inventory.china_known else '未知' }}</strong></span><span>日本参考：<strong>{{ inventory_context.inventory.japan_quantity if inventory_context.inventory.japan_known else '未知' }}</strong></span></p>
+  <p class="muted">快照时间：{{ inventory_context.inventory.snapshot_at|tokyo_datetime if inventory_context.inventory.snapshot_at else '暂无快照' }}{% if freshness_labels.get(inventory_context.inventory.freshness) %} · {{ freshness_labels[inventory_context.inventory.freshness] }}{% endif %}</p>
+  <p class="pd-shortage">{% if inventory_context.domestic_shortage_known %}国内明确缺口：<strong>{{ '参考库存可覆盖' if inventory_context.domestic_shortage == 0 else inventory_context.domestic_shortage }}</strong>{% else %}国内明确缺口：<strong>库存未知，请人工确认</strong>{% endif %}</p>
+  {% if inventory_context.inventory.japan_known and inventory_context.inventory.japan_quantity > 0 %}<p class="muted">日本有 {{ inventory_context.inventory.japan_quantity }} 件参考库存，可考虑调拨/避免重复采购。</p>{% endif %}
+</section>
+
+<section class="card">
+  <h2>原始需求来源</h2>
+  <div class="pd-source-table">
+    {% for demand in group.all_demands %}
+    <div class="pd-source-row">
+      <div><strong>{{ demand.source_person }}</strong><span class="badge">{{ demand_type_labels.get(demand.demand_type, demand.demand_type) }}</span></div>
+      <div class="muted">{{ demand.source_channel or '—' }} · {{ source_type_labels.get(demand.source_type, demand.source_type) }}</div>
+      <div>数量：{{ demand.requested_quantity if demand.requested_quantity is not none else '未填' }}</div>
+      <div class="muted">{{ status_labels.get(demand.status, demand.status) }} · {{ demand.created_at|tokyo_datetime }}</div>
+      {% if demand.note %}<div>备注：{{ demand.note }}</div>{% endif %}
+      {% if demand.sales_order_item %}<div class="muted">对应订单：<a href="/sales-orders/{{ demand.sales_order_item.sales_order_id }}">查看订单</a></div>{% endif %}
+    </div>
+    {% endfor %}
+  </div>
+</section>
+{% endblock %}

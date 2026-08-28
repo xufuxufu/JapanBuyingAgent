@@ -1744,6 +1744,96 @@ class SalesOrderShippingLabel(Base):
     sales_order: Mapped[SalesOrder] = relationship(back_populates="shipping_labels")
 
 
+class ProcurementDemand(Base):
+    """One raw procurement-need record from a single source.
+
+    Multiple demands for the same product are never merged into one row --
+    aggregation happens dynamically in app.procurement_service so every
+    source (who asked, through what channel, for how many) stays traceable.
+    """
+
+    __tablename__ = "procurement_demands"
+    __table_args__ = (
+        CheckConstraint(
+            "demand_type IN ('sales_confirmed','channel_shortage','manual_restock','investigation','system_restock')",
+            name="ck_procurement_demands_demand_type",
+        ),
+        CheckConstraint("source_person IN ('秀','丈母娘','老婆','系统')", name="ck_procurement_demands_source_person"),
+        CheckConstraint(
+            "source_type IN ('sales_order','channel_shortage','manual','investigation','system_restock')",
+            name="ck_procurement_demands_source_type",
+        ),
+        CheckConstraint("status IN ('open','planned','closed','cancelled')", name="ck_procurement_demands_status"),
+        CheckConstraint("requested_quantity IS NULL OR requested_quantity > 0", name="ck_procurement_demands_quantity_positive"),
+        Index(
+            "uq_procurement_demands_sales_order_item", "sales_order_item_id", unique=True,
+            sqlite_where=text("sales_order_item_id IS NOT NULL"),
+        ),
+        Index("ix_procurement_demands_status_type", "status", "demand_type"),
+        Index("ix_procurement_demands_product_status", "product_id", "status"),
+    )
+    id: Mapped[int] = mapped_column(primary_key=True)
+    product_id: Mapped[int | None] = mapped_column(ForeignKey("products.id", ondelete="SET NULL"), index=True)
+    product_name_snapshot: Mapped[str] = mapped_column(String(255), nullable=False)
+    jan_snapshot: Mapped[str | None] = mapped_column(String(32))
+    demand_type: Mapped[str] = mapped_column(String(20), nullable=False, index=True)
+    source_person: Mapped[str] = mapped_column(String(20), nullable=False)
+    source_channel: Mapped[str | None] = mapped_column(String(50))
+    source_type: Mapped[str] = mapped_column(String(20), nullable=False)
+    sales_order_item_id: Mapped[int | None] = mapped_column(ForeignKey("sales_order_items.id", ondelete="CASCADE"), index=True)
+    requested_quantity: Mapped[int | None] = mapped_column(Integer)
+    note: Mapped[str | None] = mapped_column(Text)
+    status: Mapped[str] = mapped_column(String(20), default="open", nullable=False, index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False, index=True)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow, nullable=False)
+    product: Mapped[Product | None] = relationship()
+    sales_order_item: Mapped[SalesOrderItem | None] = relationship()
+    plan_sources: Mapped[list[ProcurementDemandPlanSource]] = relationship(back_populates="demand")
+
+
+class ProcurementDemandPlan(Base):
+    """A purchasing decision for one product, made by aggregating open demands.
+
+    Phase 2A stops here: no actual purchase quantity/price/receipt tracking yet.
+    """
+
+    __tablename__ = "procurement_demand_plans"
+    __table_args__ = (
+        CheckConstraint("planned_quantity > 0", name="ck_procurement_demand_plans_quantity_positive"),
+        CheckConstraint("status IN ('planned','cancelled')", name="ck_procurement_demand_plans_status"),
+        Index("ix_procurement_demand_plans_status_created", "status", "created_at"),
+    )
+    id: Mapped[int] = mapped_column(primary_key=True)
+    product_id: Mapped[int | None] = mapped_column(ForeignKey("products.id", ondelete="SET NULL"), index=True)
+    product_name_snapshot: Mapped[str] = mapped_column(String(255), nullable=False)
+    jan_snapshot: Mapped[str | None] = mapped_column(String(32))
+    planned_quantity: Mapped[int] = mapped_column(Integer, nullable=False)
+    confirmed_demand_quantity_snapshot: Mapped[int | None] = mapped_column(Integer)
+    status: Mapped[str] = mapped_column(String(20), default="planned", nullable=False, index=True)
+    created_by: Mapped[str | None] = mapped_column(String(20))
+    note: Mapped[str | None] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False, index=True)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow, nullable=False)
+    product: Mapped[Product | None] = relationship()
+    sources: Mapped[list[ProcurementDemandPlanSource]] = relationship(
+        back_populates="plan", cascade="all, delete-orphan", order_by="ProcurementDemandPlanSource.id",
+    )
+
+
+class ProcurementDemandPlanSource(Base):
+    """Links a plan back to every demand it was built from, so 'why we're buying this' never gets lost."""
+
+    __tablename__ = "procurement_demand_plan_sources"
+    __table_args__ = (UniqueConstraint("plan_id", "demand_id", name="uq_procurement_demand_plan_sources_plan_demand"),)
+    id: Mapped[int] = mapped_column(primary_key=True)
+    plan_id: Mapped[int] = mapped_column(ForeignKey("procurement_demand_plans.id", ondelete="CASCADE"), nullable=False, index=True)
+    demand_id: Mapped[int] = mapped_column(ForeignKey("procurement_demands.id", ondelete="RESTRICT"), nullable=False, index=True)
+    quantity_snapshot: Mapped[int | None] = mapped_column(Integer)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
+    plan: Mapped[ProcurementDemandPlan] = relationship(back_populates="sources")
+    demand: Mapped[ProcurementDemand] = relationship(back_populates="plan_sources")
+
+
 from app.product_identity import install_product_identity_events
 
 install_product_identity_events()
