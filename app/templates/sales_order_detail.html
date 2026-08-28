@@ -44,6 +44,38 @@
 </section>
 
 <section class="card">
+  <h2>发货面单{% if order.shipping_labels %}（{{ order.shipping_labels|length }}）{% endif %}</h2>
+  {% if order.status == 'submitted' %}
+  <p class="muted">订单进入待发货后才能上传面单。</p>
+  {% else %}
+    {% if order.shipping_labels %}
+    <div class="shipping-label-grid">
+      {% for label in order.shipping_labels %}
+      <div class="shipping-label-card">
+        <a href="/sales-orders/shipping-labels/{{ label.id }}" target="_blank"><img class="shipping-label-thumb" loading="lazy" src="/sales-orders/shipping-labels/{{ label.id }}" alt="发货面单"></a>
+        <small>{{ label.created_at|tokyo_datetime }}</small>
+        <div class="button-row">
+          <a class="button secondary compact" href="/sales-orders/shipping-labels/{{ label.id }}" target="_blank">查看</a>
+          <a class="button secondary compact" href="/sales-orders/shipping-labels/{{ label.id }}/download">下载</a>
+          {% if can_delete_shipping_label %}
+          <form method="post" action="/sales-orders/shipping-labels/{{ label.id }}/delete" onsubmit="return confirm('确认删除该面单图片？');"><button type="submit" class="secondary compact">删除</button></form>
+          {% endif %}
+        </div>
+      </div>
+      {% endfor %}
+    </div>
+    {% else %}<p class="empty-state">暂无面单</p>{% endif %}
+    {% if can_upload_shipping_label %}
+    <form method="post" action="/sales-orders/{{ order.id }}/shipping-labels" enctype="multipart/form-data" class="shipping-label-upload-form">
+      <label class="tag-photo-picker">拍摄/上传面单图片<input type="file" name="file" accept="image/*" capture="environment" hidden></label>
+      <p id="shippingLabelFileName" class="muted" hidden></p>
+      <button type="submit">上传面单</button>
+    </form>
+    {% endif %}
+  {% endif %}
+</section>
+
+<section class="card">
   <h2>操作</h2>
   <div class="button-row">
     {% if primary_next_action %}
@@ -55,4 +87,19 @@
   </div>
   {% if not primary_next_action and order.status not in ('cancelled',) %}<p class="muted">当前状态已是流转终点，无需继续操作。</p>{% endif %}
 </section>
+<script>
+(() => {
+  const form = document.querySelector('.shipping-label-upload-form');
+  if (!form) return;
+  const input = form.querySelector('input[type="file"]');
+  const nameHint = document.getElementById('shippingLabelFileName');
+  input.addEventListener('change', () => {
+    if (!input.files.length) return;
+    nameHint.textContent = `已选择：${input.files[0].name}，上传中…`;
+    nameHint.hidden = false;
+    form.querySelector('button[type="submit"]').disabled = true;
+    form.submit();
+  });
+})();
+</script>
 {% endblock %}

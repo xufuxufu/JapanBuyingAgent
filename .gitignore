@@ -46,7 +46,9 @@ data/products/main/*
 data/products/qinsi-localized/*
 data/reports/*
 data/field-purchases/tag-evidence/*
+data/sales-orders/shipping-labels/*
 !data/db/.gitkeep
 !data/uploads/original/.gitkeep
 !data/uploads/preview/.gitkeep
 !data/products/main/.gitkeep
+!data/sales-orders/shipping-labels/.gitkeep

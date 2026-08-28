@@ -9,7 +9,7 @@ from alembic import command
 from alembic.config import Config
 
 
-HEAD_REVISION = "20260828_0039"
+HEAD_REVISION = "20260828_0040"
 
 
 def test_migration_from_empty_and_repeat_safe(tmp_path, monkeypatch):
@@ -34,7 +34,7 @@ def test_migration_from_empty_and_repeat_safe(tmp_path, monkeypatch):
             "enrichment_audit_logs", "product_operation_logs",
     } <= tables
     assert {"restock_lists", "restock_list_items"} <= tables
-    assert {"customers", "salespersons", "sales_orders", "sales_order_items"} <= tables
+    assert {"customers", "salespersons", "sales_orders", "sales_order_items", "sales_order_shipping_labels"} <= tables
     assert {"low_stock_threshold", "unit_name", "weight_kg", "qinsi_brand_master_id"} <= product_columns
     assert {"recipient_name_snapshot", "recipient_phone_snapshot", "shipping_address_snapshot"} <= sales_order_columns
     assert revision == (HEAD_REVISION,)
@@ -152,6 +152,102 @@ def test_0039_upgrade_preserves_submitted_and_cancelled_orders_and_downgrade_wor
     assert "recipient_name_snapshot" not in columns
     assert "REFERENCES sales_orders" in item_fk_sql
     assert revision == ("20260828_0038",)
+
+
+def test_0040_upgrade_adds_shipping_labels_without_touching_existing_fks(tmp_path, monkeypatch):
+    # Seed the literal 0039 schema by hand for the same reason 0039's own test does:
+    # migration 20260714_0001 bootstraps every table from the current, live
+    # app/models.py, so a command.upgrade(..., "20260828_0039")-based setup on an
+    # empty database would already include sales_order_shipping_labels and make
+    # 0040's own create_table a no-op, never exercising the real migration.
+    db_path = tmp_path / "sales-order-shipping-labels.sqlite3"
+    with sqlite3.connect(db_path) as connection:
+        connection.executescript("""
+        CREATE TABLE alembic_version (version_num VARCHAR(32) NOT NULL PRIMARY KEY);
+        INSERT INTO alembic_version VALUES ('20260828_0039');
+        CREATE TABLE customers (
+            id INTEGER PRIMARY KEY, name VARCHAR(255) NOT NULL, phone VARCHAR(50),
+            wechat_name VARCHAR(128), address TEXT, note TEXT,
+            created_at DATETIME NOT NULL, updated_at DATETIME NOT NULL
+        );
+        CREATE TABLE salespersons (
+            id INTEGER PRIMARY KEY, name VARCHAR(128) NOT NULL, active BOOLEAN NOT NULL,
+            created_at DATETIME NOT NULL, updated_at DATETIME NOT NULL
+        );
+        CREATE TABLE products (id INTEGER PRIMARY KEY, internal_sku VARCHAR(32) NOT NULL);
+        CREATE TABLE sales_orders (
+            id INTEGER PRIMARY KEY,
+            order_no VARCHAR(40) NOT NULL UNIQUE,
+            customer_id INTEGER NOT NULL REFERENCES customers(id) ON DELETE RESTRICT,
+            salesperson_id INTEGER NOT NULL REFERENCES salespersons(id) ON DELETE RESTRICT,
+            status VARCHAR(20) NOT NULL,
+            order_date DATETIME NOT NULL,
+            note TEXT,
+            recipient_name_snapshot VARCHAR(255), recipient_phone_snapshot VARCHAR(50), shipping_address_snapshot TEXT,
+            created_at DATETIME NOT NULL, updated_at DATETIME NOT NULL,
+            CONSTRAINT ck_sales_orders_status CHECK (status IN ('submitted','ready_to_ship','shipped','completed','cancelled'))
+        );
+        CREATE TABLE sales_order_items (
+            id INTEGER PRIMARY KEY,
+            sales_order_id INTEGER NOT NULL REFERENCES sales_orders(id) ON DELETE CASCADE,
+            product_id INTEGER REFERENCES products(id) ON DELETE SET NULL,
+            product_name_snapshot VARCHAR(255) NOT NULL,
+            jan_snapshot VARCHAR(32),
+            quantity INTEGER NOT NULL,
+            unit_sale_price NUMERIC(18,2) NOT NULL,
+            note TEXT,
+            created_at DATETIME NOT NULL, updated_at DATETIME NOT NULL
+        );
+        INSERT INTO customers (id, name, created_at, updated_at) VALUES (1, '旧客户', datetime('now'), datetime('now'));
+        INSERT INTO salespersons (id, name, active, created_at, updated_at) VALUES (1, '秀', 1, datetime('now'), datetime('now'));
+        INSERT INTO sales_orders (order_no, customer_id, salesperson_id, status, order_date, created_at, updated_at)
+            VALUES ('SO-OLD-0001', 1, 1, 'ready_to_ship', datetime('now'), datetime('now'), datetime('now'));
+        INSERT INTO sales_order_items (sales_order_id, product_name_snapshot, quantity, unit_sale_price, created_at, updated_at)
+            VALUES (1, '旧商品', 1, 100, datetime('now'), datetime('now'));
+        """)
+    monkeypatch.setenv("JBA_DATABASE_URL", f"sqlite:///{db_path.as_posix()}")
+    config = Config(str(Path(__file__).resolve().parents[1] / "alembic.ini"))
+
+    command.upgrade(config, "head")
+    with sqlite3.connect(db_path) as connection:
+        connection.execute("PRAGMA foreign_keys=ON")
+        tables = {row[0] for row in connection.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+        item_fk_sql = connection.execute("SELECT sql FROM sqlite_master WHERE name='sales_order_items'").fetchone()[0]
+        order_row = connection.execute("SELECT order_no, status FROM sales_orders WHERE id=1").fetchone()
+        revision = connection.execute("SELECT version_num FROM alembic_version").fetchone()
+        # A fresh shipping label must actually be insertable and cascade-delete cleanly.
+        connection.execute(
+            "INSERT INTO sales_order_shipping_labels (sales_order_id, stored_filename, relative_path, created_at) "
+            "VALUES (1, 'abc123.jpg', 'data/sales-orders/shipping-labels/1/abc123.jpg', datetime('now'))"
+        )
+        connection.commit()
+        fk_check = connection.execute("PRAGMA foreign_key_check").fetchall()
+        label_fk = connection.execute("PRAGMA foreign_key_list(sales_order_shipping_labels)").fetchall()
+    assert "sales_order_shipping_labels" in tables
+    assert "REFERENCES sales_orders" in item_fk_sql
+    assert order_row == ("SO-OLD-0001", "ready_to_ship")
+    assert fk_check == []
+    assert any(row[2] == "sales_orders" and row[3] == "sales_order_id" for row in label_fk)
+    assert revision == (HEAD_REVISION,)
+
+    with sqlite3.connect(db_path) as connection:
+        connection.execute("PRAGMA foreign_keys=ON")
+        connection.execute("DELETE FROM sales_orders WHERE id=1")
+        connection.commit()
+        remaining_labels = connection.execute("SELECT COUNT(*) FROM sales_order_shipping_labels").fetchone()[0]
+    assert remaining_labels == 0  # ON DELETE CASCADE removed the label with its order
+
+    command.downgrade(config, "20260828_0039")
+    with sqlite3.connect(db_path) as connection:
+        connection.execute("PRAGMA foreign_keys=ON")
+        tables = {row[0] for row in connection.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+        item_fk_sql = connection.execute("SELECT sql FROM sqlite_master WHERE name='sales_order_items'").fetchone()[0]
+        fk_check = connection.execute("PRAGMA foreign_key_check").fetchall()
+        revision = connection.execute("SELECT version_num FROM alembic_version").fetchone()
+    assert "sales_order_shipping_labels" not in tables
+    assert "REFERENCES sales_orders" in item_fk_sql
+    assert fk_check == []
+    assert revision == ("20260828_0039",)
 
 
 def test_upgrade_from_phase1_preserves_old_data(tmp_path, monkeypatch):

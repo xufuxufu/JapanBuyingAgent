@@ -125,12 +125,15 @@ from app.restock_service import (
     update_restock_list_status,
 )
 from app.sales_order_service import (
-    ALLOWED_TRANSITIONS, PRIMARY_NEXT_ACTION, STATUS_LABELS as SALES_ORDER_STATUS_CN,
-    SalesOrderItemInput, create_customer, create_sales_order,
-    ensure_default_salesperson, get_sales_order, list_sales_orders, list_salespersons,
-    search_customers, search_products as search_sales_order_products,
+    ALLOWED_TRANSITIONS, PRIMARY_NEXT_ACTION, SHIPPING_LABEL_DELETABLE_STATUSES,
+    SHIPPING_LABEL_UPLOADABLE_STATUSES, STATUS_LABELS as SALES_ORDER_STATUS_CN,
+    SalesOrderItemInput, add_shipping_label, create_customer, create_sales_order,
+    ensure_default_salesperson, get_sales_order, get_shipping_label, list_sales_orders,
+    list_salespersons, remove_shipping_label, search_customers,
+    search_products as search_sales_order_products,
     status_counts as sales_order_status_counts, update_sales_order_status,
 )
+from app.sales_order_shipping import resolve_shipping_label_path
 from app.provider_config import diagnostic_summary, provider_status_rows, test_provider_connection
 from app.rakuten_ip_monitor import rakuten_public_ip_status
 from app.product_translation_service import (
@@ -3044,6 +3047,8 @@ def sales_order_detail_page(order_id: int, request: Request, db: Session = Depen
         "order": order, "status_labels": SALES_ORDER_STATUS_CN,
         "allowed_transitions": ALLOWED_TRANSITIONS.get(order.status, set()),
         "primary_next_action": PRIMARY_NEXT_ACTION.get(order.status),
+        "can_upload_shipping_label": order.status in SHIPPING_LABEL_UPLOADABLE_STATUSES,
+        "can_delete_shipping_label": order.status in SHIPPING_LABEL_DELETABLE_STATUSES,
         "error": request.query_params.get("error"),
     })
 
@@ -3052,6 +3057,58 @@ def sales_order_detail_page(order_id: int, request: Request, db: Session = Depen
 def sales_order_status_update(order_id: int, status: str = Form(...), db: Session = Depends(get_db)):
     try:
         update_sales_order_status(db, order_id, status)
+    except LookupError as exc:
+        db.rollback()
+        raise HTTPException(404, str(exc)) from exc
+    except ValueError as exc:
+        db.rollback()
+        return RedirectResponse(f"/sales-orders/{order_id}?error={quote(str(exc))}", status_code=303)
+    return RedirectResponse(f"/sales-orders/{order_id}", status_code=303)
+
+
+@app.post("/sales-orders/{order_id}/shipping-labels")
+async def sales_order_shipping_label_upload(order_id: int, file: UploadFile = File(...), db: Session = Depends(get_db)):
+    content = await file.read()
+    try:
+        add_shipping_label(db, order_id, content=content, original_filename=file.filename)
+    except LookupError as exc:
+        db.rollback()
+        raise HTTPException(404, str(exc)) from exc
+    except ValueError as exc:
+        db.rollback()
+        return RedirectResponse(f"/sales-orders/{order_id}?error={quote(str(exc))}", status_code=303)
+    return RedirectResponse(f"/sales-orders/{order_id}", status_code=303)
+
+
+@app.get("/sales-orders/shipping-labels/{label_id}")
+def sales_order_shipping_label_view(label_id: int, db: Session = Depends(get_db)):
+    label = get_shipping_label(db, label_id)
+    if label is None:
+        raise HTTPException(404, "面单图片不存在")
+    path = resolve_shipping_label_path(label.relative_path)
+    if path is None:
+        raise HTTPException(404, "面单图片文件不存在")
+    return FileResponse(path, media_type=label.content_type or "application/octet-stream")
+
+
+@app.get("/sales-orders/shipping-labels/{label_id}/download")
+def sales_order_shipping_label_download(label_id: int, db: Session = Depends(get_db)):
+    label = get_shipping_label(db, label_id)
+    if label is None:
+        raise HTTPException(404, "面单图片不存在")
+    path = resolve_shipping_label_path(label.relative_path)
+    if path is None:
+        raise HTTPException(404, "面单图片文件不存在")
+    filename = label.original_filename or label.stored_filename
+    return FileResponse(path, media_type=label.content_type or "application/octet-stream", filename=filename)
+
+
+@app.post("/sales-orders/shipping-labels/{label_id}/delete")
+def sales_order_shipping_label_delete(label_id: int, db: Session = Depends(get_db)):
+    label = get_shipping_label(db, label_id)
+    order_id = label.sales_order_id if label else None
+    try:
+        remove_shipping_label(db, label_id)
     except LookupError as exc:
         db.rollback()
         raise HTTPException(404, str(exc)) from exc

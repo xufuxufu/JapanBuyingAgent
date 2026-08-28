@@ -1690,6 +1690,9 @@ class SalesOrder(Base):
     items: Mapped[list[SalesOrderItem]] = relationship(
         back_populates="sales_order", cascade="all, delete-orphan", order_by="SalesOrderItem.id",
     )
+    shipping_labels: Mapped[list[SalesOrderShippingLabel]] = relationship(
+        back_populates="sales_order", cascade="all, delete-orphan", order_by="SalesOrderShippingLabel.created_at",
+    )
 
     @property
     def total_amount(self) -> Decimal:
@@ -1726,6 +1729,19 @@ class SalesOrderItem(Base):
     @property
     def line_amount(self) -> Decimal:
         return (self.unit_sale_price or Decimal("0")) * self.quantity
+
+
+class SalesOrderShippingLabel(Base):
+    __tablename__ = "sales_order_shipping_labels"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    sales_order_id: Mapped[int] = mapped_column(ForeignKey("sales_orders.id", ondelete="CASCADE"), nullable=False, index=True)
+    stored_filename: Mapped[str] = mapped_column(String(255), nullable=False)
+    original_filename: Mapped[str | None] = mapped_column(String(255))
+    relative_path: Mapped[str] = mapped_column(Text, nullable=False)
+    content_type: Mapped[str | None] = mapped_column(String(100))
+    file_size: Mapped[int | None] = mapped_column(Integer)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False, index=True)
+    sales_order: Mapped[SalesOrder] = relationship(back_populates="shipping_labels")
 
 
 from app.product_identity import install_product_identity_events

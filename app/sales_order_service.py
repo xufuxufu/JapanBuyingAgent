@@ -7,7 +7,8 @@ from decimal import Decimal
 from sqlalchemy import func, or_, select
 from sqlalchemy.orm import Session, selectinload
 
-from app.models import Customer, Product, SalesOrder, SalesOrderItem, Salesperson
+from app.models import Customer, Product, SalesOrder, SalesOrderItem, SalesOrderShippingLabel, Salesperson
+from app.sales_order_shipping import delete_shipping_label_file, save_shipping_label_file
 
 
 DEFAULT_SALESPERSON_NAME = "秀"
@@ -40,6 +41,14 @@ PRIMARY_NEXT_ACTION: dict[str, tuple[str, str]] = {
     "ready_to_ship": ("shipped", "标记已发货"),
     "shipped": ("completed", "标记完成"),
 }
+
+# Shipping labels are domestic-warehouse dispatch photos, not a parcel/tracking
+# system: submitted orders haven't reached the warehouse yet, and cancelled orders
+# are done, so only these statuses accept new photos.
+SHIPPING_LABEL_UPLOADABLE_STATUSES = {"ready_to_ship", "shipped", "completed"}
+# Deleting a label is only offered while the order is still ready_to_ship, so a
+# mis-upload can be fixed without disturbing the historical record once shipped.
+SHIPPING_LABEL_DELETABLE_STATUSES = {"ready_to_ship"}
 
 
 def utcnow() -> datetime:
@@ -192,6 +201,7 @@ def get_sales_order(session: Session, order_id: int) -> SalesOrder | None:
         select(SalesOrder).where(SalesOrder.id == order_id).options(
             selectinload(SalesOrder.customer), selectinload(SalesOrder.salesperson),
             selectinload(SalesOrder.items).selectinload(SalesOrderItem.product),
+            selectinload(SalesOrder.shipping_labels),
         )
     )
 
@@ -203,6 +213,7 @@ def list_sales_orders(
     query = select(SalesOrder).options(
         selectinload(SalesOrder.customer), selectinload(SalesOrder.salesperson),
         selectinload(SalesOrder.items).selectinload(SalesOrderItem.product),
+        selectinload(SalesOrder.shipping_labels),
     )
     if status in ORDER_STATUSES:
         query = query.where(SalesOrder.status == status)
@@ -241,6 +252,12 @@ def update_sales_order_status(session: Session, order_id: int, target_status: st
         current_label = STATUS_LABELS.get(order.status, order.status)
         target_label = STATUS_LABELS.get(target_status, target_status)
         raise ValueError(f"订单当前状态为「{current_label}」，不能直接变更为「{target_label}」")
+    if order.status == "ready_to_ship" and target_status == "shipped":
+        has_label = session.scalar(
+            select(SalesOrderShippingLabel.id).where(SalesOrderShippingLabel.sales_order_id == order.id)
+        )
+        if not has_label:
+            raise ValueError("请先上传发货面单图片")
     order.status = target_status
     session.commit()
     return order
@@ -248,3 +265,48 @@ def update_sales_order_status(session: Session, order_id: int, target_status: st
 
 def cancel_sales_order(session: Session, order_id: int) -> SalesOrder:
     return update_sales_order_status(session, order_id, "cancelled")
+
+
+def add_shipping_label(
+    session: Session, order_id: int, *, content: bytes, original_filename: str | None,
+) -> SalesOrderShippingLabel:
+    order = session.get(SalesOrder, order_id)
+    if order is None:
+        raise LookupError("订单不存在")
+    if order.status not in SHIPPING_LABEL_UPLOADABLE_STATUSES:
+        raise ValueError(f"「{STATUS_LABELS.get(order.status, order.status)}」状态不支持上传发货面单")
+    stored_filename, relative_path, content_type, safe_original_name, file_size = save_shipping_label_file(
+        order.id, content=content, original_filename=original_filename,
+    )
+    try:
+        label = SalesOrderShippingLabel(
+            stored_filename=stored_filename, original_filename=safe_original_name,
+            relative_path=relative_path, content_type=content_type, file_size=file_size,
+        )
+        # Append through the relationship (not just setting sales_order_id) so
+        # order.shipping_labels stays correct in memory for the rest of this session
+        # -- e.g. later cascade deletes and re-reads of the already-loaded order.
+        order.shipping_labels.append(label)
+        session.commit()
+    except Exception:
+        session.rollback()
+        delete_shipping_label_file(relative_path)
+        raise
+    return label
+
+
+def get_shipping_label(session: Session, label_id: int) -> SalesOrderShippingLabel | None:
+    return session.get(SalesOrderShippingLabel, label_id)
+
+
+def remove_shipping_label(session: Session, label_id: int) -> None:
+    label = session.get(SalesOrderShippingLabel, label_id)
+    if label is None:
+        raise LookupError("面单图片不存在")
+    order = session.get(SalesOrder, label.sales_order_id)
+    if order is not None and order.status not in SHIPPING_LABEL_DELETABLE_STATUSES:
+        raise ValueError(f"「{STATUS_LABELS.get(order.status, order.status)}」状态不支持删除发货面单")
+    relative_path = label.relative_path
+    session.delete(label)
+    session.commit()
+    delete_shipping_label_file(relative_path)

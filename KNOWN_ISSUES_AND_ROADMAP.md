@@ -4,6 +4,7 @@ Last updated: 2026-08-27. Keep this file limited to unresolved items. Move compl
 
 ## Known Gaps
 
+- Migration `20260828_0039`'s first version rebuilt `sales_orders` via SQLite `DROP TABLE`+`RENAME` in a way that could leave `sales_order_items.sales_order_id` pointing at a transient table name instead of `sales_orders`. The migration file has been corrected (drop-then-rename with `foreign_keys` disabled for the whole rebuild); the dev database was manually repaired and verified with `PRAGMA foreign_key_check` (empty result). `SO-20260827-0001`'s empty item list is a leftover symptom of this bug, not a new defect.
 - Historical phase documents contain outdated statements such as "Receipt MVP", "future QinSi import/export", "no crawler/scheduler/notification", and iPhone re-validation notes. Use canonical docs first.
 - `scripts/verify_quick.bat` and `scripts/verify_core.bat` compile a historical key-file list and do not include every newer module/migration. They are still useful, but pytest is the broader baseline.
 - External provider health depends on credentials, permissions, allowed IP/referer, and rate limits. A 403/429 is not automatically a code regression.

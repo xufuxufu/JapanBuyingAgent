@@ -44,6 +44,9 @@
       <p class="so-summary">{{ order.item_kind_count }} 种商品 · 共 {{ order.total_quantity }} 件</p>
       <p class="so-total">¥{{ order.total_amount }}</p>
       <p class="muted so-address">收货：{{ order.recipient_name_snapshot or order.customer.name }} {{ order.recipient_phone_snapshot or order.customer.phone or '' }}<br>{{ order.shipping_address_snapshot or order.customer.address or '地址待补充' }}</p>
+      {% if order.status != 'submitted' %}
+      <p class="muted so-shipping-hint">{{ '面单 ' ~ order.shipping_labels|length ~ ' 张' if order.shipping_labels else '面单未上传' }}</p>
+      {% endif %}
       <div class="button-row so-actions">
         <a class="button secondary compact" href="/sales-orders/{{ order.id }}">查看</a>
         {% set next = primary_next_action.get(order.status) %}

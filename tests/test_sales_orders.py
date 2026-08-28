@@ -1,17 +1,42 @@
 from __future__ import annotations
 
+import io
 import json
 from decimal import Decimal
 
 import pytest
+from PIL import Image
 from sqlalchemy import select
 
-from app.models import Customer, Product, SalesOrder, Salesperson
+from app.models import Customer, Product, SalesOrder, SalesOrderShippingLabel, Salesperson
 from app.sales_order_service import (
-    ALLOWED_TRANSITIONS, DEFAULT_SALESPERSON_NAME, SalesOrderItemInput, cancel_sales_order,
+    ALLOWED_TRANSITIONS, DEFAULT_SALESPERSON_NAME, SHIPPING_LABEL_DELETABLE_STATUSES,
+    SHIPPING_LABEL_UPLOADABLE_STATUSES, SalesOrderItemInput, add_shipping_label, cancel_sales_order,
     create_customer, create_sales_order, ensure_default_salesperson, get_sales_order,
-    list_sales_orders, status_counts, update_sales_order_status,
+    get_shipping_label, list_sales_orders, remove_shipping_label, status_counts,
+    update_sales_order_status,
 )
+from app.sales_order_shipping import resolve_shipping_label_path
+
+
+def shipping_label_jpeg_bytes(color=(10, 120, 90), size=(64, 64)) -> bytes:
+    buffer = io.BytesIO()
+    Image.new("RGB", size, color).save(buffer, "JPEG")
+    return buffer.getvalue()
+
+
+@pytest.fixture(autouse=True)
+def _isolated_shipping_label_storage(tmp_path, monkeypatch):
+    # sales_order_shipping.py resolves saved files relative to its own module-level
+    # PROJECT_ROOT/SALES_ORDER_SHIPPING_LABEL_DIR bindings, independent of the
+    # client fixture's PROJECT_ROOT patches on other modules. Without this, every
+    # test in this file would write real image files into the real project's
+    # data/sales-orders/shipping-labels/ directory instead of a throwaway tmp_path.
+    import app.sales_order_shipping as shipping_module
+    monkeypatch.setattr(shipping_module, "PROJECT_ROOT", tmp_path)
+    monkeypatch.setattr(
+        shipping_module, "SALES_ORDER_SHIPPING_LABEL_DIR", tmp_path / "data" / "sales-orders" / "shipping-labels",
+    )
 
 
 def product(db, suffix: str, *, sale_price: int | None = 900) -> Product:
@@ -49,6 +74,7 @@ def test_submitted_to_ready_to_ship_succeeds(db_session):
 def test_ready_to_ship_to_shipped_succeeds(db_session):
     order = simple_order(db_session, name_suffix="2")
     update_sales_order_status(db_session, order.id, "ready_to_ship")
+    add_shipping_label(db_session, order.id, content=shipping_label_jpeg_bytes(), original_filename="label.jpg")
     updated = update_sales_order_status(db_session, order.id, "shipped")
     assert updated.status == "shipped"
 
@@ -56,6 +82,7 @@ def test_ready_to_ship_to_shipped_succeeds(db_session):
 def test_shipped_to_completed_succeeds(db_session):
     order = simple_order(db_session, name_suffix="3")
     update_sales_order_status(db_session, order.id, "ready_to_ship")
+    add_shipping_label(db_session, order.id, content=shipping_label_jpeg_bytes(), original_filename="label.jpg")
     update_sales_order_status(db_session, order.id, "shipped")
     updated = update_sales_order_status(db_session, order.id, "completed")
     assert updated.status == "completed"
@@ -90,6 +117,7 @@ def test_ready_to_ship_to_completed_rejected(db_session):
 def test_shipped_to_cancelled_rejected(db_session):
     order = simple_order(db_session, name_suffix="8")
     update_sales_order_status(db_session, order.id, "ready_to_ship")
+    add_shipping_label(db_session, order.id, content=shipping_label_jpeg_bytes(), original_filename="label.jpg")
     update_sales_order_status(db_session, order.id, "shipped")
     with pytest.raises(ValueError):
         update_sales_order_status(db_session, order.id, "cancelled")
@@ -98,6 +126,7 @@ def test_shipped_to_cancelled_rejected(db_session):
 def test_completed_cannot_transition_further(db_session):
     order = simple_order(db_session, name_suffix="9")
     update_sales_order_status(db_session, order.id, "ready_to_ship")
+    add_shipping_label(db_session, order.id, content=shipping_label_jpeg_bytes(), original_filename="label.jpg")
     update_sales_order_status(db_session, order.id, "shipped")
     update_sales_order_status(db_session, order.id, "completed")
     assert ALLOWED_TRANSITIONS["completed"] == set()
@@ -481,3 +510,223 @@ def test_new_order_page_has_recipient_fields_and_accepts_submission(client):
     order = get_sales_order(db, order_id)
     assert order.recipient_name_snapshot == "现场收件人"
     assert order.shipping_address_snapshot == "现场填写地址"
+
+
+# ---------------- shipping label tests ----------------
+
+
+def test_order_can_have_one_shipping_label(db_session):
+    order = simple_order(db_session, name_suffix="label-1")
+    update_sales_order_status(db_session, order.id, "ready_to_ship")
+    label = add_shipping_label(db_session, order.id, content=shipping_label_jpeg_bytes(), original_filename="label.jpg")
+    reloaded = get_sales_order(db_session, order.id)
+    assert len(reloaded.shipping_labels) == 1
+    assert reloaded.shipping_labels[0].id == label.id
+
+
+def test_order_can_have_multiple_shipping_labels(db_session):
+    order = simple_order(db_session, name_suffix="label-2")
+    update_sales_order_status(db_session, order.id, "ready_to_ship")
+    add_shipping_label(db_session, order.id, content=shipping_label_jpeg_bytes((1, 2, 3)), original_filename="a.jpg")
+    add_shipping_label(db_session, order.id, content=shipping_label_jpeg_bytes((4, 5, 6)), original_filename="b.jpg")
+    reloaded = get_sales_order(db_session, order.id)
+    assert len(reloaded.shipping_labels) == 2
+
+
+def test_shipping_label_relates_to_correct_order(db_session):
+    order_a = simple_order(db_session, name_suffix="label-3a")
+    order_b = simple_order(db_session, name_suffix="label-3b")
+    update_sales_order_status(db_session, order_a.id, "ready_to_ship")
+    update_sales_order_status(db_session, order_b.id, "ready_to_ship")
+    label = add_shipping_label(db_session, order_a.id, content=shipping_label_jpeg_bytes(), original_filename="a.jpg")
+    assert label.sales_order_id == order_a.id
+    assert get_sales_order(db_session, order_b.id).shipping_labels == []
+
+
+def test_deleting_order_cascades_shipping_labels(db_session):
+    order = simple_order(db_session, name_suffix="label-4")
+    update_sales_order_status(db_session, order.id, "ready_to_ship")
+    label = add_shipping_label(db_session, order.id, content=shipping_label_jpeg_bytes(), original_filename="a.jpg")
+    label_id = label.id
+    db_session.delete(order)
+    db_session.commit()
+    assert db_session.get(SalesOrderShippingLabel, label_id) is None
+
+
+def test_shipping_label_relative_path_is_relative(db_session):
+    order = simple_order(db_session, name_suffix="label-5")
+    update_sales_order_status(db_session, order.id, "ready_to_ship")
+    label = add_shipping_label(db_session, order.id, content=shipping_label_jpeg_bytes(), original_filename="a.jpg")
+    assert not label.relative_path.startswith("/")
+    assert not (len(label.relative_path) > 1 and label.relative_path[1] == ":")
+    assert label.relative_path.startswith("data/sales-orders/shipping-labels/")
+
+
+def test_shipping_label_original_filename_sanitized(db_session):
+    order = simple_order(db_session, name_suffix="label-6")
+    update_sales_order_status(db_session, order.id, "ready_to_ship")
+    label = add_shipping_label(
+        db_session, order.id, content=shipping_label_jpeg_bytes(), original_filename="../../etc/passwd.jpg",
+    )
+    assert label.original_filename == "passwd.jpg"
+    resolved = resolve_shipping_label_path(label.relative_path)
+    assert resolved is not None and resolved.is_file()
+
+
+def test_non_image_upload_rejected(db_session):
+    order = simple_order(db_session, name_suffix="label-7")
+    update_sales_order_status(db_session, order.id, "ready_to_ship")
+    with pytest.raises(ValueError):
+        add_shipping_label(db_session, order.id, content=b"not an image at all", original_filename="fake.jpg")
+
+
+def test_oversized_upload_rejected(db_session, monkeypatch):
+    monkeypatch.setenv("JBA_SHIPPING_LABEL_MAX_UPLOAD_MB", "1")
+    order = simple_order(db_session, name_suffix="label-8")
+    update_sales_order_status(db_session, order.id, "ready_to_ship")
+    oversized = b"0" * (2 * 1024 * 1024)
+    with pytest.raises(ValueError, match="不能超过"):
+        add_shipping_label(db_session, order.id, content=oversized, original_filename="big.jpg")
+
+
+def test_fake_extension_non_image_rejected(db_session):
+    order = simple_order(db_session, name_suffix="label-9")
+    update_sales_order_status(db_session, order.id, "ready_to_ship")
+    with pytest.raises(ValueError, match="JPG/PNG/WebP"):
+        add_shipping_label(db_session, order.id, content=b"<html>not really a jpg</html>", original_filename="sneaky.jpg")
+
+
+def test_ready_to_ship_without_label_to_shipped_rejected(db_session):
+    order = simple_order(db_session, name_suffix="label-10")
+    update_sales_order_status(db_session, order.id, "ready_to_ship")
+    with pytest.raises(ValueError, match="请先上传发货面单图片"):
+        update_sales_order_status(db_session, order.id, "shipped")
+
+
+def test_submitted_cannot_upload_shipping_label(db_session):
+    order = simple_order(db_session, name_suffix="label-11")
+    assert order.status not in SHIPPING_LABEL_UPLOADABLE_STATUSES
+    with pytest.raises(ValueError):
+        add_shipping_label(db_session, order.id, content=shipping_label_jpeg_bytes(), original_filename="a.jpg")
+
+
+def test_cancelled_cannot_upload_shipping_label(db_session):
+    order = simple_order(db_session, name_suffix="label-12")
+    update_sales_order_status(db_session, order.id, "cancelled")
+    assert order.status not in SHIPPING_LABEL_UPLOADABLE_STATUSES
+    with pytest.raises(ValueError):
+        add_shipping_label(db_session, order.id, content=shipping_label_jpeg_bytes(), original_filename="a.jpg")
+
+
+def test_ready_to_ship_can_delete_shipping_label(db_session):
+    order = simple_order(db_session, name_suffix="label-13")
+    update_sales_order_status(db_session, order.id, "ready_to_ship")
+    label = add_shipping_label(db_session, order.id, content=shipping_label_jpeg_bytes(), original_filename="a.jpg")
+    assert order.status in SHIPPING_LABEL_DELETABLE_STATUSES
+    resolved_before = resolve_shipping_label_path(label.relative_path)
+    remove_shipping_label(db_session, label.id)
+    assert get_shipping_label(db_session, label.id) is None
+    assert resolved_before is not None and not resolved_before.is_file()
+
+
+def test_shipped_cannot_delete_shipping_label_normally(db_session):
+    order = simple_order(db_session, name_suffix="label-14")
+    update_sales_order_status(db_session, order.id, "ready_to_ship")
+    label = add_shipping_label(db_session, order.id, content=shipping_label_jpeg_bytes(), original_filename="a.jpg")
+    update_sales_order_status(db_session, order.id, "shipped")
+    with pytest.raises(ValueError):
+        remove_shipping_label(db_session, label.id)
+    assert get_shipping_label(db_session, label.id) is not None
+
+
+def test_resolve_shipping_label_path_blocks_traversal(db_session):
+    assert resolve_shipping_label_path("../../app/main.py") is None
+    assert resolve_shipping_label_path("data/db/japan_buying_agent.sqlite3") is None
+    assert resolve_shipping_label_path("../../../../etc/passwd") is None
+
+
+# ---------------- shipping label route tests ----------------
+
+
+def test_upload_shipping_label_route_success(client):
+    http, db, _ = client
+    order = simple_order(db, name_suffix="label-route-1")
+    update_sales_order_status(db, order.id, "ready_to_ship")
+    response = http.post(
+        f"/sales-orders/{order.id}/shipping-labels",
+        files={"file": ("label.jpg", shipping_label_jpeg_bytes(), "image/jpeg")},
+        follow_redirects=False,
+    )
+    assert response.status_code == 303
+    reloaded = get_sales_order(db, order.id)
+    assert len(reloaded.shipping_labels) == 1
+
+
+def test_view_shipping_label_route_success(client):
+    http, db, _ = client
+    order = simple_order(db, name_suffix="label-route-2")
+    update_sales_order_status(db, order.id, "ready_to_ship")
+    label = add_shipping_label(db, order.id, content=shipping_label_jpeg_bytes(), original_filename="a.jpg")
+    response = http.get(f"/sales-orders/shipping-labels/{label.id}")
+    assert response.status_code == 200
+    assert response.headers["content-type"].startswith("image/")
+
+
+def test_download_shipping_label_route_success(client):
+    http, db, _ = client
+    order = simple_order(db, name_suffix="label-route-3")
+    update_sales_order_status(db, order.id, "ready_to_ship")
+    label = add_shipping_label(db, order.id, content=shipping_label_jpeg_bytes(), original_filename="my-label.jpg")
+    response = http.get(f"/sales-orders/shipping-labels/{label.id}/download")
+    assert response.status_code == 200
+    assert "attachment" in response.headers.get("content-disposition", "")
+    assert "my-label.jpg" in response.headers.get("content-disposition", "")
+
+
+def test_shipping_label_route_404_for_missing_label(client):
+    http, db, _ = client
+    assert http.get("/sales-orders/shipping-labels/9999999").status_code == 404
+    assert http.get("/sales-orders/shipping-labels/9999999/download").status_code == 404
+
+
+def test_shipping_label_route_safe_when_order_deleted(client):
+    http, db, _ = client
+    order = simple_order(db, name_suffix="label-route-4")
+    update_sales_order_status(db, order.id, "ready_to_ship")
+    label = add_shipping_label(db, order.id, content=shipping_label_jpeg_bytes(), original_filename="a.jpg")
+    label_id = label.id
+    live_order = db.get(SalesOrder, order.id)
+    db.delete(live_order)
+    db.commit()
+    assert http.get(f"/sales-orders/shipping-labels/{label_id}").status_code == 404
+
+
+def test_detail_page_shows_uploaded_shipping_label(client):
+    http, db, _ = client
+    order = simple_order(db, name_suffix="label-route-5")
+    update_sales_order_status(db, order.id, "ready_to_ship")
+    http.post(
+        f"/sales-orders/{order.id}/shipping-labels",
+        files={"file": ("label.jpg", shipping_label_jpeg_bytes(), "image/jpeg")},
+    )
+    detail = http.get(f"/sales-orders/{order.id}")
+    assert detail.status_code == 200
+    assert "发货面单（1）" in detail.text
+    assert "shipping-label-thumb" in detail.text
+
+
+def test_workbench_shows_label_count_hint(client):
+    http, db, _ = client
+    order = simple_order(db, name_suffix="label-route-6")
+    update_sales_order_status(db, order.id, "ready_to_ship")
+    add_shipping_label(db, order.id, content=shipping_label_jpeg_bytes(), original_filename="a.jpg")
+    listing = http.get("/sales-orders?status=ready_to_ship")
+    assert "面单 1 张" in listing.text
+
+
+def test_workbench_shows_no_label_hint(client):
+    http, db, _ = client
+    order = simple_order(db, name_suffix="label-route-7")
+    update_sales_order_status(db, order.id, "ready_to_ship")
+    listing = http.get("/sales-orders?status=ready_to_ship")
+    assert "面单未上传" in listing.text

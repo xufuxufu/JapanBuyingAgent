@@ -17,6 +17,7 @@ PRODUCT_IMAGE_DIR = DATA_DIR / "products" / "main"
 QINSI_PRODUCT_IMAGE_DIR = DATA_DIR / "products" / "qinsi-localized"
 REPORT_DIR = DATA_DIR / "reports"
 TAG_EVIDENCE_DIR = DATA_DIR / "field-purchases" / "tag-evidence"
+SALES_ORDER_SHIPPING_LABEL_DIR = DATA_DIR / "sales-orders" / "shipping-labels"
 DEFAULT_DB_PATH = DB_DIR / "japan_buying_agent.sqlite3"
 DEFAULT_RAKUTEN_HTTP_REFERER = "https://xufu-cp.taile96adb.ts.net:8020/"
 DEFAULT_RAKUTEN_ALLOWED_PUBLIC_IP = "14.10.7.65"
@@ -118,7 +119,7 @@ def database_url() -> str:
 def ensure_data_directories() -> None:
     for path in (
         DB_DIR, ORIGINAL_DIR, PREVIEW_DIR, PRODUCT_IMAGE_DIR,
-        QINSI_PRODUCT_IMAGE_DIR, REPORT_DIR, TAG_EVIDENCE_DIR,
+        QINSI_PRODUCT_IMAGE_DIR, REPORT_DIR, TAG_EVIDENCE_DIR, SALES_ORDER_SHIPPING_LABEL_DIR,
     ):
         path.mkdir(parents=True, exist_ok=True)
 
