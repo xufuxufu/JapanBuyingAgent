@@ -1,7 +1,8 @@
 {% extends "base.html" %}
 {% block title %}微信订单{% endblock %}
 {% block content %}
-<div class="section-head"><div><h1>微信订单</h1><p class="muted">记录客户通过微信提出的购买需求；不代表库存、采购或发货已经处理。</p></div><a class="button" href="/sales-orders/new">新建订单</a></div>
+<div class="so-page-header"><h1>微信订单</h1><a class="button compact" href="/sales-orders/new">+ 新建订单</a></div>
+<p class="muted so-page-sub">记录客户通过微信提出的购买需求；不代表库存、采购或发货已经处理。</p>
 
 <nav class="so-tabs" aria-label="订单状态">
   <a class="so-tab{% if not status %} active{% endif %}" href="/sales-orders">全部<span class="badge">{{ total_count }}</span></a>
@@ -12,10 +13,18 @@
 
 <section class="card so-filter-card"><form class="so-filter" method="get">
   <input type="hidden" name="status" value="{{ status }}">
-  <label>客户 / 订单号<input type="search" name="q" value="{{ q }}" placeholder="客户姓名或订单号"></label>
-  <label>下单日期起<input type="date" name="date_from" value="{{ date_from }}"></label>
-  <label>下单日期止<input type="date" name="date_to" value="{{ date_to }}"></label>
-  <button type="submit">筛选</button>
+  <div class="so-filter-quick-row">
+    <input type="search" name="q" value="{{ q }}" placeholder="搜索客户姓名或订单号" aria-label="客户 / 订单号">
+    <button type="submit" class="compact">搜索</button>
+  </div>
+  <details class="so-filter-more"{% if date_from or date_to %} open{% endif %}>
+    <summary>按下单日期筛选{% if date_from or date_to %}（已设置）{% endif %}</summary>
+    <div class="so-filter-dates">
+      <label>下单日期起<input type="date" name="date_from" value="{{ date_from }}"></label>
+      <label>下单日期止<input type="date" name="date_to" value="{{ date_to }}"></label>
+    </div>
+    <button type="submit" class="compact">应用筛选</button>
+  </details>
 </form></section>
 
 <section class="so-list">
@@ -28,10 +37,12 @@
     </div>
     <div class="so-items">
       {% for item in order.items %}
+      {% set image = product_image_url(item.product) if item.product else none %}
       <div class="so-item-row">
-        {% if item.product and item.product.preferred_image_url %}
-        <img class="product-thumb" loading="lazy" src="{{ item.product.preferred_image_url }}" alt="商品主图">
-        {% else %}<div class="product-image-empty product-thumb">无图</div>{% endif %}
+        <div class="product-thumb-slot{% if not image %} image-load-failed{% endif %}">
+          {% if image %}<img class="product-thumb" src="{{ image }}" alt="商品主图" loading="lazy" referrerpolicy="no-referrer" onerror="this.parentElement.classList.add('image-load-failed')">{% endif %}
+          <div class="product-image-empty">无图</div>
+        </div>
         <div>
           <strong>{{ item.product_name_snapshot }}</strong>
           <small>{{ item.jan_snapshot or 'JAN 未填写' }}</small>

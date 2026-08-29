@@ -25,6 +25,12 @@ def shipping_label_jpeg_bytes(color=(10, 120, 90), size=(64, 64)) -> bytes:
     return buffer.getvalue()
 
 
+def shipping_label_image_bytes(fmt: str, color=(20, 90, 140), size=(64, 64)) -> bytes:
+    buffer = io.BytesIO()
+    Image.new("RGB", size, color).save(buffer, fmt)
+    return buffer.getvalue()
+
+
 @pytest.fixture(autouse=True)
 def _isolated_shipping_label_storage(tmp_path, monkeypatch):
     # sales_order_shipping.py resolves saved files relative to its own module-level
@@ -440,6 +446,31 @@ def test_new_order_shows_product_image_or_placeholder(client):
     assert "product-image-empty" in detail.text
 
 
+def test_order_list_and_detail_reuse_shared_product_image_resolver(client):
+    from app.product_image_localization import preferred_product_image_url
+
+    http, db, _ = client
+    item = product(db, "6", sale_price=800)
+    item.display_image_url = "https://example.com/images/product-6.jpg"
+    db.flush()
+    expected_url = preferred_product_image_url(item)
+    assert expected_url == "https://example.com/images/product-6.jpg"
+
+    salesperson = ensure_default_salesperson(db)
+    buyer = customer(db, "解析器测试客户")
+    order = create_sales_order(
+        db, customer_id=buyer.id, salesperson_id=salesperson.id,
+        items=[SalesOrderItemInput(product_id=item.id, manual_name=None, jan=None, quantity=1, unit_sale_price=Decimal("800"))],
+    )
+
+    listing = http.get("/sales-orders")
+    assert expected_url in listing.text
+    assert "product-thumb-slot" in listing.text
+
+    detail = http.get(f"/sales-orders/{order.id}")
+    assert expected_url in detail.text
+
+
 def test_primary_action_buttons_present_per_status(client):
     http, db, _ = client
     order = simple_order(db, name_suffix="route-action")
@@ -662,6 +693,61 @@ def test_upload_shipping_label_route_success(client):
     assert len(reloaded.shipping_labels) == 1
 
 
+def test_upload_shipping_label_route_rejects_genuinely_empty_file(client):
+    http, db, _ = client
+    order = simple_order(db, name_suffix="label-route-empty")
+    update_sales_order_status(db, order.id, "ready_to_ship")
+    response = http.post(
+        f"/sales-orders/{order.id}/shipping-labels",
+        files={"file": ("empty.jpg", b"", "image/jpeg")},
+        follow_redirects=False,
+    )
+    assert response.status_code == 303
+    assert "error=" in response.headers["location"]
+    reloaded = get_sales_order(db, order.id)
+    assert len(reloaded.shipping_labels) == 0
+
+    detail = http.get(response.headers["location"])
+    assert detail.status_code == 200
+    assert "面单图片不能为空" in detail.text
+
+
+def test_upload_shipping_label_route_accepts_png_and_webp(client):
+    http, db, _ = client
+    order = simple_order(db, name_suffix="label-route-formats")
+    update_sales_order_status(db, order.id, "ready_to_ship")
+
+    png_response = http.post(
+        f"/sales-orders/{order.id}/shipping-labels",
+        files={"file": ("label.png", shipping_label_image_bytes("PNG"), "image/png")},
+        follow_redirects=False,
+    )
+    assert png_response.status_code == 303
+
+    webp_response = http.post(
+        f"/sales-orders/{order.id}/shipping-labels",
+        files={"file": ("label.webp", shipping_label_image_bytes("WEBP"), "image/webp")},
+        follow_redirects=False,
+    )
+    assert webp_response.status_code == 303
+
+    reloaded = get_sales_order(db, order.id)
+    assert len(reloaded.shipping_labels) == 2
+
+
+def test_delete_shipping_label_route_success(client):
+    http, db, _ = client
+    order = simple_order(db, name_suffix="label-route-delete")
+    update_sales_order_status(db, order.id, "ready_to_ship")
+    label = add_shipping_label(db, order.id, content=shipping_label_jpeg_bytes(), original_filename="a.jpg")
+    response = http.post(f"/sales-orders/shipping-labels/{label.id}/delete", follow_redirects=False)
+    assert response.status_code == 303
+    db.expire_all()
+    assert get_shipping_label(db, label.id) is None
+    reloaded = get_sales_order(db, order.id)
+    assert len(reloaded.shipping_labels) == 0
+
+
 def test_view_shipping_label_route_success(client):
     http, db, _ = client
     order = simple_order(db, name_suffix="label-route-2")
@@ -730,3 +816,15 @@ def test_workbench_shows_no_label_hint(client):
     update_sales_order_status(db, order.id, "ready_to_ship")
     listing = http.get("/sales-orders?status=ready_to_ship")
     assert "面单未上传" in listing.text
+
+
+def test_detail_page_has_single_shipping_and_action_section(client):
+    http, db, _ = client
+    order = simple_order(db, name_suffix="label-route-8")
+    update_sales_order_status(db, order.id, "ready_to_ship")
+    add_shipping_label(db, order.id, content=shipping_label_jpeg_bytes(), original_filename="a.jpg")
+    detail = http.get(f"/sales-orders/{order.id}")
+    assert detail.status_code == 200
+    assert detail.text.count("<h2>发货面单") == 1
+    assert detail.text.count("<h2>操作</h2>") == 1
+    assert detail.text.count('id="shippingLabelForm"') == 1

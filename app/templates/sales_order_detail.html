@@ -1,41 +1,41 @@
 {% extends "base.html" %}
 {% block title %}{{ order.order_no }} · 订单详情{% endblock %}
 {% block content %}
-<div class="section-head"><div><h1>{{ order.order_no }}</h1><p class="muted"><span class="badge state-{{ order.status }}">{{ status_labels.get(order.status, order.status) }}</span> · 下单 {{ order.order_date|tokyo_datetime }} · 销售员 {{ order.salesperson.name }}</p></div><a class="button secondary" href="/sales-orders">返回列表</a></div>
+<div class="so-detail-page">
+<div class="section-head"><div><h1>{{ order.order_no }}</h1><p class="muted"><span class="badge state-{{ order.status }}">{{ status_labels.get(order.status, order.status) }}</span> · 下单 {{ order.order_date|tokyo_datetime }} · 销售员 {{ order.salesperson.name }}</p></div><a class="button secondary compact" href="/sales-orders">返回列表</a></div>
 {% if error %}<div class="warning"><strong>操作失败：</strong>{{ error }}</div>{% endif %}
 
-<section class="card">
+<section class="card so-detail-card">
   <h2>客户信息</h2>
-  <div class="summary-grid">
-    <span><strong>{{ order.customer.name }}</strong>客户</span>
-    <span><strong>{{ order.customer.phone or '—' }}</strong>电话</span>
-    <span><strong>{{ order.customer.wechat_name or '—' }}</strong>微信名</span>
-  </div>
+  <div class="so-detail-line"><strong>{{ order.customer.name }}</strong><span class="muted">{{ order.customer.phone or '—' }}</span></div>
+  <p class="muted so-detail-sub">微信：{{ order.customer.wechat_name or '—' }}</p>
 </section>
 
-<section class="card">
+<section class="card so-detail-card">
   <h2>收货信息</h2>
-  <div class="summary-grid">
-    <span><strong>{{ order.recipient_name_snapshot or order.customer.name }}</strong>收件人</span>
-    <span><strong>{{ order.recipient_phone_snapshot or order.customer.phone or '—' }}</strong>收件手机号</span>
-  </div>
-  <p class="muted">地址：{{ order.shipping_address_snapshot or order.customer.address or '地址待补充' }}</p>
+  <div class="so-detail-line"><strong>{{ order.recipient_name_snapshot or order.customer.name }}</strong><span class="muted">{{ order.recipient_phone_snapshot or order.customer.phone or '—' }}</span></div>
+  <p class="muted so-detail-sub">地址：{{ order.shipping_address_snapshot or order.customer.address or '地址待补充' }}</p>
 </section>
 
-<section class="card">
+<section class="card so-detail-card">
   <h2>商品信息</h2>
-  <div class="stack">
+  <div class="stack item-detail-list">
     {% for item in order.items %}
+    {% set image = product_image_url(item.product) if item.product else none %}
+    {% set product_href = '/products/' ~ item.product_id if item.product_id else none %}
     <div class="row item-detail-row">
-      {% if item.product and item.product.preferred_image_url %}
-      <img class="product-thumb" loading="lazy" src="{{ item.product.preferred_image_url }}" alt="商品主图">
-      {% else %}<div class="product-image-empty product-thumb">无图</div>{% endif %}
-      <span>
-        <strong>{{ item.product_name_snapshot }}</strong>
-        <small>{{ item.jan_snapshot or 'JAN 未填写' }}{% if item.product_id %} · <a href="/products/{{ item.product_id }}">查看商品</a>{% else %} · 手工商品{% endif %}</small>
+      {% if product_href %}<a href="{{ product_href }}" aria-label="查看商品">{% endif %}
+      <div class="product-thumb-slot{% if not image %} image-load-failed{% endif %}">
+        {% if image %}<img class="product-thumb" src="{{ image }}" alt="商品主图" loading="lazy" referrerpolicy="no-referrer" onerror="this.parentElement.classList.add('image-load-failed')">{% endif %}
+        <div class="product-image-empty">无图</div>
+      </div>
+      {% if product_href %}</a>{% endif %}
+      <span class="item-detail-body">
+        {% if product_href %}<a class="item-detail-name" href="{{ product_href }}">{{ item.product_name_snapshot }}</a>{% else %}<strong class="item-detail-name">{{ item.product_name_snapshot }}</strong>{% endif %}
+        <small>{{ item.jan_snapshot or 'JAN 未填写' }}{% if not item.product_id %} · 手工商品{% endif %}</small>
         {% if item.note %}<small>备注：{{ item.note }}</small>{% endif %}
       </span>
-      <span class="badge">×{{ item.quantity }} · ¥{{ item.unit_sale_price }} = ¥{{ item.line_amount }}</span>
+      <span class="badge item-detail-price">×{{ item.quantity }} · ¥{{ item.line_amount }}</span>
     </div>
     {% else %}<p class="empty-state">订单暂无商品明细。</p>{% endfor %}
   </div>
@@ -43,7 +43,7 @@
   {% if order.note %}<p><strong>订单备注：</strong>{{ order.note }}</p>{% endif %}
 </section>
 
-<section class="card">
+<section class="card so-detail-card">
   <h2>发货面单{% if order.shipping_labels %}（{{ order.shipping_labels|length }}）{% endif %}</h2>
   {% if order.status == 'submitted' %}
   <p class="muted">订单进入待发货后才能上传面单。</p>
@@ -66,16 +66,19 @@
     </div>
     {% else %}<p class="empty-state">暂无面单</p>{% endif %}
     {% if can_upload_shipping_label %}
-    <form method="post" action="/sales-orders/{{ order.id }}/shipping-labels" enctype="multipart/form-data" class="shipping-label-upload-form">
-      <label class="tag-photo-picker">拍摄/上传面单图片<input type="file" name="file" accept="image/*" capture="environment" hidden></label>
-      <p id="shippingLabelFileName" class="muted" hidden></p>
-      <button type="submit">上传面单</button>
+    <form method="post" action="/sales-orders/{{ order.id }}/shipping-labels" enctype="multipart/form-data" class="shipping-label-upload-form" id="shippingLabelForm">
+      <label class="tag-photo-picker" id="shippingLabelPicker">拍照或从相册选择面单图片<input type="file" name="file" accept="image/*" id="shippingLabelInput" hidden></label>
+      <div id="shippingLabelPreview" class="shipping-label-selected-preview" hidden>
+        <img id="shippingLabelPreviewImage" alt="面单预览">
+        <span id="shippingLabelFileName"></span>
+      </div>
+      <button type="submit" id="shippingLabelSubmit" disabled>上传面单</button>
     </form>
     {% endif %}
   {% endif %}
 </section>
 
-<section class="card">
+<section class="card so-detail-card">
   <h2>操作</h2>
   <div class="button-row">
     {% if primary_next_action %}
@@ -87,18 +90,33 @@
   </div>
   {% if not primary_next_action and order.status not in ('cancelled',) %}<p class="muted">当前状态已是流转终点，无需继续操作。</p>{% endif %}
 </section>
+</div>
 <script>
 (() => {
-  const form = document.querySelector('.shipping-label-upload-form');
+  const form = document.getElementById('shippingLabelForm');
   if (!form) return;
-  const input = form.querySelector('input[type="file"]');
-  const nameHint = document.getElementById('shippingLabelFileName');
+  const input = document.getElementById('shippingLabelInput');
+  const submitButton = document.getElementById('shippingLabelSubmit');
+  const preview = document.getElementById('shippingLabelPreview');
+  const previewImage = document.getElementById('shippingLabelPreviewImage');
+  const fileName = document.getElementById('shippingLabelFileName');
   input.addEventListener('change', () => {
+    if (!input.files.length) {
+      submitButton.disabled = true;
+      preview.hidden = true;
+      previewImage.removeAttribute('src');
+      return;
+    }
+    const file = input.files[0];
+    fileName.textContent = `已选择：${file.name}`;
+    previewImage.src = URL.createObjectURL(file);
+    preview.hidden = false;
+    submitButton.disabled = false;
+  });
+  form.addEventListener('submit', () => {
     if (!input.files.length) return;
-    nameHint.textContent = `已选择：${input.files[0].name}，上传中…`;
-    nameHint.hidden = false;
-    form.querySelector('button[type="submit"]').disabled = true;
-    form.submit();
+    submitButton.disabled = true;
+    submitButton.textContent = '上传中…';
   });
 })();
 </script>
