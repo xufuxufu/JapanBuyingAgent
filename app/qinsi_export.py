@@ -82,6 +82,15 @@ class PurchaseAggregate:
 
 
 @dataclass(frozen=True, slots=True)
+class QinsiExportImageDecision:
+    url: str | None
+    source_domain: str | None
+    is_rakuten_fallback: bool
+    rescued_from_rakuten: bool
+    warning: str | None
+
+
+@dataclass(frozen=True, slots=True)
 class QinsiImageDiagnostic:
     original_url: str
     final_url: str | None
@@ -554,6 +563,17 @@ def qinsi_product_export_image_warning(product: Product) -> str | None:
     return None
 
 
+def qinsi_product_export_rakuten_fallback_warning(product: Product) -> str | None:
+    """Rakuten-specific companion to qinsi_product_export_image_warning().
+
+    That function only fires when the export column would be blank; this one
+    fires when the column WILL be written, but only with a Rakuten URL that
+    QinSi's importer has historically failed to fetch -- distinct enough to
+    warrant its own check/message rather than overloading the blank-warning.
+    """
+    return qinsi_export_image_decision(product).warning
+
+
 def _is_yahoo_qinsi_image_url(url: str) -> bool:
     return _host_of(url) == "item-shopping.c.yimg.jp"
 
@@ -687,18 +707,93 @@ def _diagnosed_qinsi_image_url(
     return None
 
 
-def _qinsi_export_image_url(product: Product, *, export_job_id: int | None = None) -> str | None:
+def _is_official_qinsi_image_url(product: Product, url: str) -> bool:
+    # There is no per-candidate platform tag at the URL level here (unlike
+    # the enrichment pipeline's ProductEnrichmentCandidate rows) -- a Product
+    # only ever has one recorded source URL/platform pair. main_image_source_platform
+    # is set from the same "official" classification product_enrichment.py
+    # already uses when the image was first chosen, so trust that recorded
+    # signal rather than guessing from the URL's host.
+    return bool(
+        product.main_image_source_platform == "official"
+        and product.main_image_source_url
+        and product.main_image_source_url.strip() == url
+    )
+
+
+def qinsi_export_image_decision(product: Product, *, export_job_id: int | None = None) -> QinsiExportImageDecision:
+    """Pick the export-safe image URL for the QinSi new-goods template.
+
+    Export-only priority (does NOT affect Product.main_image_source_url,
+    Product.display_image_url, or the general product_display_image()/
+    preferred_product_image_url() logic used for on-site thumbnails):
+      1. Product.qinsi_image_url -- a previously verified QinSi-safe override
+         (e.g. from an earlier rescue on this same product), re-checked so a
+         since-broken link doesn't get reused blindly.
+      2. Official / brand-site image (main_image_source_platform == "official").
+      3. Yahoo Shopping image (already QinSi-trusted).
+      4. Any other stable, publicly reachable, non-Rakuten image on file.
+      5. Rakuten -- only as a last resort, and only after one live rescue
+         attempt (re-searching Yahoo Shopping by JAN) fails to find a safe
+         replacement. QinSi's own importer cannot reliably fetch Rakuten's
+         thumbnail CDN even though our server can, so this is the one
+         source we actively try hardest to avoid.
+    """
+    if product.qinsi_image_url:
+        override_url = _diagnosed_qinsi_image_url(
+            product, [product.qinsi_image_url], export_job_id=export_job_id, allow_untrusted=True,
+        )
+        if override_url:
+            return QinsiExportImageDecision(override_url, _host_of(override_url), False, False, None)
+
     candidates = _qinsi_image_candidates(product)
-    yahoo_candidates = [url for url in candidates if _is_yahoo_qinsi_image_url(url)]
+    rakuten_candidates = [url for url in candidates if _is_rakuten_image_url(url)]
+    non_rakuten_candidates = [url for url in candidates if not _is_rakuten_image_url(url)]
+
+    official_candidates = [url for url in non_rakuten_candidates if _is_official_qinsi_image_url(product, url)]
+    official_url = _diagnosed_qinsi_image_url(product, official_candidates, export_job_id=export_job_id, allow_untrusted=True)
+    if official_url:
+        return QinsiExportImageDecision(official_url, _host_of(official_url), False, False, None)
+
+    yahoo_candidates = [url for url in non_rakuten_candidates if _is_yahoo_qinsi_image_url(url)]
     yahoo_url = _diagnosed_qinsi_image_url(product, yahoo_candidates, export_job_id=export_job_id, allow_untrusted=False)
     if yahoo_url:
-        return yahoo_url
-    other_candidates = [url for url in candidates if not _is_yahoo_qinsi_image_url(url) and not _is_rakuten_image_url(url)]
+        return QinsiExportImageDecision(yahoo_url, _host_of(yahoo_url), False, False, None)
+
+    other_candidates = [
+        url for url in non_rakuten_candidates
+        if url not in official_candidates and url not in yahoo_candidates
+    ]
     other_url = _diagnosed_qinsi_image_url(product, other_candidates, export_job_id=export_job_id, allow_untrusted=True)
     if other_url:
-        return other_url
-    rakuten_candidates = [url for url in candidates if _is_rakuten_image_url(url)]
-    return _diagnosed_qinsi_image_url(product, rakuten_candidates, export_job_id=export_job_id, allow_untrusted=True)
+        return QinsiExportImageDecision(other_url, _host_of(other_url), False, False, None)
+
+    if not rakuten_candidates:
+        return QinsiExportImageDecision(None, None, False, False, None)
+
+    rescued_url = _lookup_yahoo_qinsi_image(product)
+    if rescued_url:
+        logger.info(
+            "qinsi_product_image_rakuten_rescued export_job_id=%r product_id=%r jan=%r rescued_url=%r",
+            export_job_id, product.id, product.jan, rescued_url,
+        )
+        return QinsiExportImageDecision(rescued_url, _host_of(rescued_url), False, True, None)
+
+    rakuten_url = _diagnosed_qinsi_image_url(product, rakuten_candidates, export_job_id=export_job_id, allow_untrusted=True)
+    if rakuten_url:
+        logger.warning(
+            "qinsi_product_image_rakuten_fallback export_job_id=%r product_id=%r jan=%r url=%r",
+            export_job_id, product.id, product.jan, rakuten_url,
+        )
+        return QinsiExportImageDecision(
+            rakuten_url, _host_of(rakuten_url), True, False,
+            "商品图片仅剩乐天(Rakuten)来源可用，秦丝可能无法正常访问；建议手动下载后重新上传主图。",
+        )
+    return QinsiExportImageDecision(None, None, False, False, None)
+
+
+def _qinsi_export_image_url(product: Product, *, export_job_id: int | None = None) -> str | None:
+    return qinsi_export_image_decision(product, export_job_id=export_job_id).url
 
 
 def _goods_template_bytes(products: list[Product], *, export_job_id: int | None = None) -> bytes:

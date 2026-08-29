@@ -90,7 +90,8 @@ from app.qinsi_export import (
     confirm_qinsi_export, confirm_qinsi_product_export, confirmed_qinsi_product_import_product_ids, create_qinsi_product_export,
     generate_merged_purchase_batch_export, generate_purchase_batch_exports, get_qinsi_export_job, get_qinsi_product_export_job,
     list_qinsi_export_jobs, list_qinsi_product_export_jobs, purchase_item_export_states,
-    pending_qinsi_product_exports, qinsi_product_export_image_warning, qinsi_product_export_rows, qinsi_product_has_export_name,
+    pending_qinsi_product_exports, qinsi_product_export_image_warning, qinsi_product_export_rakuten_fallback_warning,
+    qinsi_product_export_rows, qinsi_product_has_export_name,
     qinsi_product_is_exportable, qinsi_product_requires_import,
     regenerate_qinsi_product_export_file, retry_failed_qinsi_lines,
 )
@@ -244,6 +245,7 @@ templates.env.globals["nav_unread_count"] = _nav_unread_count
 templates.env.globals["product_image_url"] = preferred_product_image_url
 templates.env.globals["product_display_image"] = product_display_image
 templates.env.globals["qinsi_product_export_image_warning"] = qinsi_product_export_image_warning
+templates.env.globals["qinsi_product_export_rakuten_fallback_warning"] = qinsi_product_export_rakuten_fallback_warning
 
 
 NAV_PERMISSIONS = {

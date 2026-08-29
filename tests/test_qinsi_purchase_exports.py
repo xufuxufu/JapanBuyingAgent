@@ -275,6 +275,211 @@ def test_qinsi_product_export_writes_yahoo_whitelist_image_and_blanks_non_whitel
     assert products[1].image_width == 1200 and products[1].image_height == 1200
 
 
+def test_qinsi_product_export_official_platform_beats_rakuten(monkeypatch, db_session):
+    official_url = "https://brand-official.example.com/product/4901234567894.jpg"
+    rakuten_url = "https://thumbnail.image.rakuten.co.jp/@0_mall/shop/cabinet/4901234567894.jpg"
+    product = Product(
+        jan="4901234567894", name_cn="官网图商品", status="new_pending_review",
+        main_image_source_url=official_url, main_image_source_platform="official",
+        image_url=rakuten_url,
+    )
+    db_session.add(product)
+    db_session.commit()
+
+    def fake_diagnostic(url):
+        return qinsi_export.QinsiImageDiagnostic(
+            url, url, 200, "image/jpeg", False, 900, 900, False, "blank", "host_not_qinsi_trusted",
+        )
+
+    monkeypatch.setattr(qinsi_export, "qinsi_image_diagnostic", fake_diagnostic)
+
+    job = create_qinsi_product_export(db_session, {product.id})
+    sheet = workbook(job.file_content)["商品导入"]
+    assert sheet.cell(2, 19).value == official_url
+
+
+def test_qinsi_product_export_prefers_yahoo_over_rakuten_when_both_present(monkeypatch, db_session):
+    yahoo_url = "https://item-shopping.c.yimg.jp/i/l/shop/4901234567894.jpg"
+    rakuten_url = "https://thumbnail.image.rakuten.co.jp/@0_mall/shop/cabinet/4901234567894.jpg"
+    product = Product(
+        jan="4901234567894", name_cn="Yahoo优先商品", status="new_pending_review",
+        main_image_source_url=yahoo_url, image_url=rakuten_url,
+    )
+    db_session.add(product)
+    db_session.commit()
+
+    def fake_diagnostic(url):
+        if url == yahoo_url:
+            return qinsi_export.QinsiImageDiagnostic(
+                url, url, 200, "image/jpeg", False, 800, 800, False, "write", "trusted_public_image",
+            )
+        raise AssertionError(f"must not diagnose rakuten when yahoo already succeeded: {url}")
+
+    monkeypatch.setattr(qinsi_export, "qinsi_image_diagnostic", fake_diagnostic)
+
+    job = create_qinsi_product_export(db_session, {product.id})
+    sheet = workbook(job.file_content)["商品导入"]
+    assert sheet.cell(2, 19).value == yahoo_url
+
+
+def test_qinsi_product_export_reuses_cached_qinsi_image_url_override(monkeypatch, db_session):
+    rescued_url = "https://item-shopping.c.yimg.jp/i/l/shop/rescued.jpg"
+    rakuten_url = "https://thumbnail.image.rakuten.co.jp/@0_mall/shop/cabinet/4901234567894.jpg"
+    product = Product(
+        jan="4901234567894", name_cn="已有秦丝专用图商品", status="new_pending_review",
+        main_image_source_url=rakuten_url, qinsi_image_url=rescued_url,
+    )
+    db_session.add(product)
+    db_session.commit()
+
+    def fake_diagnostic(url):
+        if url == rescued_url:
+            return qinsi_export.QinsiImageDiagnostic(
+                url, url, 200, "image/jpeg", False, 800, 800, False, "write", "trusted_public_image",
+            )
+        raise AssertionError(f"must not fall through to rakuten when a cached override is still valid: {url}")
+
+    monkeypatch.setattr(qinsi_export, "qinsi_image_diagnostic", fake_diagnostic)
+
+    job = create_qinsi_product_export(db_session, {product.id})
+    sheet = workbook(job.file_content)["商品导入"]
+    assert sheet.cell(2, 19).value == rescued_url
+
+
+def test_qinsi_product_export_stale_cached_override_falls_through_to_rakuten(monkeypatch, db_session):
+    stale_url = "https://item-shopping.c.yimg.jp/i/l/shop/gone-404.jpg"
+    rakuten_url = "https://thumbnail.image.rakuten.co.jp/@0_mall/shop/cabinet/4901234567894.jpg"
+    product = Product(
+        jan="4901234567894", name_cn="过期缓存图商品", status="new_pending_review",
+        main_image_source_url=rakuten_url, qinsi_image_url=stale_url,
+    )
+    db_session.add(product)
+    db_session.commit()
+
+    def fake_diagnostic(url):
+        if url == stale_url:
+            return qinsi_export.QinsiImageDiagnostic(url, None, 404, None, False, None, None, False, "blank", "http_404")
+        return qinsi_export.QinsiImageDiagnostic(
+            url, url, 200, "image/jpeg", False, 900, 900, False, "blank", "host_not_qinsi_trusted",
+        )
+
+    monkeypatch.setattr(qinsi_export, "qinsi_image_diagnostic", fake_diagnostic)
+    monkeypatch.setattr(qinsi_export, "_lookup_yahoo_qinsi_image", lambda product: None)
+
+    job = create_qinsi_product_export(db_session, {product.id})
+    sheet = workbook(job.file_content)["商品导入"]
+    assert sheet.cell(2, 19).value == rakuten_url
+
+
+def test_qinsi_product_export_rakuten_only_tries_yahoo_rescue_before_writing_rakuten(monkeypatch, db_session):
+    rakuten_url = "https://thumbnail.image.rakuten.co.jp/@0_mall/shop/cabinet/4901234567894.jpg"
+    rescued_url = "https://item-shopping.c.yimg.jp/i/l/shop/rescued-live.jpg"
+    product = Product(
+        jan="4901234567894", name_cn="仅乐天可救回商品", status="new_pending_review",
+        main_image_source_url=rakuten_url,
+    )
+    db_session.add(product)
+    db_session.commit()
+
+    def fake_diagnostic(url):
+        raise AssertionError(f"rakuten must not be diagnosed once the live rescue already succeeded: {url}")
+
+    rescue_calls = []
+
+    def fake_rescue(target_product):
+        rescue_calls.append(target_product.jan)
+        target_product.qinsi_image_url = rescued_url
+        return rescued_url
+
+    monkeypatch.setattr(qinsi_export, "qinsi_image_diagnostic", fake_diagnostic)
+    monkeypatch.setattr(qinsi_export, "_lookup_yahoo_qinsi_image", fake_rescue)
+
+    job = create_qinsi_product_export(db_session, {product.id})
+    sheet = workbook(job.file_content)["商品导入"]
+    assert sheet.cell(2, 19).value == rescued_url
+    assert rescue_calls == ["4901234567894"]
+    assert product.qinsi_image_url == rescued_url
+    # The rescue must not touch the site-wide main image fields.
+    assert product.main_image_source_url == rakuten_url
+
+
+def test_qinsi_product_export_rakuten_only_and_rescue_fails_still_writes_rakuten_as_fallback(monkeypatch, db_session):
+    rakuten_url = "https://thumbnail.image.rakuten.co.jp/@0_mall/shop/cabinet/4901234567894.jpg"
+    product = Product(
+        jan="4901234567894", name_cn="仅乐天且救不回商品", status="new_pending_review",
+        main_image_source_url=rakuten_url,
+    )
+    db_session.add(product)
+    db_session.commit()
+
+    def fake_diagnostic(url):
+        return qinsi_export.QinsiImageDiagnostic(
+            url, url, 200, "image/jpeg", False, 900, 900, False, "blank", "host_not_qinsi_trusted",
+        )
+
+    monkeypatch.setattr(qinsi_export, "qinsi_image_diagnostic", fake_diagnostic)
+    monkeypatch.setattr(qinsi_export, "_lookup_yahoo_qinsi_image", lambda product: None)
+
+    job = create_qinsi_product_export(db_session, {product.id})
+    sheet = workbook(job.file_content)["商品导入"]
+    assert sheet.cell(2, 19).value == rakuten_url
+
+    warning = qinsi_export.qinsi_product_export_rakuten_fallback_warning(product)
+    assert warning is not None and "乐天" in warning and "Rakuten" in warning
+
+
+def test_qinsi_product_export_rakuten_fallback_warning_is_none_when_not_applicable(monkeypatch, db_session):
+    yahoo_url = "https://item-shopping.c.yimg.jp/i/l/shop/4901234567894.jpg"
+    product = Product(
+        jan="4901234567894", name_cn="Yahoo商品无警告", status="new_pending_review",
+        main_image_source_url=yahoo_url,
+    )
+    db_session.add(product)
+    db_session.commit()
+
+    def fake_diagnostic(url):
+        return qinsi_export.QinsiImageDiagnostic(
+            url, url, 200, "image/jpeg", False, 800, 800, False, "write", "trusted_public_image",
+        )
+
+    monkeypatch.setattr(qinsi_export, "qinsi_image_diagnostic", fake_diagnostic)
+    assert qinsi_export.qinsi_product_export_rakuten_fallback_warning(product) is None
+
+
+def test_qinsi_export_rakuten_rescue_does_not_affect_site_wide_product_display_image(monkeypatch, db_session):
+    # The QinSi-only rescue/priority logic must never change what the
+    # general site shows as this product's main image.
+    from app.product_image_localization import preferred_product_image_url
+
+    rakuten_url = "https://thumbnail.image.rakuten.co.jp/@0_mall/shop/cabinet/4901234567894.jpg"
+    product = Product(
+        jan="4901234567894", name_cn="站内图不受影响商品", status="new_pending_review",
+        main_image_source_url=rakuten_url, display_image_url=rakuten_url,
+    )
+    db_session.add(product)
+    db_session.commit()
+
+    before = preferred_product_image_url(product)
+
+    def fake_diagnostic(url):
+        return qinsi_export.QinsiImageDiagnostic(
+            url, url, 200, "image/jpeg", False, 900, 900, False, "blank", "host_not_qinsi_trusted",
+        )
+
+    monkeypatch.setattr(qinsi_export, "qinsi_image_diagnostic", fake_diagnostic)
+    monkeypatch.setattr(qinsi_export, "_lookup_yahoo_qinsi_image", lambda p: (
+        setattr(p, "qinsi_image_url", "https://item-shopping.c.yimg.jp/i/l/shop/rescued.jpg") or
+        "https://item-shopping.c.yimg.jp/i/l/shop/rescued.jpg"
+    ))
+
+    create_qinsi_product_export(db_session, {product.id})
+
+    after = preferred_product_image_url(product)
+    assert before == after == rakuten_url
+    assert product.main_image_source_url == rakuten_url
+    assert product.display_image_url == rakuten_url
+
+
 def test_qinsi_product_export_allows_local_image_without_public_url(db_session):
     product = Product(
         jan="4901234567894",
