@@ -56,8 +56,8 @@
 
   function buildVideoConstraints(deviceId, platform) {
     const constraints = {
-      width: {ideal: 1920},
-      height: {ideal: 1080},
+      width: {ideal: 1280},
+      height: {ideal: 720},
       frameRate: {ideal: 30, max: 30},
     };
     if (deviceId) {
@@ -221,9 +221,15 @@
       this.debug = options.debug || null;
       this.onCode = options.onCode || (() => {});
       this.validJan = options.validJan || defaultValidJan;
-      this.scanIntervalMs = Number(options.scanIntervalMs || 180);
+      this.scanIntervalMs = Number(options.scanIntervalMs || 220);
       this.sameCodeDebounceMs = Number(options.sameCodeDebounceMs || 1600);
       this.noResultFallbackMs = Number(options.noResultFallbackMs || 4000);
+      // ZXing is a software decoder running on the main thread (no native
+      // BarcodeDetector on iOS Safari); decoding immediately after the video
+      // frame first reports "ready" can race the camera's own autofocus/
+      // auto-exposure convergence, wasting decode attempts on a still-settling
+      // frame. This short pause only applies to the ZXing fallback path.
+      this.zxingSettleDelayMs = Number(options.zxingSettleDelayMs || 260);
       this.cameraAdapter = options.cameraAdapter || new CameraAdapter(options.cameraOptions || {});
       this.detector = null;
       this.zxingReader = null;
@@ -374,6 +380,10 @@
       this.stats.zxingReaderCreated = true;
       this.stats.roiMode = "full_frame";
       await this.waitForVideoFrame();
+      if (this.zxingSettleDelayMs > 0) {
+        await new Promise((resolve) => scheduleTimeout(resolve, this.zxingSettleDelayMs));
+      }
+      if (loopId !== this.loopGeneration) return;
       this.scanning = true;
       const decode = () => {
         if (!this.scanning || loopId !== this.loopGeneration || !this.zxingReader) return;
@@ -562,7 +572,13 @@
 
     renderDiagnostics() {
       if (!this.debug) return;
-      this.debug.hidden = false;
+      // Only refresh the content here -- do NOT force the element visible.
+      // This previously ran on every decode attempt (many times per second
+      // while scanning), which meant the debug JSON panel popped open for
+      // every user as soon as scanning started, regardless of whether the
+      // page ever asked to show it. Visibility is the caller's decision
+      // (e.g. price_check.html keeps it hidden unless ?debug=1 or a real
+      // camera-start error occurs).
       this.debug.textContent = JSON.stringify(this.diagnostics(), null, 2);
     }
   }

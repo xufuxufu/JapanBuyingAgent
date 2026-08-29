@@ -8,7 +8,7 @@
   <link rel="manifest" href="/static/manifest.webmanifest">
   <link rel="stylesheet" href="/static/app.css">
 </head>
-<body>
+<body class="{% block body_class %}{% endblock %}">
   <header class="mobile-header">
     <button type="button" class="mobile-back" aria-label="返回" onclick="history.back()">‹</button>
     <a id="mobilePageTitle" href="/">Japan Buying Agent</a>

@@ -726,7 +726,7 @@ def test_field_purchase_api_and_navigation_permissions(client, monkeypatch, jpeg
     assert "秦丝数据" in admin_more.text
 
 
-def test_camera_contract_uses_high_resolution_roi_and_safe_capability_fallback():
+def test_camera_contract_uses_moderate_resolution_roi_and_safe_capability_fallback():
     root = Path(__file__).resolve().parents[1]
     script = (root / "app" / "static" / "field_purchase.js").read_text(encoding="utf-8")
     adapter = (root / "app" / "static" / "camera_adapter.js").read_text(encoding="utf-8")
@@ -735,8 +735,8 @@ def test_camera_contract_uses_high_resolution_roi_and_safe_capability_fallback()
     price_template = (root / "app" / "templates" / "price_check.html").read_text(encoding="utf-8")
 
     for contract in (
-        "width: {ideal: 1920}",
-        "height: {ideal: 1080}",
+        "width: {ideal: 1280}",
+        "height: {ideal: 720}",
         "frameRate: {ideal: 30, max: 30}",
         'constraints.resizeMode = {ideal: "none"}',
         "constraints.zoom = {ideal: 1}",
@@ -965,6 +965,254 @@ function makeStream(track) {{
   assert.equal(playName, "PlaybackError");
   const busy = new Error("camera busy"); busy.name = "NotReadableError";
   assert(api.cameraErrorDetails(busy, {{secureContext:true,platform:{{kind:"ios-webkit"}},mediaDevices:{{getUserMedia(){{}}}}}}).message.includes("占用"));
+}})().catch((error) => {{ console.error(error); process.exit(1); }});
+"""
+    completed = subprocess.run(
+        [node, "-e", program],
+        cwd=root,
+        text=True,
+        capture_output=True,
+        timeout=30,
+        check=False,
+    )
+    assert completed.returncode == 0, completed.stderr
+
+
+def test_unified_jan_scanner_skips_decode_until_video_ready_and_disposes_on_restart():
+    node = shutil.which("node")
+    assert node, "UnifiedJanScanner Mock 测试需要 Node.js"
+    root = Path(__file__).resolve().parents[1]
+    adapter_path = json.dumps(str(root / "app" / "static" / "camera_adapter.js"))
+    program = f"""
+const assert = require("assert");
+const api = require({adapter_path});
+
+let decodeCalls = 0;
+let readerInstances = [];
+class FakeReader {{
+  constructor() {{ this.resetCalls = 0; readerInstances.push(this); }}
+  decode(video) {{
+    decodeCalls += 1;
+    const error = new Error("not found");
+    error.name = "NotFoundException";
+    throw error;
+  }}
+  reset() {{ this.resetCalls += 1; }}
+}}
+globalThis.ZXingBrowser = {{
+  BrowserMultiFormatReader: FakeReader,
+  BarcodeFormat: {{EAN_13: 1, EAN_8: 2, UPC_A: 3}},
+}};
+
+const listeners = {{}};
+const video = {{
+  readyState: 0, videoWidth: 0, videoHeight: 0, srcObject: null,
+  classList: {{add() {{}}, remove() {{}}}},
+  addEventListener(type, fn) {{ (listeners[type] = listeners[type] || []).push(fn); }},
+  removeEventListener(type, fn) {{
+    if (!listeners[type]) return;
+    listeners[type] = listeners[type].filter((item) => item !== fn);
+  }},
+  play: async () => {{}},
+}};
+function fireVideoEvent(type) {{ (listeners[type] || []).slice().forEach((fn) => fn()); }}
+
+const fakeTrack = {{getSettings: () => ({{}})}};
+const fakeStream = {{getVideoTracks: () => [fakeTrack]}};
+const fakeCameraAdapter = {{
+  async start(deviceId, opts) {{
+    await opts.onStream(fakeStream);
+    return {{
+      stream: fakeStream, track: fakeTrack, devices: [], capabilities: {{}},
+      settings: {{}}, torchSupported: false, warnings: [],
+    }};
+  }},
+  stop() {{}},
+}};
+
+(async () => {{
+  const scanner = new api.UnifiedJanScanner({{video, cameraAdapter: fakeCameraAdapter, onCode: () => {{}}}});
+  const startPromise = scanner.start();
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  assert.equal(decodeCalls, 0, "decode must not run before readyState/videoWidth/videoHeight are ready");
+
+  video.readyState = 2; video.videoWidth = 640; video.videoHeight = 480;
+  fireVideoEvent("loadedmetadata");
+  await startPromise;
+  await new Promise((resolve) => setTimeout(resolve, 60));
+  assert(decodeCalls >= 1, "decode should start running once the video frame is ready");
+  assert.equal(readerInstances.length, 1);
+
+  const firstReader = readerInstances[0];
+  const generationAfterFirstStart = scanner.loopGeneration;
+
+  // Simulate "继续扫码": video briefly reports not-ready again mid-restart,
+  // then becomes ready — the scanner must fully dispose the old reader/stream
+  // before starting a fresh one, and must not decode against the stale frame.
+  video.readyState = 0; video.videoWidth = 0; video.videoHeight = 0;
+  const restartPromise = scanner.start();
+  assert.equal(firstReader.resetCalls, 1, "old zxing reader must be reset() during restart's stop()");
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  assert.equal(readerInstances.length, 1, "no new reader should be created until the restarted frame is ready");
+
+  video.readyState = 2; video.videoWidth = 640; video.videoHeight = 480;
+  fireVideoEvent("loadedmetadata");
+  await restartPromise;
+  await new Promise((resolve) => setTimeout(resolve, 60));
+
+  assert.equal(readerInstances.length, 2, "restart must create exactly one new reader, not stack loops");
+  assert(scanner.loopGeneration > generationAfterFirstStart, "loop generation must advance so the old decode closure self-cancels");
+
+  scanner.stop("test_complete");
+  process.exit(0);
+}})().catch((error) => {{ console.error(error); process.exit(1); }});
+"""
+    completed = subprocess.run(
+        [node, "-e", program],
+        cwd=root,
+        text=True,
+        capture_output=True,
+        timeout=30,
+        check=False,
+    )
+    assert completed.returncode == 0, completed.stderr
+
+
+def test_zxing_settle_delay_applies_only_to_zxing_not_barcode_detector():
+    node = shutil.which("node")
+    assert node, "UnifiedJanScanner Mock 测试需要 Node.js"
+    root = Path(__file__).resolve().parents[1]
+    adapter_path = json.dumps(str(root / "app" / "static" / "camera_adapter.js"))
+    program = f"""
+const assert = require("assert");
+const api = require({adapter_path});
+
+function makeVideo() {{
+  const listeners = {{}};
+  return {{
+    readyState: 2, videoWidth: 640, videoHeight: 480, srcObject: null,
+    classList: {{add() {{}}, remove() {{}}}},
+    addEventListener(type, fn) {{ (listeners[type] = listeners[type] || []).push(fn); }},
+    removeEventListener() {{}},
+    play: async () => {{}},
+  }};
+}}
+
+function makeFakeCameraAdapter() {{
+  const fakeTrack = {{getSettings: () => ({{}})}};
+  const fakeStream = {{getVideoTracks: () => [fakeTrack]}};
+  return {{
+    async start(deviceId, opts) {{
+      await opts.onStream(fakeStream);
+      return {{
+        stream: fakeStream, track: fakeTrack, devices: [], capabilities: {{}},
+        settings: {{}}, torchSupported: false, warnings: [],
+      }};
+    }},
+    stop() {{}},
+  }};
+}}
+
+(async () => {{
+  // ZXing path: video is ready from the very first tick (readyState=2 already),
+  // so the only thing that can delay the first decode() call is zxingSettleDelayMs.
+  let zxingDecodeCalls = 0;
+  class FakeReader {{
+    decode() {{ zxingDecodeCalls += 1; const e = new Error("nf"); e.name = "NotFoundException"; throw e; }}
+    reset() {{}}
+  }}
+  delete globalThis.BarcodeDetector;
+  globalThis.ZXingBrowser = {{
+    BrowserMultiFormatReader: FakeReader,
+    BarcodeFormat: {{EAN_13: 1, EAN_8: 2, UPC_A: 3}},
+  }};
+  const zxingScanner = new api.UnifiedJanScanner({{
+    video: makeVideo(), cameraAdapter: makeFakeCameraAdapter(), onCode: () => {{}},
+    zxingSettleDelayMs: 200,
+  }});
+  const zxingStart = zxingScanner.start();
+  await new Promise((resolve) => setTimeout(resolve, 50));
+  assert.equal(zxingDecodeCalls, 0, "ZXing must wait out zxingSettleDelayMs before its first decode() call");
+  await zxingStart;
+  assert(zxingDecodeCalls >= 1, "ZXing should have decoded at least once once start() resolves");
+  zxingScanner.stop("done");
+
+  // Android/Chrome path: BarcodeDetector is natively available, so the settle
+  // delay (a ZXing-only workaround for iOS Safari's software decoder) must
+  // not slow this path down at all -- Android should stay exactly as fast.
+  let detectorCalls = 0;
+  globalThis.BarcodeDetector = class {{
+    static async getSupportedFormats() {{ return ["ean_13", "ean_8", "upc_a", "upc_e"]; }}
+    async detect() {{ detectorCalls += 1; return []; }}
+  }};
+  const detectorScanner = new api.UnifiedJanScanner({{
+    video: makeVideo(), cameraAdapter: makeFakeCameraAdapter(), onCode: () => {{}},
+    zxingSettleDelayMs: 200,
+  }});
+  const detectorStart = detectorScanner.start();
+  await new Promise((resolve) => setTimeout(resolve, 50));
+  assert(detectorCalls >= 1, "BarcodeDetector (Android/Chrome) must not be held back by the ZXing-only settle delay");
+  await detectorStart;
+  detectorScanner.stop("done");
+
+  process.exit(0);
+}})().catch((error) => {{ console.error(error); process.exit(1); }});
+"""
+    completed = subprocess.run(
+        [node, "-e", program],
+        cwd=root,
+        text=True,
+        capture_output=True,
+        timeout=30,
+        check=False,
+    )
+    assert completed.returncode == 0, completed.stderr
+
+
+def test_render_diagnostics_does_not_force_debug_panel_visible():
+    # renderDiagnostics() used to set `this.debug.hidden = false` on every
+    # single decode attempt (many times per second while scanning), which
+    # meant the raw diagnostics JSON popped open for every price-check user
+    # as soon as they started scanning, regardless of the page's own
+    # hidden-by-default intent (?debug=1 only). It must now only refresh the
+    # content, leaving visibility entirely up to the caller.
+    node = shutil.which("node")
+    assert node, "UnifiedJanScanner Mock 测试需要 Node.js"
+    root = Path(__file__).resolve().parents[1]
+    adapter_path = json.dumps(str(root / "app" / "static" / "camera_adapter.js"))
+    program = f"""
+const assert = require("assert");
+const api = require({adapter_path});
+
+const debugEl = {{hidden: true, textContent: ""}};
+const video = {{
+  readyState: 2, videoWidth: 640, videoHeight: 480, srcObject: null,
+  classList: {{add() {{}}, remove() {{}}}},
+  addEventListener() {{}}, removeEventListener() {{}},
+  play: async () => {{}},
+}};
+const fakeTrack = {{getSettings: () => ({{}})}};
+const fakeStream = {{getVideoTracks: () => [fakeTrack]}};
+const fakeCameraAdapter = {{
+  async start(deviceId, opts) {{
+    await opts.onStream(fakeStream);
+    return {{stream: fakeStream, track: fakeTrack, devices: [], capabilities: {{}}, settings: {{}}, torchSupported: false, warnings: []}};
+  }},
+  stop() {{}},
+}};
+globalThis.BarcodeDetector = class {{
+  static async getSupportedFormats() {{ return ["ean_13"]; }}
+  async detect() {{ return []; }}
+}};
+
+(async () => {{
+  const scanner = new api.UnifiedJanScanner({{video, cameraAdapter: fakeCameraAdapter, debug: debugEl, onCode: () => {{}}}});
+  await scanner.start();
+  await new Promise((resolve) => setTimeout(resolve, 60));
+  assert.equal(debugEl.hidden, true, "renderDiagnostics() must not force the debug panel visible on its own");
+  assert(debugEl.textContent.length > 0, "renderDiagnostics() must still refresh the content for callers that DO show it");
+  scanner.stop("done");
+  process.exit(0);
 }})().catch((error) => {{ console.error(error); process.exit(1); }});
 """
     completed = subprocess.run(

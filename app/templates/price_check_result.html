@@ -1,40 +1,38 @@
 {% extends "base.html" %}
 {% block title %}JAN {{ view.history.jan }} 查价结果{% endblock %}
+{% block body_class %}price-check-page{% endblock %}
 {% block content %}
 <div class="section-head price-result-head">
   <div><span class="badge">{% if view.history.cache_hit %}使用短时缓存{% else %}本次查询{% endif %}</span><h1>JAN {{ view.history.jan }}</h1></div>
-  <a class="button secondary price-result-top-action" href="/price-check">继续扫码</a>
+  <a class="button secondary price-result-top-action" href="/price-check?autostart=1">继续扫码</a>
 </div>
 
-<section class="card local-product-card">
-  {% if view.product %}
-    <span class="badge success">本地已有商品</span>
-    <div class="local-product-result">
-      {% if view.product.preferred_image_url %}<img class="product-thumb-large" src="{{ view.product.preferred_image_url }}" alt="商品图片" loading="lazy">{% else %}<div class="product-image-empty">暂无图</div>{% endif %}
-      <div>
-        <h2>{{ view.product_display_name }}</h2>
-        <p><code>{{ view.product.internal_sku }}</code>{% if view.product.qinsi_product_code %} · 秦丝编码 {{ view.product.qinsi_product_code }}{% endif %}</p>
-        <div class="summary-grid">
-          <span><strong>{{ view.product.jan or view.history.jan }}</strong>JAN</span>
-          <span><strong>{% if view.historical_lowest_purchase_price is not none %}¥{{ '{:,}'.format(view.historical_lowest_purchase_price) }}{% else %}暂无{% endif %}</strong>历史最低采购价</span>
-          <span><strong>{% if view.recent_purchase_price is not none %}¥{{ '{:,}'.format(view.recent_purchase_price) }}{% else %}暂无{% endif %}</strong>上一次采购价</span>
-          <span><strong>{{ view.latest_purchase_store_name or '暂无' }}</strong>上一次采购店铺</span>
-          <span><strong>{{ view.latest_purchase_store_address or '暂无' }}</strong>上一次采购店铺地址</span>
-        </div>
-      </div>
-    </div>
-    <div class="button-row"><a class="button secondary" href="/products/{{ view.product.id }}">查看本地商品</a>{% if watch %}<a class="button secondary" href="/watched-products">管理关注</a>{% else %}<form method="post" action="/watched-products/add"><input type="hidden" name="product_id" value="{{ view.product.id }}"><input type="hidden" name="return_to" value="/price-check/results/{{ view.history.id }}"><button type="submit">关注</button></form>{% endif %}</div>
-  {% else %}
-    <span class="badge warning">新品候选</span>
-    <h2>本地暂无该 JAN 商品</h2>
-    <p class="muted">查询与资料补全正在后台处理；Provider 全部失败时仍会保存为 JAN|缺商品。</p>
-  {% endif %}
-</section>
+{% if view.providers_all_failed %}
+<div class="warning price-provider-banner">查询失败，暂无线上结果 <a class="link-button" href="/price-check?jan={{ view.history.jan }}&amp;auto=1&amp;refresh=1">重试</a></div>
+{% elif view.providers_partial_failed %}
+<div class="badge warning price-provider-badge">部分平台查询失败，结果可能不完整</div>
+{% endif %}
 
-<section class="comparison-grid">
-  <div class="card price-metric"><small>当前采购价</small><strong>{% if view.current_store_price is not none %}¥{{ '{:,}'.format(view.current_store_price) }}{% else %}未填写{% endif %}</strong></div>
-  <div class="card price-metric"><small>当前查询最低价</small><strong>{% if view.online_min_price is not none %}¥{{ '{:,}'.format(view.online_min_price) }}{% else %}暂无可信结果{% endif %}</strong></div>
-  <div class="card price-metric"><small>差额</small><strong>{% if view.difference is not none %}¥{{ '{:,}'.format(view.difference|abs) }}{% else %}—{% endif %}</strong><span>{% if view.comparison_status %}{{ comparison_cn[view.comparison_status] }}{% else %}等待可比较价格{% endif %}</span></div>
+<section class="card price-compare-card">
+  <div class="price-compare-grid">
+    <form method="post" action="/price-check/results/{{ view.history.id }}/store-price" class="price-compare-store">
+      <label for="storePriceInput">店内价<small>（税込）</small></label>
+      <div class="store-price-row">
+        <input id="storePriceInput" name="current_store_price" type="number" min="0" step="1" inputmode="decimal" placeholder="未填写" value="{{ view.current_store_price if view.current_store_price is not none else '' }}">
+        <button type="submit" class="compact">保存</button>
+      </div>
+      {% if price_saved %}<span class="store-price-feedback saved">已保存</span>{% endif %}
+      {% if price_error %}<span class="store-price-feedback error">{{ price_error }}</span>{% endif %}
+    </form>
+    <div class="price-compare-online">
+      <small>网上最低</small>
+      <strong>{% if view.online_min_price is not none %}¥{{ '{:,}'.format(view.online_min_price) }}{% else %}暂无可信结果{% endif %}</strong>
+    </div>
+  </div>
+  <p class="price-compare-diff">差额
+    <strong>{% if view.difference is not none %}¥{{ '{:,}'.format(view.difference|abs) }}{% else %}—{% endif %}</strong>
+    <span>{% if view.comparison_status %}{{ comparison_cn[view.comparison_status] }}{% else %}等待可比较价格{% endif %}</span>
+  </p>
 </section>
 
 <section>
@@ -60,5 +58,28 @@
   </div>
   {% else %}<div class="card info">当前没有线上商品结果。</div>{% endif %}
 </section>
-<div class="scan-bottom-action"><a class="button" href="/price-check">继续扫码</a></div>
+
+<section class="card local-product-card">
+  {% if view.product %}
+    <span class="badge success">本地已有商品</span>
+    <div class="local-product-result">
+      {% if view.product.preferred_image_url %}<img class="product-thumb-large" src="{{ view.product.preferred_image_url }}" alt="商品图片" loading="lazy">{% else %}<div class="product-image-empty">暂无图</div>{% endif %}
+      <div>
+        <h2>{{ view.product_display_name }}</h2>
+        <p><code>{{ view.product.internal_sku }}</code>{% if view.product.qinsi_product_code %} · 秦丝编码 {{ view.product.qinsi_product_code }}{% endif %}</p>
+        <div class="summary-grid">
+          <span><strong>{{ view.product.jan or view.history.jan }}</strong>JAN</span>
+          <span><strong>{% if view.historical_lowest_purchase_price is not none %}¥{{ '{:,}'.format(view.historical_lowest_purchase_price) }}{% else %}暂无{% endif %}</strong>历史最低采购价</span>
+          <span><strong>{% if view.recent_purchase_price is not none %}¥{{ '{:,}'.format(view.recent_purchase_price) }}{% else %}暂无{% endif %}</strong>上一次采购价</span>
+          <span><strong>{{ view.latest_purchase_store_name or '暂无' }}</strong>上一次采购店铺</span>
+          <span><strong>{{ view.latest_purchase_store_address or '暂无' }}</strong>上一次采购店铺地址</span>
+        </div>
+      </div>
+    </div>
+    <div class="button-row"><a class="button secondary" href="/products/{{ view.product.id }}">查看本地商品</a>{% if watch %}<a class="button secondary" href="/watched-products">管理关注</a>{% else %}<form method="post" action="/watched-products/add"><input type="hidden" name="product_id" value="{{ view.product.id }}"><input type="hidden" name="return_to" value="/price-check/results/{{ view.history.id }}"><button type="submit">关注</button></form>{% endif %}</div>
+  {% else %}
+    <span class="badge warning">新品候选 · 资料补全中</span>
+  {% endif %}
+</section>
+<div class="scan-bottom-action"><a class="button" href="/price-check?autostart=1">继续扫码</a></div>
 {% endblock %}

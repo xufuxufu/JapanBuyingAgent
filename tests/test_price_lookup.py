@@ -18,7 +18,8 @@ from app.price_providers import (
     WebFallbackPriceProvider,
     YahooShoppingPriceProvider,
 )
-from app.price_service import _search_provider_coalesced, build_lookup_view, online_reference_price_from_offers, query_prices
+import app.price_service as price_service
+from app.price_service import _search_provider_coalesced, build_lookup_view, online_reference_price_from_offers, query_prices, update_store_price
 from app.product_identity import format_product_display_name, normalize_product_name
 from app.schemas import PriceLookupInput
 
@@ -424,6 +425,523 @@ def test_qinsi_derived_jan_rebinds_cached_lookup_and_local_provider(db_session):
     assert local_response.offers[0].url == f"/products/{product.id}"
 
 
+def test_build_engine_configures_wal_and_generous_busy_timeout(tmp_path):
+    from sqlalchemy import text
+
+    from app.db import build_engine
+
+    url = f"sqlite:///{(tmp_path / 'pragma_check.sqlite3').as_posix()}"
+    engine = build_engine(url)
+    with engine.connect() as connection:
+        journal_mode = connection.execute(text("PRAGMA journal_mode")).scalar()
+        busy_timeout = connection.execute(text("PRAGMA busy_timeout")).scalar()
+    assert journal_mode == "wal"
+    assert busy_timeout >= 15000
+
+
+def test_sqlite_busy_timeout_avoids_locked_error_under_concurrent_writers(tmp_path):
+    # Reproduces the real in-store 500: the background enrichment task for a
+    # brand-new JAN opens its own engine/session (process_price_lookup_enrichment)
+    # and can still be mid-transaction when the next scan's foreground request
+    # tries to write to the same sqlite file. Without WAL + busy_timeout this
+    # raised "database is locked" immediately instead of waiting briefly.
+    from sqlalchemy.orm import Session as OrmSession
+
+    from app.db import Base, build_engine
+
+    db_path = tmp_path / "concurrent.sqlite3"
+    url = f"sqlite:///{db_path.as_posix()}"
+    setup_engine = build_engine(url)
+    Base.metadata.create_all(setup_engine)
+    setup_engine.dispose()
+
+    writer_engine = build_engine(url)
+    other_engine = build_engine(url)
+    errors: list[Exception] = []
+
+    def hold_write_lock():
+        with OrmSession(writer_engine) as session:
+            session.add(Marketplace(code="holder", name="Holder", active=True))
+            session.flush()
+            time.sleep(0.5)
+            session.commit()
+
+    def concurrent_write():
+        try:
+            time.sleep(0.1)
+            with OrmSession(other_engine) as session:
+                session.add(Marketplace(code="second_writer", name="Second", active=True))
+                session.commit()
+        except Exception as exc:
+            errors.append(exc)
+
+    holder = threading.Thread(target=hold_write_lock)
+    other = threading.Thread(target=concurrent_write)
+    holder.start()
+    other.start()
+    holder.join(timeout=5)
+    other.join(timeout=5)
+
+    assert not holder.is_alive() and not other.is_alive()
+    assert not errors, f"concurrent writer should wait via busy_timeout instead of failing: {errors}"
+    with OrmSession(writer_engine) as session:
+        assert session.scalar(select(func.count()).select_from(Marketplace)) == 2
+
+
+def test_zero_busy_timeout_reproduces_the_original_locked_error(tmp_path):
+    # Contrast case: with no busy handler at all (the pre-fix equivalent),
+    # the same contention pattern above genuinely raises "database is locked"
+    # instead of waiting — this proves build_engine's busy_timeout is what
+    # actually prevents the 500, not some incidental timing.
+    from sqlalchemy import create_engine
+    from sqlalchemy.orm import Session as OrmSession
+
+    from app.db import Base, build_engine
+
+    db_path = tmp_path / "no_busy_timeout.sqlite3"
+    url = f"sqlite:///{db_path.as_posix()}"
+    setup_engine = build_engine(url)
+    Base.metadata.create_all(setup_engine)
+    setup_engine.dispose()
+
+    zero_timeout_engine = create_engine(url, connect_args={"check_same_thread": False, "timeout": 0})
+    other_engine = create_engine(url, connect_args={"check_same_thread": False, "timeout": 0})
+    errors: list[Exception] = []
+
+    def hold_write_lock():
+        with OrmSession(zero_timeout_engine) as session:
+            session.add(Marketplace(code="holder2", name="Holder2", active=True))
+            session.flush()
+            time.sleep(0.3)
+            session.commit()
+
+    def concurrent_write():
+        try:
+            time.sleep(0.05)
+            with OrmSession(other_engine) as session:
+                session.add(Marketplace(code="second_writer2", name="Second2", active=True))
+                session.commit()
+        except Exception as exc:
+            errors.append(exc)
+
+    holder = threading.Thread(target=hold_write_lock)
+    other = threading.Thread(target=concurrent_write)
+    holder.start()
+    other.start()
+    holder.join(timeout=5)
+    other.join(timeout=5)
+
+    assert errors, "expected a locked-database error with no busy timeout configured"
+    assert "locked" in str(errors[0]).lower()
+
+
+@dataclass
+class DelayedProvider(PriceProvider):
+    code: str
+    delay_seconds: float
+    response: ProviderResponse | None = None
+    display_name: str = "Delayed"
+    base_url: str | None = "https://example.test/"
+
+    def search(self, jan: str, timeout_seconds: float) -> ProviderResponse:
+        time.sleep(self.delay_seconds)
+        return self.response or ProviderResponse("empty")
+
+
+def test_providers_are_queried_in_parallel_not_summed_sequentially(db_session):
+    # This is the concrete fix for "JAN 查询速度不稳定，有时快有时明显慢": providers
+    # used to run one after another, so total latency was the SUM of every
+    # provider's response time. Three providers each sleeping 0.3s must now
+    # complete in well under their sum (0.9s), proving they run concurrently.
+    providers = [
+        DelayedProvider("slow_a", 0.3, ProviderResponse("success", (offer(500),))),
+        DelayedProvider("slow_b", 0.3, ProviderResponse("success", (offer(600),))),
+        DelayedProvider("slow_c", 0.3, ProviderResponse("success", (offer(700),))),
+    ]
+    started = time.monotonic()
+    # trigger_enrichment=False matches how the real HTTP routes call this --
+    # they defer enrichment to a BackgroundTask instead of running it inline,
+    # so this isolates the provider-querying phase itself.
+    view = query_prices(db_session, PriceLookupInput(jan=VALID_JAN), providers, trigger_enrichment=False)
+    elapsed = time.monotonic() - started
+
+    assert elapsed < 0.65, f"providers ran sequentially instead of in parallel: {elapsed:.2f}s"
+    statuses = {item.provider_code: item.status for item in view.attempts}
+    assert statuses == {"slow_a": "success", "slow_b": "success", "slow_c": "success"}
+    assert view.online_min_price == 500
+
+
+def test_repeated_same_jan_force_refresh_query_does_not_500(db_session):
+    provider = FakeProvider("repeat_provider", ProviderResponse("success", (offer(500),)))
+    for _ in range(5):
+        view = query_prices(db_session, PriceLookupInput(jan=VALID_JAN, force_refresh=True), [provider])
+        assert view.online_min_price == 500
+    assert db_session.scalar(select(func.count()).select_from(PriceSearchRun)) == 5
+    assert db_session.scalar(select(func.count()).select_from(PriceLookupHistory)) == 5
+    assert db_session.scalar(select(func.count()).select_from(Marketplace).where(Marketplace.code == "repeat_provider")) == 1
+
+
+def test_repeated_same_jan_query_over_http_does_not_500(client):
+    test_client, _db_session, _ = client
+    for _ in range(4):
+        response = test_client.post(
+            "/price-check", data={"jan": VALID_JAN, "force_refresh": "true"}, follow_redirects=False,
+        )
+        assert response.status_code == 303
+        result = test_client.get(response.headers["location"])
+        assert result.status_code == 200
+
+
+def test_provider_processing_failure_is_isolated_and_does_not_500(db_session, monkeypatch):
+    original_record_state = price_service._record_provider_state
+
+    def failing_record_state(session, provider, response, *, tested_at):
+        if provider.code == "boom_provider":
+            raise RuntimeError("boom during processing")
+        return original_record_state(session, provider, response, tested_at=tested_at)
+
+    monkeypatch.setattr(price_service, "_record_provider_state", failing_record_state)
+    providers = [
+        FakeProvider("boom_provider", ProviderResponse("success", (offer(500),))),
+        FakeProvider("ok_provider", ProviderResponse("success", (offer(600),))),
+    ]
+
+    view = query_prices(db_session, PriceLookupInput(jan=VALID_JAN), providers)
+
+    statuses = {item.provider_code: item.status for item in view.attempts}
+    assert statuses["boom_provider"] == "error"
+    assert statuses["ok_provider"] == "success"
+    assert view.providers_partial_failed is True
+    assert view.providers_all_failed is False
+    assert view.online_min_price == 600
+
+
+def test_all_providers_failing_returns_view_with_retry_flag_not_500(db_session):
+    providers = [
+        FakeProvider("fail_one", error=RuntimeError("boom")),
+        FakeProvider("fail_two", error=TimeoutError()),
+    ]
+    view = query_prices(db_session, PriceLookupInput(jan=VALID_JAN), providers)
+    assert view.providers_all_failed is True
+    assert view.providers_partial_failed is False
+    assert view.result_offers == ()
+
+
+def test_marketplace_lookup_recovers_from_concurrent_insert_race(db_session, monkeypatch):
+    provider = FakeProvider("race_provider", ProviderResponse("success", (offer(700),)))
+    real_marketplace = price_service._marketplace
+    calls = {"count": 0}
+
+    def racy_marketplace(session, provider_arg):
+        calls["count"] += 1
+        if calls["count"] == 1:
+            session.add(Marketplace(code=provider_arg.code, name=provider_arg.display_name, active=True))
+            session.flush()
+        return real_marketplace(session, provider_arg)
+
+    monkeypatch.setattr(price_service, "_marketplace", racy_marketplace)
+    view = query_prices(db_session, PriceLookupInput(jan=VALID_JAN), [provider])
+    assert view.online_min_price == 700
+    assert db_session.scalar(select(func.count()).select_from(Marketplace).where(Marketplace.code == "race_provider")) == 1
+
+
+def test_store_price_can_be_saved_reopened_and_does_not_overwrite_online_price(db_session):
+    provider = FakeProvider("store_price_provider", ProviderResponse("success", (offer(500),)))
+    view = query_prices(db_session, PriceLookupInput(jan=VALID_JAN), [provider])
+
+    updated = update_store_price(db_session, view.history.id, 2000)
+    assert updated.current_store_price == 2000
+
+    reopened = build_lookup_view(db_session, view.history.id)
+    assert reopened.current_store_price == 2000
+    assert reopened.online_min_price == 500
+
+    cleared = update_store_price(db_session, view.history.id, None)
+    assert cleared.current_store_price is None
+
+
+def _make_valid_jan(body12: str) -> str:
+    digits = [int(c) for c in body12]
+    weighted = sum(d * (1 if i % 2 == 0 else 3) for i, d in enumerate(digits))
+    check = (10 - weighted % 10) % 10
+    return body12 + str(check)
+
+
+def test_20x_same_jan_and_20x_different_jan_with_concurrent_background_writer_no_500(tmp_path):
+    # P0 stress repro requested on-site: same-JAN repeats, different-JAN
+    # repeats, and a background writer standing in for
+    # process_price_lookup_enrichment, all hitting the same sqlite file
+    # concurrently. At least 20 iterations of each pattern; zero exceptions
+    # allowed anywhere.
+    import app.models  # noqa: F401
+    from sqlalchemy.orm import Session as OrmSession
+
+    from app.db import Base, build_engine
+
+    db_path = tmp_path / "stress20.sqlite3"
+    url = f"sqlite:///{db_path.as_posix()}"
+    setup_engine = build_engine(url)
+    Base.metadata.create_all(setup_engine)
+    setup_engine.dispose()
+
+    stop_flag = threading.Event()
+    background_errors: list[Exception] = []
+
+    def background_writer():
+        engine = build_engine(url)
+        counter = 0
+        while not stop_flag.is_set():
+            counter += 1
+            try:
+                with OrmSession(engine) as session:
+                    session.add(Marketplace(code=f"bg_writer_{counter}", name=f"BG{counter}", active=True))
+                    session.commit()
+            except Exception as exc:  # pragma: no cover - failure path asserted below
+                background_errors.append(exc)
+            time.sleep(0.01)
+        engine.dispose()
+
+    bg_thread = threading.Thread(target=background_writer, daemon=True)
+    bg_thread.start()
+
+    foreground_errors: list[Exception] = []
+
+    def run_query(jan: str):
+        engine = build_engine(url)
+        try:
+            with OrmSession(engine) as session:
+                provider = FakeProvider(f"stress_{jan}", ProviderResponse("success", (offer(500, jan=jan),)))
+                query_prices(session, PriceLookupInput(jan=jan, force_refresh=True), [provider])
+        except Exception as exc:
+            foreground_errors.append(exc)
+        finally:
+            engine.dispose()
+
+    try:
+        for _ in range(20):
+            run_query(VALID_JAN)
+        different_jans = [_make_valid_jan(f"4901{i:08d}") for i in range(20)]
+        for jan in different_jans:
+            run_query(jan)
+    finally:
+        stop_flag.set()
+        bg_thread.join(timeout=5)
+
+    assert not bg_thread.is_alive()
+    assert not foreground_errors, f"foreground query raised: {foreground_errors}"
+    assert not background_errors, f"background writer raised: {background_errors}"
+
+    verify_engine = build_engine(url)
+    with OrmSession(verify_engine) as session:
+        assert session.scalar(select(func.count()).select_from(PriceSearchRun)) == 40
+
+
+def test_camera_diagnostics_endpoint_accepts_payload_and_never_500s(client):
+    test_client, _db_session, _ = client
+    response = test_client.post("/api/camera-diagnostics", json={
+        "context": "price_check", "userAgent": "iPhone test UA", "mode": "first_decode",
+        "roiMode": "full_frame", "readyState": 4, "videoWidth": 1280, "videoHeight": 720,
+        "settingsResolution": "1280x720", "deviceLabel": "Back Camera",
+        "barcodeDetectorSupported": False, "zxingLoaded": True, "decodesPerSecond": 5,
+        "firstDecodeMs": 812, "lastException": "none",
+    })
+    assert response.status_code == 200
+    assert response.json() == {"ok": True}
+
+    minimal = test_client.post("/api/camera-diagnostics", json={})
+    assert minimal.status_code == 200
+
+
+def test_store_price_full_redirect_chain_saves_and_shows_value(client):
+    # Exact real-device chain: open the result page, POST the store price with
+    # follow_redirects=True (the way a real phone/browser actually behaves),
+    # and confirm the final response is 200 on the same JAN's result page,
+    # showing the saved value -- not a 404, not a different JAN, not a 500.
+    test_client, db_session, _ = client
+    scan = test_client.post(
+        "/price-check", data={"jan": VALID_JAN, "force_refresh": "true"}, follow_redirects=False,
+    )
+    assert scan.status_code == 303
+    result_url = scan.headers["location"]
+
+    opened = test_client.get(result_url)
+    assert opened.status_code == 200
+    history_id = int(result_url.rstrip("/").rsplit("/", 1)[-1])
+    form_action = f"/price-check/results/{history_id}/store-price"
+    assert f'action="{form_action}"' in opened.text
+
+    final = test_client.post(
+        form_action, data={"current_store_price": "1540"}, follow_redirects=True,
+    )
+    assert final.status_code == 200
+    assert len(final.history) == 1 and final.history[0].status_code == 303
+    assert f"JAN {VALID_JAN}" in final.text
+    assert 'value="1540"' in final.text
+    assert "已保存" in final.text
+
+    db_session.expire_all()
+    saved = db_session.get(PriceLookupHistory, history_id)
+    assert saved.current_store_price == 1540
+
+
+def test_store_price_route_saves_and_persists_on_reopen(client):
+    test_client, _db_session, _ = client
+    response = test_client.post(
+        "/price-check", data={"jan": VALID_JAN, "force_refresh": "true"}, follow_redirects=False,
+    )
+    result_url = response.headers["location"]
+    history_id = int(result_url.rstrip("/").rsplit("/", 1)[-1])
+
+    save = test_client.post(
+        f"/price-check/results/{history_id}/store-price",
+        data={"current_store_price": "2500"}, follow_redirects=False,
+    )
+    assert save.status_code == 303
+    assert "price_saved=1" in save.headers["location"]
+
+    reopened = test_client.get(save.headers["location"])
+    assert reopened.status_code == 200
+    assert 'value="2500"' in reopened.text
+    assert "已保存" in reopened.text
+
+    reopened_again = test_client.get(f"/price-check/results/{history_id}")
+    assert 'value="2500"' in reopened_again.text
+
+
+def test_store_price_route_rejects_invalid_value(client):
+    test_client, _db_session, _ = client
+    response = test_client.post(
+        "/price-check", data={"jan": VALID_JAN, "force_refresh": "true"}, follow_redirects=False,
+    )
+    history_id = int(response.headers["location"].rstrip("/").rsplit("/", 1)[-1])
+
+    save = test_client.post(
+        f"/price-check/results/{history_id}/store-price",
+        data={"current_store_price": "not-a-number"}, follow_redirects=False,
+    )
+    assert save.status_code == 303
+    assert "price_error=" in save.headers["location"]
+
+
+def test_result_page_orders_offers_before_local_product_card(client):
+    test_client, _db_session, _ = client
+    response = test_client.post(
+        "/price-check", data={"jan": VALID_JAN, "force_refresh": "true"}, follow_redirects=False,
+    )
+    result = test_client.get(response.headers["location"])
+    assert result.status_code == 200
+    body = result.text.split("</head>", 1)[1]
+    offers_index = body.index("线上商品结果一览")
+    local_card_index = body.index("local-product-card")
+    assert offers_index < local_card_index
+    assert body.count("JAN " + VALID_JAN) == 1
+
+
+def test_result_page_compare_area_is_one_compact_card_with_tax_inclusive_label(client):
+    test_client, _db_session, _ = client
+    response = test_client.post(
+        "/price-check", data={"jan": VALID_JAN, "current_store_price": "659", "force_refresh": "true"},
+        follow_redirects=False,
+    )
+    result = test_client.get(response.headers["location"])
+    assert result.status_code == 200
+    body = result.text
+
+    assert "店内价" in body and "税込" in body
+    # 店内价/网上最低/差额 must all live inside ONE .price-compare-card, not
+    # three separate cards -- and 差额 specifically must not be its own card.
+    assert body.count('class="card price-compare-card"') == 1
+    assert "comparison-grid" not in body
+    compare_section = body.split('class="card price-compare-card"', 1)[1].split("</section>", 1)[0]
+    assert "店内价" in compare_section
+    assert "网上最低" in compare_section
+    assert "差额" in compare_section
+    # 差额 must be a plain inline block within the same card, not `class="card ...`.
+    diff_html = compare_section.split("price-compare-diff", 1)[1]
+    assert '<div class="card' not in diff_html and '<section class="card' not in diff_html
+
+
+def test_result_page_store_price_and_online_min_and_difference_correct(client):
+    test_client, _db_session, _ = client
+    response = test_client.post(
+        "/price-check", data={"jan": VALID_JAN, "current_store_price": "659", "force_refresh": "true"},
+        follow_redirects=False,
+    )
+    result = test_client.get(response.headers["location"])
+    body = result.text
+    assert 'value="659"' in body
+    online_min_present = "暂无可信结果" in body or "¥" in body.split("网上最低", 1)[1][:200]
+    assert online_min_present
+    assert "差额" in body
+
+
+def test_mobile_header_batch_badge_hidden_on_price_check_pages(client):
+    test_client, _db_session, _ = client
+    scan_page = test_client.get("/price-check")
+    assert "price-check-page" in scan_page.text
+    response = test_client.post(
+        "/price-check", data={"jan": VALID_JAN, "force_refresh": "true"}, follow_redirects=False,
+    )
+    result = test_client.get(response.headers["location"])
+    assert "price-check-page" in result.text
+    # field-purchase (batch-tracked flow) must be unaffected -- it should NOT
+    # carry the price-check-only body class.
+    field_page = test_client.get("/field-purchase")
+    assert "price-check-page" not in field_page.text
+
+
+def test_price_check_page_collapses_manual_entry_and_hides_debug_by_default(client):
+    test_client, _db_session, _ = client
+    response = test_client.get("/price-check")
+    assert response.status_code == 200
+    body = response.text
+    # Manual JAN entry must be tucked inside a collapsed <details>, not a
+    # top-level always-visible form block.
+    assert '<summary>手动输入 JAN</summary>' in body
+    manual_section = body.split('<summary>手动输入 JAN</summary>', 1)[1].split("</details>", 1)[0]
+    assert 'id="priceLookupForm"' in manual_section
+    assert 'id="janInput"' in manual_section
+    # Debug JSON panel must default to hidden (no ?debug=1 given).
+    assert 'id="priceCameraDebug"' in body
+    debug_tag = body[body.index('id="priceCameraDebug"') - 5 : body.index('id="priceCameraDebug"') + 200]
+    assert "hidden" in debug_tag
+
+
+def test_price_check_page_debug_param_shows_debug_panel(client):
+    test_client, _db_session, _ = client
+    response = test_client.get("/price-check?debug=1")
+    assert response.status_code == 200
+    debug_tag = response.text[
+        response.text.index('id="priceCameraDebug"') - 5 : response.text.index('id="priceCameraDebug"') + 60
+    ]
+    assert "hidden" not in debug_tag
+
+
+def test_price_check_page_autostart_param_triggers_camera_start(client):
+    test_client, _db_session, _ = client
+    no_autostart = test_client.get("/price-check")
+    assert no_autostart.status_code == 200
+    autostart = test_client.get("/price-check?autostart=1")
+    assert autostart.status_code == 200
+    body = autostart.text
+    assert "autostart" in body and "startCamera()" in body
+    # The autostart trigger must be conditional (reads the query param at
+    # runtime), not an unconditional call baked into every page load --
+    # otherwise a plain /price-check visit would also silently grab the
+    # camera without the user tapping anything.
+    assert "get('autostart') === '1'" in body
+
+
+def test_result_page_continue_scan_links_include_autostart(client):
+    test_client, _db_session, _ = client
+    response = test_client.post(
+        "/price-check", data={"jan": VALID_JAN, "force_refresh": "true"}, follow_redirects=False,
+    )
+    result = test_client.get(response.headers["location"])
+    assert result.status_code == 200
+    assert result.text.count('href="/price-check?autostart=1"') == 2
+
+
 def test_scan_and_result_pages_and_missing_config_do_not_500(client, monkeypatch):
     test_client, db_session, _ = client
     monkeypatch.delenv("JBA_RAKUTEN_APPLICATION_ID", raising=False)
@@ -439,8 +957,228 @@ def test_scan_and_result_pages_and_missing_config_do_not_500(client, monkeypatch
     assert invalid.status_code == 422 and "JAN" in invalid.text
     response = test_client.post("/price-check", data={"jan": VALID_JAN, "current_store_price": "1000"}, follow_redirects=False)
     assert response.status_code == 303
+    # The background enrichment task runs on its own engine/session (a separate
+    # connection from db_session's), so db_session's identity map can still be
+    # holding the pre-enrichment PriceSearchRun/PriceLookupHistory objects it
+    # loaded during the POST above; expire_all() forces the next read to see
+    # what the background task actually committed (this mirrors real usage,
+    # where each request gets a brand new session with an empty identity map).
+    db_session.expire_all()
     result = test_client.get(response.headers["location"])
     assert result.status_code == 200
     assert "本地已有商品" in result.text and "当前按商品价格排序，未计入配送费。" in result.text
     assert test_client.get("/health").status_code == 200
     assert db_session.scalar(select(func.count()).select_from(PriceProviderAttempt)) == 5
+
+
+# ---------------- durability: repeated real scans over HTTP ----------------
+# Reproduces the on-site complaint: scans 1-7 fine, degrading from ~8 onward,
+# eventually an occasional 500. Every scan of an incomplete-status JAN
+# schedules a background enrichment task via `background_tasks.add_task`,
+# which TestClient (like real Starlette) runs synchronously before the
+# request returns -- so these HTTP-level loops exercise the exact same
+# engine-per-background-task code path a real continuous scanning session
+# hits, not just the in-memory query_prices() function.
+
+
+class FastSimProvider(PriceProvider):
+    code = "sim_fast"
+    display_name = "SimFast"
+    base_url = None
+
+    def search(self, jan: str, timeout_seconds: float) -> ProviderResponse:
+        return ProviderResponse("success", (offer(400, jan=jan),))
+
+
+class SlowSimProvider(PriceProvider):
+    code = "sim_slow"
+    display_name = "SimSlow"
+    base_url = None
+
+    def search(self, jan: str, timeout_seconds: float) -> ProviderResponse:
+        time.sleep(0.15)
+        return ProviderResponse("success", (offer(500, jan=jan),))
+
+
+class TimeoutSimProvider(PriceProvider):
+    code = "sim_timeout"
+    display_name = "SimTimeout"
+    base_url = None
+
+    def search(self, jan: str, timeout_seconds: float) -> ProviderResponse:
+        raise TimeoutError("simulated provider timeout")
+
+
+class ExceptionSimProvider(PriceProvider):
+    code = "sim_exception"
+    display_name = "SimException"
+    base_url = None
+
+    def search(self, jan: str, timeout_seconds: float) -> ProviderResponse:
+        raise RuntimeError("simulated provider crash")
+
+
+def test_30x_same_jan_scan_over_http_no_500_and_no_runaway_slowdown(client):
+    test_client, _db_session, _ = client
+    durations = []
+    for i in range(30):
+        started = time.monotonic()
+        response = test_client.post(
+            "/price-check", data={"jan": VALID_JAN, "force_refresh": "true"}, follow_redirects=True,
+        )
+        durations.append(time.monotonic() - started)
+        assert response.status_code == 200, f"scan {i + 1} failed with {response.status_code}"
+
+    first_five_avg = sum(durations[:5]) / 5
+    last_five_avg = sum(durations[-5:]) / 5
+    assert last_five_avg < max(first_five_avg * 2, 0.2), (
+        f"scans degraded across the run: first5_avg={first_five_avg:.3f}s last5_avg={last_five_avg:.3f}s "
+        f"all={[round(d, 3) for d in durations]}"
+    )
+
+
+def test_30_different_jans_over_http_no_500(client):
+    test_client, _db_session, _ = client
+    for i in range(30):
+        jan = _make_valid_jan(f"4906{i:08d}")
+        response = test_client.post(
+            "/price-check", data={"jan": jan, "force_refresh": "true"}, follow_redirects=True,
+        )
+        assert response.status_code == 200, f"jan #{i + 1} ({jan}) failed with {response.status_code}"
+
+
+def test_background_enrichment_engine_is_disposed_every_time(client, monkeypatch):
+    # This is the concrete regression guard for the engine leak: every scan of
+    # a still-incomplete JAN used to open a fresh SQLAlchemy engine (and its
+    # connection pool) in process_price_lookup_enrichment and never dispose
+    # it, so N scans left N abandoned open sqlite connections behind.
+    from sqlalchemy.engine import Engine
+
+    dispose_count = {"n": 0}
+    original_dispose = Engine.dispose
+
+    def counting_dispose(self, *args, **kwargs):
+        dispose_count["n"] += 1
+        return original_dispose(self, *args, **kwargs)
+
+    monkeypatch.setattr(Engine, "dispose", counting_dispose)
+
+    test_client, _db_session, _ = client
+    total = 10
+    for i in range(total):
+        jan = _make_valid_jan(f"4907{i:08d}")
+        response = test_client.post(
+            "/price-check", data={"jan": jan, "force_refresh": "true"}, follow_redirects=True,
+        )
+        assert response.status_code == 200
+
+    assert dispose_count["n"] >= total, (
+        f"expected at least {total} engine disposals from background enrichment, got {dispose_count['n']}"
+    )
+
+
+def test_same_jan_repeated_enrichment_does_not_reprocess_within_cooldown(db_session, monkeypatch):
+    import app.product_enrichment as enrichment
+
+    process_calls = {"n": 0}
+    original_process = enrichment.process_enrichment_task
+
+    def counting_process(session, task, **kwargs):
+        process_calls["n"] += 1
+        return original_process(session, task, **kwargs)
+
+    monkeypatch.setattr(enrichment, "process_enrichment_task", counting_process)
+
+    db_url = db_session.get_bind().url.render_as_string(hide_password=False)
+    provider = FastSimProvider()
+    view = query_prices(db_session, PriceLookupInput(jan=OTHER_JAN, force_refresh=True), [provider], trigger_enrichment=False)
+    db_session.commit()
+
+    # First call actually runs the pipeline (each call opens its own engine
+    # against the same file, exactly like the real background task does).
+    enrichment.process_price_lookup_enrichment(db_url, OTHER_JAN, view.history.id)
+    assert process_calls["n"] == 1
+
+    # Repeat calls immediately after (same JAN, task now completed_with_warnings
+    # because there's no real DeepSeek/image config in tests) must be skipped
+    # by the cooldown guard instead of re-running the whole pipeline again.
+    for _ in range(3):
+        enrichment.process_price_lookup_enrichment(db_url, OTHER_JAN, view.history.id)
+    assert process_calls["n"] == 1
+
+
+def test_enrichment_global_concurrency_cap_defers_excess_tasks(tmp_path, monkeypatch):
+    # Different JANs are NOT deduped against each other -- only a global cap
+    # (ENRICHMENT_MAX_CONCURRENCY) protects the shared threadpool from being
+    # starved when several different-JAN scans each schedule their own
+    # background enrichment task at roughly the same time.
+    import app.models  # noqa: F401
+    from datetime import datetime, timezone
+
+    from sqlalchemy.orm import Session as OrmSession
+
+    from app.db import Base, build_engine
+    import app.product_enrichment as enrichment
+
+    db_path = tmp_path / "concurrency_cap.sqlite3"
+    url = f"sqlite:///{db_path.as_posix()}"
+    setup_engine = build_engine(url)
+    Base.metadata.create_all(setup_engine)
+    setup_engine.dispose()
+
+    provider = FastSimProvider()
+    jobs = []
+    seed_engine = build_engine(url)
+    with OrmSession(seed_engine) as session:
+        for i in range(5):
+            jan = _make_valid_jan(f"4911{i:08d}")
+            view = query_prices(session, PriceLookupInput(jan=jan, force_refresh=True), [provider], trigger_enrichment=False)
+            jobs.append((jan, view.history.id))
+    seed_engine.dispose()
+
+    concurrent_now = {"n": 0, "max_seen": 0}
+    lock = threading.Lock()
+
+    def slow_process(session, task, **kwargs):
+        with lock:
+            concurrent_now["n"] += 1
+            concurrent_now["max_seen"] = max(concurrent_now["max_seen"], concurrent_now["n"])
+        time.sleep(0.5)
+        with lock:
+            concurrent_now["n"] -= 1
+        task.status = "completed_with_warnings"
+        task.completed_at = datetime.now(timezone.utc)
+        session.commit()
+        return task
+
+    monkeypatch.setattr(enrichment, "process_enrichment_task", slow_process)
+
+    threads = [
+        threading.Thread(target=enrichment.process_price_lookup_enrichment, args=(url, jan, history_id))
+        for jan, history_id in jobs
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=10)
+
+    assert not any(thread.is_alive() for thread in threads)
+    assert enrichment.ENRICHMENT_MAX_CONCURRENCY == 2, "test assumes the documented default cap of 2"
+    assert concurrent_now["max_seen"] <= 2, (
+        f"more than 2 enrichment tasks ran at once (cap not enforced): {concurrent_now['max_seen']}"
+    )
+    snapshot = enrichment.enrichment_concurrency_snapshot()
+    assert snapshot["active_count"] == 0, "semaphore slots must all be released after completion"
+
+
+def test_provider_mix_fast_slow_timeout_exception_over_http_no_500(client, monkeypatch):
+    test_client, _db_session, _ = client
+    mix = [FastSimProvider(), SlowSimProvider(), TimeoutSimProvider(), ExceptionSimProvider()]
+    monkeypatch.setattr(price_service, "get_default_price_providers", lambda: mix)
+
+    for i in range(8):
+        jan = _make_valid_jan(f"4908{i:08d}")
+        response = test_client.post(
+            "/price-check", data={"jan": jan, "force_refresh": "true"}, follow_redirects=True,
+        )
+        assert response.status_code == 200, f"jan #{i + 1} failed with {response.status_code}"

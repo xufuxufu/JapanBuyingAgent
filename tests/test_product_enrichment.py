@@ -735,6 +735,25 @@ def test_low_resolution_image_does_not_replace_existing_high_quality_product(db_
     assert product.image_quality == "normal"
 
 
+def test_bundle_listing_title_deprioritized_for_image_selection():
+    single_item = ProductEnrichmentCandidate(
+        task_id=1, jan=VALID_JAN, name_ja="正規単品パッケージ", platform="rakuten",
+        source_url="https://rakuten.test/single", score=0.5,
+    )
+    bundle = ProductEnrichmentCandidate(
+        task_id=1, jan=VALID_JAN, name_ja="お得な2個セットまとめ買い", platform="rakuten",
+        source_url="https://rakuten.test/bundle", score=0.5,
+    )
+    assert enrichment._candidate_field_rank(single_item, "image") < enrichment._candidate_field_rank(bundle, "image")
+    # Bundle-avoidance is only a same-source tie-breaker: a higher-priority
+    # source (yahoo) still outranks a non-bundle listing from a lower one.
+    yahoo_bundle = ProductEnrichmentCandidate(
+        task_id=1, jan=VALID_JAN, name_ja="福袋2個セット", platform="yahoo",
+        source_url="https://yahoo.test/bundle", score=0.5,
+    )
+    assert enrichment._candidate_field_rank(yahoo_bundle, "image") < enrichment._candidate_field_rank(single_item, "image")
+
+
 def test_high_confidence_auto_create_links_receipt_and_purchase(db_session, monkeypatch, tmp_path):
     initialize_default_locations(db_session)
     configure_deepseek(monkeypatch, auto_create=True)

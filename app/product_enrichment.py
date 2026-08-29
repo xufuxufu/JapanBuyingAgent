@@ -6,8 +6,9 @@ import json
 import logging
 import os
 import re
+import threading
 from dataclasses import asdict, dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from html import unescape
 from html.parser import HTMLParser
@@ -30,12 +31,39 @@ from app.models import (
     ProductEnrichmentSource, ProductEnrichmentTask, ProductMatchLog,
     ProductOffer, ProductOperationLog, ProductTranslationCache, ReceiptItem,
 )
+from app.price_service import MULTIPACK_PATTERN
 from app.product_identity import assert_jan_available, format_product_display_name, normalize_product_name_whitespace
 from app.product_matching import validate_jan
 from app.product_specs import parse_product_specs
 
 
 ACTIVE_OR_SUCCESS_STATUSES = {"pending", "running", "completed", "completed_with_warnings", "needs_review"}
+# Rescanning the same still-incomplete JAN moments apart (very common at a
+# real register) must not re-run the full provider/DeepSeek/image pipeline
+# every single time -- nothing about those inputs changes in a few seconds,
+# so repeating it just stacks up network calls and makes each successive
+# scan slower than the last.
+ENRICHMENT_RETRY_COOLDOWN = timedelta(seconds=45)
+# download_main_image tries every URL variant (Rakuten/Yahoo high-res guesses)
+# for every candidate image; this was previously 20s each, so a handful of
+# slow/unreachable image hosts could hold one enrichment task's thread for
+# minutes. 6s matches the scale already used for the other outbound calls in
+# this module (DeepSeek=10s, page-scrape=8s) while still bounding the worst case.
+IMAGE_DOWNLOAD_TIMEOUT_SECONDS = 6
+# At most this many enrichment tasks (across ALL JANs) run at once. Enrichment
+# and the foreground scan/price-check route both run on the same shared
+# worker threadpool; without a cap, several slow enrichment tasks (each doing
+# multiple sequential image downloads) can pile up and starve that pool,
+# making even unrelated, brand-new JAN scans queue behind them.
+ENRICHMENT_MAX_CONCURRENCY = 2
+_enrichment_slots = threading.BoundedSemaphore(ENRICHMENT_MAX_CONCURRENCY)
+_enrichment_state_lock = threading.Lock()
+_enrichment_running_jans: set[str] = set()
+
+
+def enrichment_concurrency_snapshot() -> dict[str, object]:
+    with _enrichment_state_lock:
+        return {"active_count": len(_enrichment_running_jans), "running_jans": sorted(_enrichment_running_jans)}
 CAPACITY_PATTERN = re.compile(r"(?i)(\d+(?:\.\d+)?\s*(?:ml|l|g|kg|錠|粒|枚))")
 PACKAGE_PATTERN = re.compile(r"(?i)(\d+\s*(?:個|本|袋|包|箱|セット|パック))")
 MODEL_PATTERN = re.compile(r"(?i)\b(?=[A-Z0-9_-]*[A-Z])(?=[A-Z0-9_-]*\d)[A-Z0-9][A-Z0-9_-]{2,24}\b")
@@ -91,7 +119,7 @@ THUMBNAIL_EX_PATTERN = re.compile(r"([?&])_ex=\d+x\d+", re.IGNORECASE)
 MARKETPLACE_HOST_MARKERS = (
     "rakuten.co.jp", "amazon.co.jp", "yahoo.co.jp", "yimg.jp",
 )
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("uvicorn.error")
 
 
 def _env_bool(name: str, default: bool) -> bool:
@@ -503,12 +531,24 @@ def _candidate_kind(candidate: ProductEnrichmentCandidate) -> str:
     return "fallback"
 
 
+BUNDLE_IMAGE_EXTRA_PATTERN = re.compile(r"まとめ|ケース|BOX", re.IGNORECASE)
+
+
+def _is_bundle_listing_title(candidate: ProductEnrichmentCandidate) -> bool:
+    title = candidate.name_ja or ""
+    return bool(MULTIPACK_PATTERN.search(title) or BUNDLE_IMAGE_EXTRA_PATTERN.search(title))
+
+
 def _candidate_field_rank(candidate: ProductEnrichmentCandidate, field: str) -> int:
     kind = _candidate_kind(candidate)
     if field == "name":
         return {"yahoo": 0, "official": 1, "rakuten": 2, "amazon": 3}.get(kind, 4)
     if field == "image":
-        return {"yahoo": 0, "official": 1, "fallback": 2, "rakuten": 3, "amazon": 4}.get(kind, 5)
+        base = {"yahoo": 0, "official": 1, "fallback": 2, "rakuten": 3, "amazon": 4}.get(kind, 5)
+        # Same-source candidates: prefer a single-item listing title over an
+        # obvious bundle/set listing (セット/まとめ/2個/×2/箱/BOX/...) so a
+        # multi-unit package photo doesn't become the product's main image.
+        return base * 2 + (1 if _is_bundle_listing_title(candidate) else 0)
     return {"yahoo": 0, "official": 1, "rakuten": 2, "amazon": 3}.get(kind, 4)
 
 
@@ -954,10 +994,10 @@ def download_main_image(
         for url in _image_high_res_variants(image_candidate.url):
             try:
                 if client is None:
-                    with httpx.Client(timeout=20, follow_redirects=True) as http:
+                    with httpx.Client(timeout=IMAGE_DOWNLOAD_TIMEOUT_SECONDS, follow_redirects=True) as http:
                         response = http.get(url)
                 else:
-                    response = client.get(url, timeout=20, follow_redirects=True)
+                    response = client.get(url, timeout=IMAGE_DOWNLOAD_TIMEOUT_SECONDS, follow_redirects=True)
                 response.raise_for_status()
                 content = response.content
                 if not content or len(content) > 10 * 1024 * 1024:
@@ -1571,16 +1611,58 @@ def safe_trigger_receipt_items(session: Session, items: list[ReceiptItem], trigg
 
 
 def process_price_lookup_enrichment(database_url: str, jan: str, history_id: int) -> None:
+    # build_engine() opens its own connection pool; it MUST be disposed when
+    # this background task finishes. Every scan of a JAN that still needs
+    # completion schedules one of these, and each leaked, never-disposed
+    # engine leaves behind an open sqlite connection -- across a real
+    # continuous-scanning session this accumulates and is the main reason
+    # scans measurably slow down after several in a row.
     engine = build_engine(database_url)
-    with Session(engine) as session:
-        task = ensure_enrichment_task(
-            session, jan, "price_lookup", source_type="price_lookup", source_id=history_id,
-        )
-        if task is None:
-            return
-        attach_lookup_source(session, task, history_id)
-        session.commit()
-        process_enrichment_task(session, task)
+    try:
+        with Session(engine) as session:
+            task = ensure_enrichment_task(
+                session, jan, "price_lookup", source_type="price_lookup", source_id=history_id,
+            )
+            if task is None:
+                return
+            attach_lookup_source(session, task, history_id)
+            session.commit()
+            if task.status == "running":
+                logger.info("price_lookup_enrichment_skipped reason=already_running jan=%s task_id=%s", jan, task.id)
+                return
+            if task.status in {"completed", "completed_with_warnings"} and task.completed_at is not None:
+                completed_at = task.completed_at
+                if completed_at.tzinfo is None:
+                    completed_at = completed_at.replace(tzinfo=timezone.utc)
+                if datetime.now(timezone.utc) - completed_at < ENRICHMENT_RETRY_COOLDOWN:
+                    logger.info(
+                        "price_lookup_enrichment_skipped reason=cooldown jan=%s task_id=%s", jan, task.id,
+                    )
+                    return
+            # Global cap across ALL JANs, checked only now (right before the
+            # expensive part) so the cheap dedup checks above never waste a
+            # concurrency slot. On-site priority is the foreground scan, not
+            # enrichment, so hitting the cap defers this task rather than
+            # queuing/blocking for a slot -- it will simply retry on the
+            # scanned JAN's next lookup.
+            if not _enrichment_slots.acquire(blocking=False):
+                logger.info(
+                    "price_lookup_enrichment_skipped reason=capacity jan=%s task_id=%s active=%s",
+                    jan, task.id, enrichment_concurrency_snapshot(),
+                )
+                return
+            with _enrichment_state_lock:
+                _enrichment_running_jans.add(jan)
+            try:
+                process_enrichment_task(session, task)
+            finally:
+                with _enrichment_state_lock:
+                    _enrichment_running_jans.discard(jan)
+                _enrichment_slots.release()
+    except Exception:
+        logger.exception("price_lookup_enrichment_failed jan=%s history_id=%s", jan, history_id)
+    finally:
+        engine.dispose()
 
 
 def accept_task(

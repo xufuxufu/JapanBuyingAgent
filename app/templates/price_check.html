@@ -1,11 +1,8 @@
 {% extends "base.html" %}
 {% block title %}扫码查价 · Japan Buying Agent{% endblock %}
+{% block body_class %}price-check-page{% endblock %}
 {% block content %}
-<section class="price-hero">
-  <span class="badge">手机优先</span>
-  <h1>扫码 JAN 查价</h1>
-  <p>扫描包装条码或手动输入 JAN。结果仅表示各平台本次查询，不承诺全网最低价。</p>
-</section>
+<p class="price-check-hero-line">扫码查价 · 结果仅供参考，不代表全网最低价</p>
 
 {% if error %}<div class="error" role="alert">{{ error }}</div>{% endif %}
 <section class="scan-layout">
@@ -16,37 +13,41 @@
       <p id="scannerPlaceholder">点击下方按钮开启后置摄像头</p>
     </div>
     <button id="startScan" class="full scan-toggle" type="button">开启扫码</button>
-    <details class="camera-advanced">
-      <summary>切换镜头 / 高级设置</summary>
-      <select id="priceCameraSelect" aria-label="切换摄像头" hidden></select>
-      <div class="field-camera-tools">
-        <button id="priceTorch" class="secondary compact" type="button" hidden>补光灯</button>
-        <button id="priceZoomOut" class="secondary compact" type="button" hidden>−</button>
-        <button id="priceZoomReset" class="secondary compact" type="button" hidden>1×</button>
-        <button id="priceZoomIn" class="secondary compact" type="button" hidden>＋</button>
-      </div>
-    </details>
-    <p id="scannerStatus" class="muted scanner-status" role="status">也可以直接在下方输入 JAN。</p>
+    <p id="scannerStatus" class="muted scanner-status" role="status">也可以手动输入 JAN。</p>
+    <div class="scan-quick-links">
+      <details class="camera-advanced">
+        <summary>切换镜头 / 高级设置</summary>
+        <select id="priceCameraSelect" aria-label="切换摄像头" hidden></select>
+        <div class="field-camera-tools">
+          <button id="priceTorch" class="secondary compact" type="button" hidden>补光灯</button>
+          <button id="priceZoomOut" class="secondary compact" type="button" hidden>−</button>
+          <button id="priceZoomReset" class="secondary compact" type="button" hidden>1×</button>
+          <button id="priceZoomIn" class="secondary compact" type="button" hidden>＋</button>
+        </div>
+      </details>
+      <details class="camera-advanced" id="manualEntryDetails">
+        <summary>手动输入 JAN</summary>
+        <form class="stack price-form" method="post" action="/price-check" id="priceLookupForm">
+          <label>JAN
+            <input id="janInput" name="jan" value="{{ jan }}" inputmode="numeric" pattern="[0-9]*" minlength="8" maxlength="13" autocomplete="off" required placeholder="例：4901234567894">
+          </label>
+          <label>当前实体店采购价（日元，可选）
+            <input name="current_store_price" value="{{ current_store_price }}" type="number" min="0" step="1" inputmode="numeric" placeholder="例：1280">
+          </label>
+          <label class="inline-check"><input name="force_refresh" type="checkbox" value="true" checked>忽略短时缓存，重新查询</label>
+          <button id="lookupSubmit" type="submit">查询商品</button>
+          <small class="muted">本地已有商品会立即显示，不等待平台；勾选“重新查询”时才同步刷新线上结果。未知 JAN 会保存为待补全/待确认商品。</small>
+        </form>
+      </details>
+    </div>
     <button id="priceCopyCameraDiagnostic" type="button" class="secondary compact" hidden>复制安全诊断</button>
     <pre id="priceCameraDebug" class="camera-debug" {% if request.query_params.get('debug') != '1' %}hidden{% endif %}></pre>
   </div>
-
-  <form class="card stack price-form" method="post" action="/price-check" id="priceLookupForm">
-    <label>JAN
-      <input id="janInput" name="jan" value="{{ jan }}" inputmode="numeric" pattern="[0-9]*" minlength="8" maxlength="13" autocomplete="off" required placeholder="例：4901234567894">
-    </label>
-    <label>当前实体店采购价（日元，可选）
-      <input name="current_store_price" value="{{ current_store_price }}" type="number" min="0" step="1" inputmode="numeric" placeholder="例：1280">
-    </label>
-    <label class="inline-check"><input name="force_refresh" type="checkbox" value="true" checked>忽略短时缓存，重新查询</label>
-    <button id="lookupSubmit" type="submit">查询商品</button>
-    <small class="muted">本地已有商品会立即显示，不等待平台；勾选“重新查询”时才同步刷新线上结果。未知 JAN 会保存为待补全/待确认商品。</small>
-  </form>
 </section>
 
 {% if histories %}
-<section class="card">
-  <div class="section-head"><h2>最近查询</h2><span class="muted">最多 20 条</span></div>
+<details class="card">
+  <summary><h2 style="display:inline">最近查询</h2> <span class="muted">最多 20 条</span></summary>
   <div class="price-history-list">
     {% for item in histories %}
     <a class="price-history-row" href="/price-check/results/{{ item.id }}">
@@ -55,7 +56,7 @@
     </a>
     {% endfor %}
   </div>
-</section>
+</details>
 {% endif %}
 
 <script src="/static/camera_adapter.js"></script>
@@ -89,14 +90,70 @@
     debug,
     onCode(value) {
       input.value = value;
-      stopCamera(`已识别 JAN：${value}，正在查询…`);
-      submit.disabled = true;
-      form.submit();
+      const firstDecodeMs = cameraStartedAt ? Date.now() - cameraStartedAt : null;
+      sendCameraDiagnostics('first_decode', {firstDecodeMs});
+      enterQueryingState(value);
+      submitPriceForm();
     },
   });
 
+  let cameraStartedAt = 0;
+
+  function enterQueryingState(jan) {
+    scanner.stop('price_check_stop');
+    start.disabled = false;
+    start.textContent = '开启扫码';
+    // Hide the (now stopped, dark) camera view entirely instead of leaving
+    // it on screen -- the user doesn't need to see readyState=0/videoWidth=0
+    // internals, just a clear "querying" state.
+    stage.hidden = true;
+    status.classList.add('querying-status');
+    status.textContent = `JAN ${jan} 正在查询价格…`;
+  }
+
+  function sendCameraDiagnostics(mode, extra) {
+    try {
+      const info = scanner.diagnostics();
+      const payload = JSON.stringify({
+        context: 'price_check', userAgent: navigator.userAgent, mode,
+        roiMode: info.roiMode, readyState: info.readyState, videoWidth: info.videoWidth,
+        videoHeight: info.videoHeight, settingsResolution: info.settingsResolution,
+        deviceLabel: info.label, barcodeDetectorSupported: Boolean(globalThis.BarcodeDetector),
+        zxingLoaded: info.zxing, decodesPerSecond: info.decodesPerSecond,
+        lastException: info.lastException, ...extra,
+      });
+      const blob = new Blob([payload], {type: 'application/json'});
+      if (navigator.sendBeacon) navigator.sendBeacon('/api/camera-diagnostics', blob);
+      else fetch('/api/camera-diagnostics', {method: 'POST', body: blob, keepalive: true});
+    } catch (_) {}
+  }
+
+  async function submitPriceForm() {
+    submit.disabled = true;
+    submit.textContent = '查询中…';
+    const slowTimer = setTimeout(() => {
+      status.textContent = '网络查询较慢，正在继续获取…';
+    }, 2000);
+    try {
+      const response = await fetch(form.action, {method: 'POST', body: new FormData(form)});
+      clearTimeout(slowTimer);
+      if (response.ok && response.redirected) {
+        window.location.href = response.url;
+        return;
+      }
+    } catch (_) {
+      clearTimeout(slowTimer);
+    }
+    // Validation/conflict errors (422/409), or the fetch itself failing:
+    // fall back to a real navigation so the server renders its normal
+    // error page instead of silently doing nothing.
+    form.submit();
+  }
+
   function stopCamera(message) {
     scanner.stop('price_check_stop');
+    stage.hidden = false;
+    status.classList.remove('querying-status');
     start.disabled = false;
     start.textContent = '开启扫码';
     if (message) status.textContent = message;
@@ -104,12 +161,16 @@
 
   async function startCamera(deviceId='') {
     start.disabled = true;
+    stage.hidden = false;
+    status.classList.remove('querying-status');
     status.textContent = '正在请求摄像头权限…';
+    cameraStartedAt = Date.now();
     try {
       await scanner.start(deviceId);
       start.disabled = false;
       start.textContent = '停止扫码';
       copyDiagnostic.hidden = true;
+      sendCameraDiagnostics('camera_started');
     } catch (error) {
       const details=window.JBACamera.cameraErrorDetails(error,{secureContext:globalThis.isSecureContext,platform:scanner.cameraAdapter.platform,mediaDevices:navigator.mediaDevices});
       stopCamera(details.message);
@@ -126,8 +187,18 @@
   torchButton.addEventListener('click',()=>scanner.setTorch(!scanner.torchOn));
   stage.addEventListener('click',async(event)=>{if(!scanner.track)return;const rect=video.getBoundingClientRect();await scanner.focusAt({x:Math.min(1,Math.max(0,(event.clientX-rect.left)/rect.width)),y:Math.min(1,Math.max(0,(event.clientY-rect.top)/rect.height))})});
   copyDiagnostic.addEventListener('click',async()=>{try{await navigator.clipboard.writeText(debug.textContent||'');status.textContent='安全诊断已复制。'}catch(_){status.textContent='无法自动复制；请长按诊断文本手动复制。'}});
-  form.addEventListener('submit', () => { submit.disabled = true; submit.textContent = '查询中…'; });
+  form.addEventListener('submit', (event) => { event.preventDefault(); submitPriceForm(); });
   window.addEventListener('pagehide', () => stopCamera());
+
+  // "继续扫码" from the result page links here with ?autostart=1 so the user
+  // doesn't have to tap "开启扫码" again for every single item. If the
+  // browser blocks/rejects the automatic camera request (permission not yet
+  // granted, insecure context, etc.), startCamera()'s own catch path already
+  // shows the normal error message and leaves the big manual button enabled
+  // -- so this never risks a blank/stuck page, just falls back to manual.
+  if (new URLSearchParams(location.search).get('autostart') === '1') {
+    startCamera();
+  }
 })();
 </script>
 {% endblock %}

@@ -5,6 +5,7 @@ import io
 import json
 import os
 import time
+import traceback
 import unicodedata
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal, ROUND_HALF_UP
@@ -12,7 +13,7 @@ from difflib import SequenceMatcher
 from pathlib import Path
 from urllib.parse import quote
 
-from fastapi import BackgroundTasks, Depends, FastAPI, File, Form, HTTPException, Query, Request, UploadFile
+from fastapi import BackgroundTasks, Body, Depends, FastAPI, File, Form, HTTPException, Query, Request, UploadFile
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, PlainTextResponse, RedirectResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
@@ -50,7 +51,7 @@ from app.product_admin import (
     save_product_photo_for_completion,
     update_product_master,
 )
-from app.price_service import build_lookup_view, query_prices, recent_price_lookup_histories
+from app.price_service import build_lookup_view, query_prices, recent_price_lookup_histories, update_store_price
 from app.product_enrichment import (
     accept_task, bind_task_to_existing, enrichment_summary_for_receipt, ensure_existing_product_enrichment_task, get_task,
     list_review_tasks, process_enrichment_task, process_price_lookup_enrichment, refresh_existing_product_main_image,
@@ -965,6 +966,38 @@ def upload_page(request: Request):
     return templates.TemplateResponse(request, "upload.html", {})
 
 
+@app.post("/api/camera-diagnostics")
+async def camera_diagnostics(payload: dict = Body(...)):
+    def _safe(key: str, limit: int = 200):
+        value = payload.get(key)
+        return str(value)[:limit] if value is not None else None
+
+    logger.info(
+        "camera_diagnostics context=%r userAgent=%r mode=%r roiMode=%r readyState=%r "
+        "videoWidth=%r videoHeight=%r settingsResolution=%r deviceLabel=%r "
+        "barcodeDetectorSupported=%r zxingLoaded=%r decodesPerSecond=%r "
+        "firstDecodeMs=%r lastException=%r",
+        _safe("context"), _safe("userAgent", 300), _safe("mode"), _safe("roiMode"),
+        _safe("readyState"), _safe("videoWidth"), _safe("videoHeight"),
+        _safe("settingsResolution"), _safe("deviceLabel"),
+        _safe("barcodeDetectorSupported"), _safe("zxingLoaded"),
+        _safe("decodesPerSecond"), _safe("firstDecodeMs"), _safe("lastException"),
+    )
+    return {"ok": True}
+
+
+def _log_price_check_failure(
+    request: Request, *, jan: str | None, history_id: int | None = None,
+    run_id: int | None = None, exc: Exception,
+) -> None:
+    logger.error(
+        "price_check_failed timestamp=%s path=%r method=%r jan=%r history_id=%r run_id=%r "
+        "exception_class=%r exception_message=%r\n%s",
+        datetime.now(timezone.utc).isoformat(), request.url.path, request.method, jan,
+        history_id, run_id, type(exc).__name__, str(exc), traceback.format_exc(),
+    )
+
+
 @app.get("/price-check", response_class=HTMLResponse)
 def price_check_page(
     request: Request,
@@ -987,6 +1020,9 @@ def price_check_page(
             return RedirectResponse(f"/price-check/results/{view.history.id}", status_code=303)
         except (ValidationError, ValueError):
             pass
+        except Exception as exc:
+            _log_price_check_failure(request, jan=jan, exc=exc)
+            raise
     return templates.TemplateResponse(request, "price_check.html", {
         "histories": recent_price_lookup_histories(db, jan=jan.strip() or None),
         "error": None, "jan": jan.strip(), "current_store_price": "",
@@ -1017,6 +1053,9 @@ def price_check_submit(
             "histories": recent_price_lookup_histories(db), "error": str(exc),
             "jan": jan, "current_store_price": current_store_price,
         }, status_code=409)
+    except Exception as exc:
+        _log_price_check_failure(request, jan=lookup.jan, exc=exc)
+        raise
     if local.product is None or product_needs_jan_completion(local.product):
         database_url = db.get_bind().url.render_as_string(hide_password=False)
         background_tasks.add_task(process_price_lookup_enrichment, database_url, lookup.jan, view.history.id)
@@ -1029,10 +1068,41 @@ def price_check_result(history_id: int, request: Request, db: Session = Depends(
         view = build_lookup_view(db, history_id)
     except LookupError as exc:
         raise HTTPException(404, str(exc)) from exc
+    except Exception as exc:
+        _log_price_check_failure(request, jan=None, history_id=history_id, exc=exc)
+        raise
     return templates.TemplateResponse(request, "price_check_result.html", {
         "view": view, "watch": get_watch(db, view.product.id) if view.product else None,
         "provider_status_cn": PRICE_PROVIDER_STATUS_CN, "comparison_cn": PRICE_COMPARISON_CN,
+        "price_saved": request.query_params.get("price_saved") == "1",
+        "price_error": request.query_params.get("price_error"),
     })
+
+
+@app.post("/price-check/results/{history_id}/store-price")
+def price_check_update_store_price(
+    history_id: int, request: Request, current_store_price: str = Form(""), db: Session = Depends(get_db),
+):
+    raw = current_store_price.strip()
+    parsed: int | None = None
+    if raw:
+        try:
+            parsed = int(raw)
+        except ValueError:
+            parsed = None
+        if parsed is None or parsed < 0:
+            return RedirectResponse(
+                f"/price-check/results/{history_id}?price_error={quote('店内价必须是不小于 0 的整数')}",
+                status_code=303,
+            )
+    try:
+        update_store_price(db, history_id, parsed)
+    except LookupError as exc:
+        raise HTTPException(404, str(exc)) from exc
+    except Exception as exc:
+        _log_price_check_failure(request, jan=None, history_id=history_id, exc=exc)
+        raise
+    return RedirectResponse(f"/price-check/results/{history_id}?price_saved=1", status_code=303)
 
 
 @app.post("/receipts/upload")

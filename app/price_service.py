@@ -4,13 +4,15 @@ import json
 import logging
 import re
 import threading
-from concurrent.futures import Future, TimeoutError as FutureTimeoutError
+import time
+from concurrent.futures import Future, ThreadPoolExecutor, TimeoutError as FutureTimeoutError, as_completed
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal, ROUND_HALF_UP
 
 import httpx
 from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, selectinload
 
 from app.local_product import resolve_local_product_by_jan
@@ -43,7 +45,7 @@ PROVIDER_SUMMARY_KEYS = {
 }
 PROVIDER_INFLIGHT_LOCK = threading.Lock()
 PROVIDER_INFLIGHT: dict[tuple[str, str], Future[ProviderResponse]] = {}
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("uvicorn.error")
 
 
 @dataclass(frozen=True, slots=True)
@@ -66,6 +68,8 @@ class PriceLookupView:
     online_min_price: int | Decimal | None
     difference: int | Decimal | None
     comparison_status: str | None
+    providers_all_failed: bool
+    providers_partial_failed: bool
 
 
 def _utc(value: datetime | None) -> datetime | None:
@@ -78,8 +82,14 @@ def _marketplace(session: Session, provider: PriceProvider) -> Marketplace:
     marketplace = session.scalar(select(Marketplace).where(Marketplace.code == provider.code))
     if marketplace is None:
         marketplace = Marketplace(code=provider.code, name=provider.display_name, base_url=provider.base_url, active=True)
-        session.add(marketplace)
-        session.flush()
+        try:
+            with session.begin_nested():
+                session.add(marketplace)
+                session.flush()
+        except IntegrityError:
+            marketplace = session.scalar(select(Marketplace).where(Marketplace.code == provider.code))
+            if marketplace is None:
+                raise
     return marketplace
 
 
@@ -95,7 +105,16 @@ def _record_provider_state(
     )
     if state is None:
         state = PlatformProviderState(provider_code=provider.code)
-        session.add(state)
+        try:
+            with session.begin_nested():
+                session.add(state)
+                session.flush()
+        except IntegrityError:
+            state = session.scalar(
+                select(PlatformProviderState).where(PlatformProviderState.provider_code == provider.code)
+            )
+            if state is None:
+                raise
     state.configured = provider.is_configured()
     state.request_count = (state.request_count or 0) + 1
     state.last_tested_at = tested_at
@@ -444,6 +463,40 @@ def _provider_request_id(provider: PriceProvider, jan: str, started_at: datetime
     return f"{provider.code}:{jan}:{int(started_at.timestamp() * 1000)}"
 
 
+@dataclass(frozen=True, slots=True)
+class _ProviderSearchResult:
+    provider: PriceProvider
+    request_id: str
+    response: ProviderResponse
+    started_at: datetime
+    completed_at: datetime
+    elapsed_ms: int
+
+
+def _run_provider_search(provider: PriceProvider, jan: str, timeout_seconds: float) -> _ProviderSearchResult:
+    started_at = datetime.now(timezone.utc)
+    request_id = _provider_request_id(provider, jan, started_at)
+    try:
+        logger.info(
+            "price_provider_request provider=%s endpoint=search request_id=%s jan=%s cache=miss",
+            provider.code, request_id, jan,
+        )
+        response = _search_provider_coalesced(provider, jan, timeout_seconds)
+        if response.status == "success" and not response.offers:
+            response = ProviderResponse("empty", message="Provider 返回空结果")
+    except (httpx.TimeoutException, TimeoutError):
+        response = ProviderResponse("timeout", message=f"{provider.display_name} 查询超时")
+    except Exception as exc:
+        response = ProviderResponse("error", message=f"{provider.display_name} 查询失败：{type(exc).__name__}")
+    completed_at = datetime.now(timezone.utc)
+    elapsed_ms = int((completed_at - started_at).total_seconds() * 1000)
+    logger.info(
+        "price_provider_result provider=%s endpoint=search request_id=%s jan=%s http_status=%r elapsed_ms=%s status=%s error_code=%r",
+        provider.code, request_id, jan, response.http_status, elapsed_ms, response.status, response.error_code,
+    )
+    return _ProviderSearchResult(provider, request_id, response, started_at, completed_at, elapsed_ms)
+
+
 def _response_has_enrichment_data(jan: str, response: ProviderResponse) -> bool:
     return response.status == "success" and any(
         candidate.jan == jan
@@ -481,6 +534,14 @@ def _search_provider_coalesced(provider: PriceProvider, jan: str, timeout_second
         raise TimeoutError(f"{provider.display_name} in-flight request timed out") from exc
 
 
+def _enrichment_snapshot_for_log() -> dict[str, object]:
+    try:
+        from app.product_enrichment import enrichment_concurrency_snapshot
+        return enrichment_concurrency_snapshot()
+    except Exception:
+        return {}
+
+
 def _trigger_enrichment_for_lookup(session: Session, jan: str, history_id: int) -> None:
     try:
         from app.product_enrichment import attach_lookup_source, ensure_enrichment_task, process_enrichment_task
@@ -506,7 +567,14 @@ def query_prices(
     trigger_enrichment: bool = True,
 ) -> PriceLookupView:
     now = now or datetime.now(timezone.utc)
+    timing_started = time.monotonic()
+    timings: dict[str, float] = {}
+
+    def _mark(label: str) -> None:
+        timings[label] = round((time.monotonic() - timing_started) * 1000, 1)
+
     local_resolution = resolve_local_product_by_jan(session, lookup.jan)
+    _mark("local_lookup_ms")
     if local_resolution.is_conflict:
         candidates = "、".join(
             f"{product.display_name or product.name_cn or product.name_ja or product.internal_sku}"
@@ -529,8 +597,23 @@ def query_prices(
             history = _history(session, cached, lookup, True, lookup_source)
             if product is None and trigger_enrichment:
                 _trigger_enrichment_for_lookup(session, lookup.jan, history.id)
+            _mark("total_ms")
+            logger.info(
+                "price_query_timing jan=%s cache_hit=true local_lookup_ms=%s total_ms=%s active_threads=%s enrichment=%s",
+                lookup.jan, timings["local_lookup_ms"], timings["total_ms"], threading.active_count(),
+                json.dumps(_enrichment_snapshot_for_log(), ensure_ascii=False),
+            )
             return build_lookup_view(session, history.id)
 
+    # The PriceSearchRun row (and its child attempts/offers) is intentionally
+    # NOT added to the session until every provider has been queried. SQLite
+    # only allows one writer at a time; flushing the run immediately and then
+    # running slow, sequential provider network calls before the final commit
+    # held the write lock for the whole request, which under real concurrent
+    # scans piled up other requests' writes until they exceeded even a
+    # generous busy_timeout ("database is locked" 500s). Building everything
+    # in memory first and writing it in one fast burst at the end keeps the
+    # write lock held for milliseconds instead of seconds.
     run = PriceSearchRun(
         product_id=product.id if product else None,
         jan=lookup.jan,
@@ -539,140 +622,191 @@ def query_prices(
         started_at=now,
         cache_expires_at=now + CACHE_TTL,
     )
-    session.add(run)
-    session.flush()
+    _mark("run_created_ms")
+    provider_timings: dict[str, float] = {}
     summary: dict[str, dict[str, object]] = {}
     has_enrichment_data = False
-    for provider in providers if providers is not None else get_default_price_providers():
-        if provider.code == "web_fallback" and has_enrichment_data:
+
+    # Providers are independent network calls with no shared state, so they're
+    # queried in parallel instead of one-after-another -- sequential querying
+    # meant total latency was the SUM of every provider's response time (e.g.
+    # Yahoo ~400ms + Rakuten ~50-550ms + ...), which is exactly what made scans
+    # "sometimes fast, sometimes clearly slow" depending on which provider was
+    # slow that round. web_fallback is the one exception: it only runs when
+    # no other provider already produced usable data, so it can't be started
+    # until the others have finished. The DB session itself is never touched
+    # from worker threads -- only `_run_provider_search` (pure network I/O)
+    # runs off the main thread; all `session`-touching work below still
+    # happens sequentially back on the main thread.
+    all_providers = list(providers if providers is not None else get_default_price_providers())
+    immediate_providers = [p for p in all_providers if p.code != "web_fallback"]
+    deferred_providers = [p for p in all_providers if p.code == "web_fallback"]
+
+    search_results: dict[str, _ProviderSearchResult] = {}
+    if immediate_providers:
+        with ThreadPoolExecutor(max_workers=len(immediate_providers)) as pool:
+            futures = [
+                pool.submit(_run_provider_search, provider, lookup.jan, provider_timeout_seconds)
+                for provider in immediate_providers
+            ]
+            for future in as_completed(futures):
+                result = future.result()
+                search_results[result.provider.code] = result
+
+    def _process_search_result(result: _ProviderSearchResult) -> None:
+        nonlocal has_enrichment_data
+        provider, request_id, response, started_at, completed_at = (
+            result.provider, result.request_id, result.response, result.started_at, result.completed_at,
+        )
+        provider_timings[provider.code] = result.elapsed_ms
+        try:
+            marketplace = _marketplace(session, provider)
+            _record_provider_state(session, provider, response, tested_at=completed_at)
+            if _response_has_enrichment_data(lookup.jan, response):
+                has_enrichment_data = True
+            attempt = PriceProviderAttempt(
+                marketplace_id=marketplace.id,
+                provider_code=provider.code,
+                status=response.status if response.status in {"success", "empty", "timeout", "error", "unconfigured", "manual_only"} else "error",
+                result_count=len(response.offers),
+                message=response.message,
+                started_at=started_at,
+                completed_at=completed_at,
+            )
+            summary[provider.code] = {"status": attempt.status, "count": attempt.result_count, "message": attempt.message}
+            # Accumulate this provider's rows locally; only merged into `run`
+            # once this provider's whole block succeeds, so a mid-provider
+            # exception discards just its own partial results (same isolation
+            # the old per-provider savepoint gave, without holding a lock).
+            provider_platform_results: list[PlatformLookupResult] = []
+            provider_offers: list[ProductOffer] = []
+            if response.search_url and response.status != "success":
+                provider_platform_results.append(PlatformLookupResult(
+                    platform=provider.code,
+                    jan=lookup.jan,
+                    product_url=response.search_url,
+                    link_type="search",
+                    jan_verified=False,
+                    match_type="SEARCH_ONLY",
+                    confidence=0,
+                    fetched_at=completed_at,
+                    error_code=response.error_code or response.status.upper(),
+                ))
+            for candidate in _dedupe_candidates(provider.code, response.offers):
+                jan_status, spec_status, subscription, reasons = _offer_quality(lookup.jan, product, candidate)
+                total_price = candidate.item_price + candidate.shipping_price
+                unified = candidate.unified(provider.code)
+                pack_quantity = _reliable_pack_quantity(candidate.title, candidate.raw_data)
+                normalized_unit_price = _normalized_unit_price(candidate.item_price, pack_quantity)
+                provider_platform_results.append(PlatformLookupResult(
+                    platform=provider.code,
+                    jan=candidate.jan,
+                    title=candidate.title or None,
+                    brand=candidate.brand,
+                    price=unified["price"],
+                    shipping_fee=unified["shipping_fee"],
+                    total_price=unified["total_price"],
+                    currency=candidate.currency,
+                    availability=candidate.stock_status,
+                    seller=candidate.seller,
+                    product_url=candidate.url or None,
+                    image_url=candidate.image_url,
+                    link_type=candidate.link_type,
+                    jan_verified=candidate.jan == lookup.jan and candidate.jan_verified,
+                    match_type=candidate.match_type,
+                    confidence=candidate.confidence,
+                    fetched_at=candidate.fetched_at or completed_at,
+                    error_code=candidate.error_code,
+                ))
+                provider_offers.append(ProductOffer(
+                    marketplace_id=marketplace.id,
+                    product_id=product.id if product else None,
+                    jan=candidate.jan,
+                    title=candidate.title,
+                    image_url=candidate.image_url,
+                    seller=candidate.seller,
+                    url=candidate.url,
+                    item_price=candidate.item_price,
+                    shipping_price=candidate.shipping_price,
+                    shipping_known=candidate.shipping_known,
+                    total_price=total_price,
+                    currency=candidate.currency,
+                    stock_status=candidate.stock_status,
+                    listing_type=candidate.listing_type,
+                    condition=candidate.condition,
+                    match_status="matched" if not reasons else "flagged",
+                    jan_match_status=jan_status,
+                    spec_match_status=spec_status,
+                    is_subscription=subscription,
+                    is_trusted=not reasons,
+                    exclusion_reason="；".join(reasons) if reasons else None,
+                    fetched_at=completed_at,
+                    raw_data_json=json.dumps(
+                        {
+                            **_provider_summary(candidate.raw_data),
+                            "listing_price": candidate.item_price,
+                            "pack_quantity": pack_quantity,
+                            "pack_quantity_reliable": pack_quantity is not None,
+                            "normalized_unit_price": str(normalized_unit_price) if normalized_unit_price is not None else None,
+                            "image_candidates": _provider_image_candidates(candidate.raw_data, candidate.image_url),
+                            "link_type": candidate.link_type,
+                            "jan_verified": candidate.jan_verified,
+                            "match_type": candidate.match_type,
+                            "confidence": candidate.confidence,
+                            "error_code": candidate.error_code,
+                        },
+                        ensure_ascii=False,
+                        default=str,
+                    ),
+                ))
+            run.provider_attempts.append(attempt)
+            run.platform_results.extend(provider_platform_results)
+            run.offers.extend(provider_offers)
+        except Exception as exc:
+            logger.exception(
+                "price_provider_processing_failed provider=%s jan=%s request_id=%s",
+                provider.code, lookup.jan, request_id,
+            )
+            failure_message = f"{provider.display_name} 处理失败：{type(exc).__name__}"
+            summary[provider.code] = {"status": "error", "count": 0, "message": failure_message}
+            run.provider_attempts.append(PriceProviderAttempt(
+                marketplace_id=None,
+                provider_code=provider.code,
+                status="error",
+                result_count=0,
+                message=failure_message,
+                started_at=started_at,
+                completed_at=datetime.now(timezone.utc),
+            ))
+
+    for provider in immediate_providers:
+        _process_search_result(search_results[provider.code])
+    for provider in deferred_providers:
+        if has_enrichment_data:
             summary[provider.code] = {"status": "skipped", "count": 0, "message": "已有正式平台资料，未执行 Web fallback"}
             continue
-        marketplace = _marketplace(session, provider)
-        started_at = datetime.now(timezone.utc)
-        request_id = _provider_request_id(provider, lookup.jan, started_at)
-        try:
-            logger.info(
-                "price_provider_request provider=%s endpoint=search request_id=%s jan=%s cache=miss",
-                provider.code, request_id, lookup.jan,
-            )
-            response = _search_provider_coalesced(provider, lookup.jan, provider_timeout_seconds)
-            if response.status == "success" and not response.offers:
-                response = ProviderResponse("empty", message="Provider 返回空结果")
-        except (httpx.TimeoutException, TimeoutError):
-            response = ProviderResponse("timeout", message=f"{provider.display_name} 查询超时")
-        except Exception as exc:
-            response = ProviderResponse("error", message=f"{provider.display_name} 查询失败：{type(exc).__name__}")
-        completed_at = datetime.now(timezone.utc)
-        elapsed_ms = int((completed_at - started_at).total_seconds() * 1000)
-        logger.info(
-            "price_provider_result provider=%s endpoint=search request_id=%s jan=%s http_status=%r elapsed_ms=%s status=%s error_code=%r",
-            provider.code, request_id, lookup.jan, response.http_status, elapsed_ms,
-            response.status, response.error_code,
-        )
-        _record_provider_state(session, provider, response, tested_at=completed_at)
-        if _response_has_enrichment_data(lookup.jan, response):
-            has_enrichment_data = True
-        attempt = PriceProviderAttempt(
-            search_run_id=run.id,
-            marketplace_id=marketplace.id,
-            provider_code=provider.code,
-            status=response.status if response.status in {"success", "empty", "timeout", "error", "unconfigured", "manual_only"} else "error",
-            result_count=len(response.offers),
-            message=response.message,
-            started_at=started_at,
-            completed_at=completed_at,
-        )
-        session.add(attempt)
-        summary[provider.code] = {"status": attempt.status, "count": attempt.result_count, "message": attempt.message}
-        if response.search_url and response.status != "success":
-            session.add(PlatformLookupResult(
-                price_search_run_id=run.id,
-                platform=provider.code,
-                jan=lookup.jan,
-                product_url=response.search_url,
-                link_type="search",
-                jan_verified=False,
-                match_type="SEARCH_ONLY",
-                confidence=0,
-                fetched_at=completed_at,
-                error_code=response.error_code or response.status.upper(),
-            ))
-        for candidate in _dedupe_candidates(provider.code, response.offers):
-            jan_status, spec_status, subscription, reasons = _offer_quality(lookup.jan, product, candidate)
-            total_price = candidate.item_price + candidate.shipping_price
-            unified = candidate.unified(provider.code)
-            pack_quantity = _reliable_pack_quantity(candidate.title, candidate.raw_data)
-            normalized_unit_price = _normalized_unit_price(candidate.item_price, pack_quantity)
-            session.add(PlatformLookupResult(
-                price_search_run_id=run.id,
-                platform=provider.code,
-                jan=candidate.jan,
-                title=candidate.title or None,
-                brand=candidate.brand,
-                price=unified["price"],
-                shipping_fee=unified["shipping_fee"],
-                total_price=unified["total_price"],
-                currency=candidate.currency,
-                availability=candidate.stock_status,
-                seller=candidate.seller,
-                product_url=candidate.url or None,
-                image_url=candidate.image_url,
-                link_type=candidate.link_type,
-                jan_verified=candidate.jan == lookup.jan and candidate.jan_verified,
-                match_type=candidate.match_type,
-                confidence=candidate.confidence,
-                fetched_at=candidate.fetched_at or completed_at,
-                error_code=candidate.error_code,
-            ))
-            session.add(ProductOffer(
-                search_run_id=run.id,
-                marketplace_id=marketplace.id,
-                product_id=product.id if product else None,
-                jan=candidate.jan,
-                title=candidate.title,
-                image_url=candidate.image_url,
-                seller=candidate.seller,
-                url=candidate.url,
-                item_price=candidate.item_price,
-                shipping_price=candidate.shipping_price,
-                shipping_known=candidate.shipping_known,
-                total_price=total_price,
-                currency=candidate.currency,
-                stock_status=candidate.stock_status,
-                listing_type=candidate.listing_type,
-                condition=candidate.condition,
-                match_status="matched" if not reasons else "flagged",
-                jan_match_status=jan_status,
-                spec_match_status=spec_status,
-                is_subscription=subscription,
-                is_trusted=not reasons,
-                exclusion_reason="；".join(reasons) if reasons else None,
-                fetched_at=completed_at,
-                raw_data_json=json.dumps(
-                    {
-                        **_provider_summary(candidate.raw_data),
-                        "listing_price": candidate.item_price,
-                        "pack_quantity": pack_quantity,
-                        "pack_quantity_reliable": pack_quantity is not None,
-                        "normalized_unit_price": str(normalized_unit_price) if normalized_unit_price is not None else None,
-                        "image_candidates": _provider_image_candidates(candidate.raw_data, candidate.image_url),
-                        "link_type": candidate.link_type,
-                        "jan_verified": candidate.jan_verified,
-                        "match_type": candidate.match_type,
-                        "confidence": candidate.confidence,
-                        "error_code": candidate.error_code,
-                    },
-                    ensure_ascii=False,
-                    default=str,
-                ),
-            ))
+        _process_search_result(_run_provider_search(provider, lookup.jan, provider_timeout_seconds))
+
     run.status = "completed"
     run.completed_at = datetime.now(timezone.utc)
     run.provider_summary_json = json.dumps(summary, ensure_ascii=False)
+    _mark("providers_done_ms")
+    session.add(run)
+    session.flush()
     session.commit()
+    _mark("db_commit_ms")
     history = _history(session, run, lookup, False, lookup_source)
     if product is None and trigger_enrichment:
         _trigger_enrichment_for_lookup(session, lookup.jan, history.id)
+    _mark("total_ms")
+    logger.info(
+        "price_query_timing jan=%s cache_hit=false local_lookup_ms=%s run_created_ms=%s "
+        "providers_done_ms=%s db_commit_ms=%s total_ms=%s active_threads=%s enrichment=%s providers=%s",
+        lookup.jan, timings["local_lookup_ms"], timings["run_created_ms"],
+        timings["providers_done_ms"], timings["db_commit_ms"], timings["total_ms"],
+        threading.active_count(), json.dumps(_enrichment_snapshot_for_log(), ensure_ascii=False),
+        json.dumps(provider_timings, ensure_ascii=False),
+    )
     return build_lookup_view(session, history.id)
 
 
@@ -720,6 +854,10 @@ def build_lookup_view(session: Session, history_id: int) -> PriceLookupView:
     if difference is not None:
         comparison = "store_cheaper" if difference < 0 else ("online_cheaper" if difference > 0 else "same")
     purchase_history = _purchase_history_summary(session, product)
+    considered_attempts = [a for a in run.provider_attempts if a.status != "skipped"]
+    failed_attempts = [a for a in considered_attempts if a.status in {"error", "timeout"}]
+    providers_all_failed = bool(considered_attempts) and len(failed_attempts) == len(considered_attempts)
+    providers_partial_failed = bool(failed_attempts) and not providers_all_failed
     return PriceLookupView(
         history=history,
         run=run,
@@ -739,7 +877,19 @@ def build_lookup_view(session: Session, history_id: int) -> PriceLookupView:
         online_min_price=online_min,
         difference=difference,
         comparison_status=comparison,
+        providers_all_failed=providers_all_failed,
+        providers_partial_failed=providers_partial_failed,
     )
+
+
+def update_store_price(session: Session, history_id: int, current_store_price: int | None) -> PriceLookupHistory:
+    history = session.get(PriceLookupHistory, history_id)
+    if history is None:
+        raise LookupError("查价历史不存在")
+    history.current_store_price = current_store_price
+    session.commit()
+    session.refresh(history)
+    return history
 
 
 def recent_price_lookup_histories(session: Session, limit: int = 20, jan: str | None = None) -> list[PriceLookupHistory]:
