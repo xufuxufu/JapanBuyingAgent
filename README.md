@@ -40,6 +40,16 @@ The default database is `data/db/japan_buying_agent.sqlite3`. Override only for 
 
 HEIC is accepted only when the installed Pillow build has a compatible HEIC decoder. Unsupported HEIC uploads return a clear message and do not create a batch.
 
+## Image search (拍照搜商品)
+
+The CLIP ONNX model (~85 MB, int8 quantized) is not committed to git. Prepare it once per checkout:
+
+```powershell
+.\.venv\Scripts\python.exe scripts\prepare_image_search_model.py
+```
+
+This downloads the model into `data/image-search/models/`. The FAISS index itself (`data/image-search/products.faiss` + `product_image_map.json` + `index_meta.json`) is also gitignored and must be built by an admin from the "重建图片搜索索引" entry (商品 page) after the model is in place — `/api/products/image-search` returns a friendly "索引尚未建立" message until then.
+
 ## Receipt workflow
 
 1. Upload one or more original images from camera or album.

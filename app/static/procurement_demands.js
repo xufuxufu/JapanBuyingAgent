@@ -71,3 +71,73 @@
   planCheckboxes.forEach((box) => box.addEventListener("change", updateBulkBar));
   updateBulkBar();
 })();
+
+(() => {
+  // ---- Plan editing (planned_quantity / note / product association) before or after purchasing starts ----
+  function debounce(fn, delay) {
+    let timer = null;
+    return (...args) => {
+      clearTimeout(timer);
+      timer = setTimeout(() => fn(...args), delay);
+    };
+  }
+
+  document.querySelectorAll(".plan-edit-toggle").forEach((toggle) => {
+    const form = toggle.nextElementSibling;
+    toggle.addEventListener("click", () => {
+      form.hidden = !form.hidden;
+    });
+    form.querySelector(".plan-edit-cancel")?.addEventListener("click", () => {
+      form.hidden = true;
+    });
+    const quantityInput = form.querySelector(".plan-edit-quantity");
+    quantityInput?.addEventListener("change", () => {
+      const min = Number(quantityInput.min) || 1;
+      if (Number(quantityInput.value) < min) quantityInput.value = min;
+    });
+
+    const searchInput = form.querySelector(".plan-edit-product-search");
+    if (!searchInput) return;
+    const results = form.querySelector(".plan-edit-product-results");
+    const productIdInput = form.querySelector(".plan-edit-product-id");
+    const picked = form.querySelector(".plan-edit-product-picked");
+    const runSearch = debounce(async (value) => {
+      if (!value.trim()) {
+        results.hidden = true;
+        results.textContent = "";
+        return;
+      }
+      let products = [];
+      try {
+        const response = await fetch(`/api/procurement/products/search?q=${encodeURIComponent(value)}`, { headers: { Accept: "application/json" } });
+        products = await response.json();
+      } catch (err) {
+        return;
+      }
+      results.textContent = "";
+      products.forEach((product) => {
+        const row = document.createElement("button");
+        row.type = "button";
+        row.className = "row search-result-item search-result-item-no-thumb";
+        const main = document.createElement("span");
+        const strong = document.createElement("strong");
+        strong.textContent = product.display_name;
+        main.appendChild(strong);
+        const small = document.createElement("small");
+        small.textContent = [product.jan, product.qinsi_product_code].filter(Boolean).join(" · ");
+        main.appendChild(small);
+        row.appendChild(main);
+        row.addEventListener("click", () => {
+          productIdInput.value = String(product.id);
+          picked.hidden = false;
+          picked.textContent = `将关联为：${product.display_name}`;
+          searchInput.value = "";
+          results.hidden = true;
+        });
+        results.appendChild(row);
+      });
+      results.hidden = products.length === 0;
+    }, 250);
+    searchInput.addEventListener("input", (event) => runSearch(event.target.value));
+  });
+})();

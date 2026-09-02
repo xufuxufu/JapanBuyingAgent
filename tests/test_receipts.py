@@ -135,3 +135,126 @@ def test_delete_confirmed_is_blocked(client, jpeg_bytes, valid_payload):
     db.commit()
     assert http.delete(f"/api/receipt-batches/{batch_id}").status_code == 409
     assert db.get(ReceiptBatch, batch_id) is not None
+
+
+# ---------------- single-receipt import: enrichment is backgrounded too ----------------
+# Same fix as import_gpt_job_json(): import_recognition_json() must never wait
+# on product enrichment after its own commit succeeds. Both call sites
+# (recognition_page_post's form route and api_recognition's JSON route)
+# schedule process_receipt_items_enrichment as a BackgroundTask instead.
+
+
+def make_valid_jan(body12: str) -> str:
+    digits = [int(c) for c in body12]
+    weighted = sum(d * (1 if i % 2 == 0 else 3) for i, d in enumerate(digits))
+    check = (10 - weighted % 10) % 10
+    return body12 + str(check)
+
+
+def multi_item_payload(jans: list[str]) -> dict:
+    items = [{
+        "line_no": line_no, "raw_name": f"商品{line_no}", "recognized_name": "",
+        "jan_candidate": jan, "quantity": 1, "unit_price": 100, "discount_amount": 0,
+        "tax_rate": 0.1, "line_total": 100, "confidence": 0.9,
+    } for line_no, jan in enumerate(jans, 1)]
+    return {
+        "schema_version": "1.0",
+        "store": {"raw_name": "测试药妆店", "purchased_at": None},
+        "totals": {
+            "subtotal": sum(item["line_total"] for item in items), "discount_total": 0,
+            "tax_total": 0, "paid_total": sum(item["line_total"] for item in items),
+        },
+        "items": items,
+        "warnings": [],
+    }
+
+
+def test_import_recognition_json_returns_fast_even_with_many_new_jans(client, jpeg_bytes):
+    import time
+    import app.services as services
+
+    http, db, _ = client
+    batch_id = upload(http, jpeg_bytes).json()["id"]
+    batch = db.get(ReceiptBatch, batch_id)
+    jans = [make_valid_jan(f"4930{i:08d}") for i in range(30)]
+    raw = json.dumps(multi_item_payload(jans), ensure_ascii=False)
+
+    started = time.monotonic()
+    receipt = services.import_recognition_json(db, batch, raw)
+    elapsed = time.monotonic() - started
+
+    assert len(receipt.items) == 30
+    assert elapsed < 5, f"import_recognition_json took {elapsed:.2f}s -- enrichment must not run inline"
+    from app.models import ProductEnrichmentTask
+    assert db.scalar(select(func.count()).select_from(ProductEnrichmentTask)) == 0
+
+
+def test_api_recognition_route_schedules_background_enrichment(client, jpeg_bytes, monkeypatch):
+    http, db, _ = client
+    batch_id = upload(http, jpeg_bytes).json()["id"]
+    jans = [make_valid_jan(f"4931{i:08d}") for i in range(5)]
+    payload = multi_item_payload(jans)
+
+    calls = []
+
+    def fake_enrichment(database_url, receipt_item_ids, trigger_source):
+        calls.append((receipt_item_ids, trigger_source))
+
+    import app.main as main_module
+    monkeypatch.setattr(main_module, "process_receipt_items_enrichment", fake_enrichment)
+
+    response = http.post(f"/api/receipt-batches/{batch_id}/recognition-json", json=payload)
+    assert response.status_code == 200
+    assert len(calls) == 1
+    item_ids, trigger_source = calls[0]
+    assert len(item_ids) == 5 and trigger_source == "gpt_receipt_json"
+    db.expire_all()
+    assert db.scalar(select(func.count()).select_from(ReceiptItem)) == 5
+
+
+def test_recognition_page_post_route_schedules_background_enrichment_and_redirects(client, jpeg_bytes, monkeypatch):
+    http, db, _ = client
+    batch_id = upload(http, jpeg_bytes).json()["id"]
+    jans = [make_valid_jan(f"4932{i:08d}") for i in range(5)]
+    raw = json.dumps(multi_item_payload(jans), ensure_ascii=False)
+
+    calls = []
+
+    def fake_enrichment(database_url, receipt_item_ids, trigger_source):
+        calls.append((receipt_item_ids, trigger_source))
+
+    import app.main as main_module
+    monkeypatch.setattr(main_module, "process_receipt_items_enrichment", fake_enrichment)
+
+    response = http.post(f"/receipts/{batch_id}/recognition-json", data={"payload": raw}, follow_redirects=False)
+    assert response.status_code == 303
+    assert response.headers["location"] == f"/receipts/{batch_id}/review"
+    assert len(calls) == 1
+    item_ids, trigger_source = calls[0]
+    assert len(item_ids) == 5 and trigger_source == "gpt_receipt_json"
+    db.expire_all()
+    assert db.scalar(select(func.count()).select_from(ReceiptItem)) == 5
+
+
+def test_api_recognition_route_survives_enrichment_exception(client, jpeg_bytes, monkeypatch):
+    # Same reasoning as the gpt-jobs regression test: break the real
+    # process_receipt_items_enrichment's one internal call rather than
+    # replacing the entry point itself, since Starlette's BackgroundTask
+    # does not catch exceptions on its own -- the isolation must come from
+    # process_receipt_items_enrichment's own try/except.
+    import app.product_enrichment as enrichment
+
+    http, db, _ = client
+    batch_id = upload(http, jpeg_bytes).json()["id"]
+    jans = [make_valid_jan(f"4933{i:08d}") for i in range(3)]
+    payload = multi_item_payload(jans)
+
+    def failing_safe_trigger(session, items, trigger_source):
+        raise RuntimeError("simulated enrichment crash")
+
+    monkeypatch.setattr(enrichment, "safe_trigger_receipt_items", failing_safe_trigger)
+
+    response = http.post(f"/api/receipt-batches/{batch_id}/recognition-json", json=payload)
+    assert response.status_code == 200
+    db.expire_all()
+    assert db.scalar(select(func.count()).select_from(ReceiptItem)) == 3

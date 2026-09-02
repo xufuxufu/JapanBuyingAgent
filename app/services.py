@@ -980,8 +980,10 @@ def import_recognition_json(session: Session, batch: ReceiptBatch, raw_text: str
         batch.json_imported_at = now
         session.commit()
         session.refresh(receipt)
-        from app.product_enrichment import safe_trigger_receipt_items
-        safe_trigger_receipt_items(session, list(receipt.items), "gpt_receipt_json")
+        # Enrichment is deliberately NOT triggered here -- same reasoning as
+        # import_gpt_job_json(): the import is already fully committed, so
+        # the caller (the route) schedules enrichment as a background task
+        # once it has the created receipt, instead of blocking this request.
         return receipt
     except Exception:
         session.rollback()
@@ -1092,10 +1094,15 @@ def import_gpt_job_json(session: Session, job: ZipPackageJob, raw_text: str) -> 
         session.commit()
         for receipt in created:
             session.refresh(receipt)
-        from app.product_enrichment import safe_trigger_receipt_items
-        safe_trigger_receipt_items(
-            session, [item for receipt in created for item in receipt.items], "gpt_receipt_json",
-        )
+        # Enrichment (Yahoo/Rakuten lookups, image downloads, DeepSeek
+        # translation) is deliberately NOT triggered here. The JSON import is
+        # already fully committed at this point -- receipts/receipt_items are
+        # durably saved -- so the caller (the route) is responsible for
+        # scheduling enrichment as a background task once it has the created
+        # receipts. Running it synchronously here used to block the request
+        # for several minutes on a large receipt (dozens of new JANs each
+        # needing real network calls), even though nothing about that work
+        # can fail the import itself.
         return created
     except Exception:
         session.rollback()

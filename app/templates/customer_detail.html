@@ -1,0 +1,69 @@
+{% extends "base.html" %}
+{% block title %}{{ customer.name }} · 客户详情{% endblock %}
+{% block content %}
+<div class="section-head"><div><h1>{{ customer.name }}</h1><p class="muted">{{ customer.phone or '—' }}{% if customer.wechat_name %} · 微信：{{ customer.wechat_name }}{% endif %}</p></div><a class="button secondary compact" href="/customers">返回客户列表</a></div>
+{% if customer.note %}<p class="muted">备注：{{ customer.note }}</p>{% endif %}
+
+<section class="card so-detail-card">
+  <div class="section-head"><h2>收货地址</h2><button type="button" id="addAddressToggle">+ 新增地址</button></div>
+
+  <form id="addAddressForm" class="stack address-form" hidden>
+    <details class="so-filter-more">
+      <summary>粘贴收货信息自动识别</summary>
+      <textarea id="addAddressPasteText" rows="3" placeholder="例如：小徐 13900001111 湖北武汉市洪山区xxx"></textarea>
+      <div class="button-row"><button type="button" id="addAddressPasteParse">解析</button></div>
+      <p id="addAddressPasteError" class="error" hidden></p>
+    </details>
+    <div class="form-grid">
+      <label>标签（可空，如 家/公司）<input id="addAddressLabel" maxlength="50"></label>
+      <label>收件人姓名<input id="addAddressRecipientName" maxlength="255" required></label>
+      <label>收件手机号<input id="addAddressPhone" maxlength="50" inputmode="tel"></label>
+      <label class="full">收货地址<input id="addAddressAddress" maxlength="500" required></label>
+      <label><input type="checkbox" id="addAddressIsDefault"> 设为默认地址</label>
+    </div>
+    <div class="button-row">
+      <button type="button" id="addAddressSave">保存地址</button>
+      <button type="button" class="secondary" id="addAddressCancel">取消</button>
+    </div>
+    <p id="addAddressError" class="error" hidden></p>
+  </form>
+
+  <div class="stack address-card-list">
+    {% for address in addresses %}
+    <div class="card address-card" data-address-id="{{ address.id }}">
+      <div class="address-card-view">
+        <div class="so-head">
+          {% if address.label %}<span class="badge">{{ address.label }}</span>{% endif %}
+          {% if address.is_default %}<span class="badge state-completed">默认</span>{% endif %}
+        </div>
+        <p><strong>{{ address.recipient_name }}</strong> {{ address.phone or '—' }}</p>
+        <p class="muted">{{ address.address }}</p>
+        <div class="button-row">
+          <button type="button" class="secondary compact address-edit-toggle">编辑</button>
+          {% if not address.is_default %}
+          <button type="button" class="secondary compact address-set-default">设为默认</button>
+          {% endif %}
+          <button type="button" class="secondary compact address-delete">删除</button>
+        </div>
+      </div>
+      <form class="stack address-form address-edit-form" hidden>
+        <div class="form-grid">
+          <label>标签（可空）<input class="address-edit-label" value="{{ address.label or '' }}" maxlength="50"></label>
+          <label>收件人姓名<input class="address-edit-recipient-name" value="{{ address.recipient_name }}" maxlength="255" required></label>
+          <label>收件手机号<input class="address-edit-phone" value="{{ address.phone or '' }}" maxlength="50" inputmode="tel"></label>
+          <label class="full">收货地址<input class="address-edit-address" value="{{ address.address }}" maxlength="500" required></label>
+          <label><input type="checkbox" class="address-edit-is-default"{% if address.is_default %} checked disabled{% endif %}> 设为默认地址</label>
+        </div>
+        <div class="button-row">
+          <button type="button" class="address-edit-save">保存修改</button>
+          <button type="button" class="secondary address-edit-cancel">取消</button>
+        </div>
+        <p class="error address-edit-error" hidden></p>
+      </form>
+    </div>
+    {% else %}<p class="empty-state">该客户暂无收货地址。</p>{% endfor %}
+  </div>
+</section>
+<script src="/static/address_paste.js" defer></script>
+<script src="/static/customer_detail.js" defer></script>
+{% endblock %}

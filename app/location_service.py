@@ -25,6 +25,14 @@ class DefaultLocation:
 DEFAULT_LOCATIONS = (
     DefaultLocation("QW-2025-QIANYU", "2025千羽", "qinsi_warehouse", True, 10),
     DefaultLocation("QW-2025-ZHAOCAIMAO", "2025招财猫", "qinsi_warehouse", True, 20),
+    # QinSi renamed these two China warehouses for the new calendar year; the
+    # 2025 rows stay (past snapshot lines reference them by id/raw name), and
+    # these are additive new Location rows rather than a rename in place --
+    # same pattern as "招财猫店" (QW-QINSI-1DE1039D20FB, auto-created earlier
+    # from a differently-spelled goods import) representing the same
+    # warehouse under yet another QinSi spelling.
+    DefaultLocation("QW-2026-QIANYU", "2026千羽", "qinsi_warehouse", True, 11),
+    DefaultLocation("QW-2026-ZHAOCAIMAO", "2026招财猫", "qinsi_warehouse", True, 21),
     DefaultLocation("QW-NO-BARCODE", "无条码商品", "qinsi_warehouse", True, 30),
     DefaultLocation(QINSI_NEW_JAPAN_WAREHOUSE_CODE, "新日本仓库", "qinsi_warehouse", True, 40),
     DefaultLocation(DEFAULT_PHYSICAL_LOCATION_CODE, "日本家里库存", "local_physical", True, 50),

@@ -9,7 +9,7 @@ from alembic import command
 from alembic.config import Config
 
 
-HEAD_REVISION = "20260828_0044"
+HEAD_REVISION = "20260901_0046"
 
 
 def test_migration_from_empty_and_repeat_safe(tmp_path, monkeypatch):
@@ -23,6 +23,8 @@ def test_migration_from_empty_and_repeat_safe(tmp_path, monkeypatch):
         revision = connection.execute("SELECT version_num FROM alembic_version").fetchone()
         product_columns = {row[1] for row in connection.execute("PRAGMA table_info(products)")}
         sales_order_columns = {row[1] for row in connection.execute("PRAGMA table_info(sales_orders)")}
+        sales_order_item_columns = {row[1] for row in connection.execute("PRAGMA table_info(sales_order_items)")}
+        procurement_demand_columns = {row[1] for row in connection.execute("PRAGMA table_info(procurement_demands)")}
     assert {"receipt_batches", "receipt_images", "receipts", "receipt_items", "ai_recognition_runs", "products", "product_aliases", "store_brands", "stores", "store_aliases", "locations", "purchase_batches", "purchase_batch_items", "inventory_transactions", "import_jobs", "import_rows", "product_match_logs", "qinsi_export_jobs", "qinsi_export_lines", "qinsi_export_line_sources", "qinsi_purchase_export_jobs", "qinsi_purchase_export_lines", "qinsi_purchase_export_line_sources", "marketplaces", "price_search_runs", "product_offers", "price_provider_attempts", "price_lookup_histories", "price_watch_rules", "price_alerts", "product_watch_configs", "product_watch_recommendations", "duplicate_detection_logs", "zip_package_jobs", "zip_package_items"} <= tables
     assert {"product_watch_snapshots", "product_watch_notifications", "monitor_scheduler_states"} <= tables
     assert {"qinsi_inventory_snapshots", "qinsi_inventory_snapshot_lines", "qinsi_product_mappings"} <= tables
@@ -34,10 +36,58 @@ def test_migration_from_empty_and_repeat_safe(tmp_path, monkeypatch):
             "enrichment_audit_logs", "product_operation_logs",
     } <= tables
     assert {"restock_lists", "restock_list_items"} <= tables
-    assert {"customers", "salespersons", "sales_orders", "sales_order_items", "sales_order_shipping_labels"} <= tables
+    assert {
+        "customers", "customer_addresses", "salespersons", "sales_orders", "sales_order_items",
+        "sales_order_shipping_labels", "sales_shipments", "sales_shipment_items",
+    } <= tables
     assert {"low_stock_threshold", "unit_name", "weight_kg", "qinsi_brand_master_id"} <= product_columns
     assert {"recipient_name_snapshot", "recipient_phone_snapshot", "shipping_address_snapshot"} <= sales_order_columns
+    assert {"manual_image_relative_path", "manual_image_original_filename", "manual_image_content_type", "manual_image_file_size"} <= sales_order_item_columns
+    assert {"manual_image_relative_path", "manual_image_original_filename", "manual_image_content_type", "manual_image_file_size"} <= procurement_demand_columns
     assert revision == (HEAD_REVISION,)
+
+
+def test_0046_procurement_demand_manual_image_columns_upgrade_and_downgrade(tmp_path, monkeypatch):
+    db_path = tmp_path / "procurement-manual-image.sqlite3"
+    monkeypatch.setenv("JBA_DATABASE_URL", f"sqlite:///{db_path.as_posix()}")
+    config = Config(str(Path(__file__).resolve().parents[1] / "alembic.ini"))
+    command.upgrade(config, "head")
+    command.upgrade(config, "head")
+    with sqlite3.connect(db_path) as connection:
+        columns = {row[1] for row in connection.execute("PRAGMA table_info(procurement_demands)")}
+        connection.execute(
+            "INSERT INTO procurement_demands "
+            "(product_name_snapshot, demand_type, source_person, source_type, status, manual_image_relative_path, "
+            "created_at, updated_at) "
+            "VALUES ('手工商品（图片）', 'channel_shortage', '丈母娘', 'channel_shortage', 'open', "
+            "'data/procurement-demands/item-images/1/x.jpg', datetime('now'), datetime('now'))"
+        )
+        connection.commit()
+        fk_check = connection.execute("PRAGMA foreign_key_check").fetchall()
+    assert {
+        "manual_image_relative_path", "manual_image_original_filename",
+        "manual_image_content_type", "manual_image_file_size",
+    } <= columns
+    assert fk_check == []
+
+    command.downgrade(config, "20260831_0045")
+    with sqlite3.connect(db_path) as connection:
+        columns_after = {row[1] for row in connection.execute("PRAGMA table_info(procurement_demands)")}
+        row = connection.execute("SELECT product_name_snapshot, status FROM procurement_demands").fetchone()
+        integrity = connection.execute("PRAGMA integrity_check").fetchone()
+    assert not any(c.startswith("manual_image") for c in columns_after)
+    assert row == ("手工商品（图片）", "open")
+    assert integrity == ("ok",)
+
+    command.upgrade(config, "head")
+    with sqlite3.connect(db_path) as connection:
+        revision = connection.execute("SELECT version_num FROM alembic_version").fetchone()
+        columns_final = {row[1] for row in connection.execute("PRAGMA table_info(procurement_demands)")}
+    assert revision == (HEAD_REVISION,)
+    assert {
+        "manual_image_relative_path", "manual_image_original_filename",
+        "manual_image_content_type", "manual_image_file_size",
+    } <= columns_final
 
 
 def test_0038_sales_order_tables_are_empty_and_repeat_safe(tmp_path, monkeypatch):
@@ -225,7 +275,8 @@ def test_0040_upgrade_adds_shipping_labels_without_touching_existing_fks(tmp_pat
         label_fk = connection.execute("PRAGMA foreign_key_list(sales_order_shipping_labels)").fetchall()
     assert "sales_order_shipping_labels" in tables
     assert "REFERENCES sales_orders" in item_fk_sql
-    assert order_row == ("SO-OLD-0001", "ready_to_ship")
+    # ready_to_ship no longer exists as of 20260831_0045; it converts to paid.
+    assert order_row == ("SO-OLD-0001", "paid")
     assert fk_check == []
     assert any(row[2] == "sales_orders" and row[3] == "sales_order_id" for row in label_fk)
     assert revision == (HEAD_REVISION,)
@@ -248,6 +299,146 @@ def test_0040_upgrade_adds_shipping_labels_without_touching_existing_fks(tmp_pat
     assert "REFERENCES sales_orders" in item_fk_sql
     assert fk_check == []
     assert revision == ("20260828_0039",)
+
+
+def test_0045_upgrade_converts_ready_to_ship_and_downgrade_blocks_on_paid_orders(tmp_path, monkeypatch):
+    # Seed the literal 0044 schema by hand for the same reason 0039/0040's own
+    # tests do: on an empty DB, migration 20260714_0001 bootstraps every table
+    # from the current, live app/models.py, which would already include
+    # customer_addresses/sales_shipments/the widened status set and make
+    # 0045's own rebuild logic a silent no-op.
+    db_path = tmp_path / "sales-order-shipments.sqlite3"
+    with sqlite3.connect(db_path) as connection:
+        connection.executescript("""
+        CREATE TABLE alembic_version (version_num VARCHAR(32) NOT NULL PRIMARY KEY);
+        INSERT INTO alembic_version VALUES ('20260828_0044');
+        CREATE TABLE customers (
+            id INTEGER PRIMARY KEY, name VARCHAR(255) NOT NULL, phone VARCHAR(50),
+            wechat_name VARCHAR(128), address TEXT, note TEXT,
+            created_at DATETIME NOT NULL, updated_at DATETIME NOT NULL
+        );
+        CREATE TABLE salespersons (
+            id INTEGER PRIMARY KEY, name VARCHAR(128) NOT NULL, active BOOLEAN NOT NULL,
+            created_at DATETIME NOT NULL, updated_at DATETIME NOT NULL
+        );
+        CREATE TABLE products (id INTEGER PRIMARY KEY, internal_sku VARCHAR(32) NOT NULL);
+        CREATE TABLE sales_orders (
+            id INTEGER PRIMARY KEY,
+            order_no VARCHAR(40) NOT NULL UNIQUE,
+            customer_id INTEGER NOT NULL REFERENCES customers(id) ON DELETE RESTRICT,
+            salesperson_id INTEGER NOT NULL REFERENCES salespersons(id) ON DELETE RESTRICT,
+            status VARCHAR(20) NOT NULL,
+            order_date DATETIME NOT NULL,
+            note TEXT,
+            recipient_name_snapshot VARCHAR(255), recipient_phone_snapshot VARCHAR(50), shipping_address_snapshot TEXT,
+            created_at DATETIME NOT NULL, updated_at DATETIME NOT NULL,
+            CONSTRAINT ck_sales_orders_status CHECK (status IN ('submitted','ready_to_ship','shipped','completed','cancelled'))
+        );
+        CREATE TABLE sales_order_items (
+            id INTEGER PRIMARY KEY,
+            sales_order_id INTEGER NOT NULL REFERENCES sales_orders(id) ON DELETE CASCADE,
+            product_id INTEGER REFERENCES products(id) ON DELETE SET NULL,
+            product_name_snapshot VARCHAR(255) NOT NULL,
+            jan_snapshot VARCHAR(32),
+            quantity INTEGER NOT NULL,
+            unit_sale_price NUMERIC(18,2) NOT NULL,
+            note TEXT,
+            created_at DATETIME NOT NULL, updated_at DATETIME NOT NULL
+        );
+        CREATE TABLE sales_order_shipping_labels (
+            id INTEGER PRIMARY KEY,
+            sales_order_id INTEGER NOT NULL REFERENCES sales_orders(id) ON DELETE CASCADE,
+            stored_filename VARCHAR(255) NOT NULL,
+            original_filename VARCHAR(255),
+            relative_path TEXT NOT NULL,
+            content_type VARCHAR(100),
+            file_size INTEGER,
+            created_at DATETIME NOT NULL
+        );
+        INSERT INTO customers (id, name, phone, address, created_at, updated_at)
+            VALUES (1, '老客户', '13900000000', '北京市朝阳区', datetime('now'), datetime('now'));
+        INSERT INTO salespersons (id, name, active, created_at, updated_at) VALUES (1, '秀', 1, datetime('now'), datetime('now'));
+        INSERT INTO sales_orders (id, order_no, customer_id, salesperson_id, status, order_date, recipient_name_snapshot, recipient_phone_snapshot, shipping_address_snapshot, created_at, updated_at)
+            VALUES (1, 'SO-OLD-0001', 1, 1, 'ready_to_ship', datetime('now'), '老客户', '13900000000', '北京市朝阳区', datetime('now'), datetime('now'));
+        INSERT INTO sales_orders (id, order_no, customer_id, salesperson_id, status, order_date, created_at, updated_at)
+            VALUES (2, 'SO-OLD-0002', 1, 1, 'completed', datetime('now'), datetime('now'), datetime('now'));
+        INSERT INTO sales_order_items (id, sales_order_id, product_name_snapshot, quantity, unit_sale_price, created_at, updated_at)
+            VALUES (1, 1, '旧商品', 3, 65.00, datetime('now'), datetime('now'));
+        INSERT INTO sales_order_shipping_labels (id, sales_order_id, stored_filename, relative_path, created_at)
+            VALUES (1, 1, 'old.jpg', 'data/sales-orders/shipping-labels/1/old.jpg', datetime('now'));
+        """)
+    monkeypatch.setenv("JBA_DATABASE_URL", f"sqlite:///{db_path.as_posix()}")
+    config = Config(str(Path(__file__).resolve().parents[1] / "alembic.ini"))
+
+    command.upgrade(config, "head")
+    command.upgrade(config, "head")  # idempotency
+    with sqlite3.connect(db_path) as connection:
+        connection.execute("PRAGMA foreign_keys=ON")
+        tables = {row[0] for row in connection.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+        statuses = dict(connection.execute("SELECT order_no, status FROM sales_orders"))
+        item = connection.execute(
+            "SELECT product_name_snapshot, quantity, unit_sale_price, manual_image_relative_path FROM sales_order_items WHERE id=1"
+        ).fetchone()
+        label_shipment_id = connection.execute("SELECT shipment_id FROM sales_order_shipping_labels WHERE id=1").fetchone()[0]
+        fk_check = connection.execute("PRAGMA foreign_key_check").fetchall()
+        revision = connection.execute("SELECT version_num FROM alembic_version").fetchone()
+        # a fresh identity-less (image-only) item must now be insertable
+        connection.execute(
+            "INSERT INTO sales_order_items (sales_order_id, manual_image_relative_path, quantity, unit_sale_price, created_at, updated_at) "
+            "VALUES (1, 'data/sales-orders/item-images/1/x.jpg', 1, 10.00, datetime('now'), datetime('now'))"
+        )
+        connection.commit()
+    assert {"customer_addresses", "sales_shipments", "sales_shipment_items"} <= tables
+    assert statuses == {"SO-OLD-0001": "paid", "SO-OLD-0002": "completed"}
+    # the pre-existing purchase fact (quantity/price) must be byte-for-byte unchanged
+    assert item == ("旧商品", 3, 65, None)
+    assert label_shipment_id is None  # pre-shipment-model label stays order-level, untouched
+    assert fk_check == []
+    assert revision == (HEAD_REVISION,)
+
+    # Downgrading with a 'paid' order present must be refused (proven in
+    # test_0045_downgrade_blocks_when_paid_or_partially_shipped_orders_exist);
+    # to exercise the happy downgrade path here, first move the order past
+    # 'paid' the only way this test cares about: delete it (its item and the
+    # order-level label cascade with it), isolating "does the rebuild itself
+    # work" from "does the blocking guard work".
+    with sqlite3.connect(db_path) as connection:
+        connection.execute("PRAGMA foreign_keys=ON")
+        connection.execute("DELETE FROM sales_orders WHERE order_no='SO-OLD-0001'")
+        connection.commit()
+
+    command.downgrade(config, "20260828_0044")
+    with sqlite3.connect(db_path) as connection:
+        connection.execute("PRAGMA foreign_keys=ON")
+        tables = {row[0] for row in connection.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+        statuses = dict(connection.execute("SELECT order_no, status FROM sales_orders"))
+        item_columns = {row[1] for row in connection.execute("PRAGMA table_info(sales_order_items)")}
+        fk_check = connection.execute("PRAGMA foreign_key_check").fetchall()
+        revision = connection.execute("SELECT version_num FROM alembic_version").fetchone()
+    assert {"customer_addresses", "sales_shipments", "sales_shipment_items"}.isdisjoint(tables)
+    assert "shipment_id" not in {row[1] for row in sqlite3.connect(db_path).execute("PRAGMA table_info(sales_order_shipping_labels)")}
+    assert "manual_image_relative_path" not in item_columns
+    assert statuses == {"SO-OLD-0002": "completed"}
+    assert fk_check == []
+    assert revision == ("20260828_0044",)
+
+
+def test_0045_downgrade_blocks_when_paid_or_partially_shipped_orders_exist(tmp_path, monkeypatch):
+    db_path = tmp_path / "sales-order-shipments-block.sqlite3"
+    monkeypatch.setenv("JBA_DATABASE_URL", f"sqlite:///{db_path.as_posix()}")
+    config = Config(str(Path(__file__).resolve().parents[1] / "alembic.ini"))
+    command.upgrade(config, "head")
+    with sqlite3.connect(db_path) as connection:
+        connection.execute("PRAGMA foreign_keys=ON")
+        connection.execute("INSERT INTO customers (id, name, created_at, updated_at) VALUES (1, '客户', datetime('now'), datetime('now'))")
+        connection.execute("INSERT INTO salespersons (id, name, active, created_at, updated_at) VALUES (1, '秀', 1, datetime('now'), datetime('now'))")
+        connection.execute(
+            "INSERT INTO sales_orders (order_no, customer_id, salesperson_id, status, order_date, created_at, updated_at) "
+            "VALUES ('SO-BLOCK-0001', 1, 1, 'paid', datetime('now'), datetime('now'), datetime('now'))"
+        )
+        connection.commit()
+    with pytest.raises(RuntimeError, match="paid/partially_shipped"):
+        command.downgrade(config, "20260828_0044")
 
 
 def test_upgrade_from_phase1_preserves_old_data(tmp_path, monkeypatch):

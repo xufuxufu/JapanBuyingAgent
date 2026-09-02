@@ -17,14 +17,24 @@
     <input type="search" name="q" value="{{ q }}" placeholder="搜索客户姓名或订单号" aria-label="客户 / 订单号">
     <button type="submit" class="compact">搜索</button>
   </div>
-  <details class="so-filter-more"{% if date_from or date_to %} open{% endif %}>
-    <summary>按下单日期筛选{% if date_from or date_to %}（已设置）{% endif %}</summary>
-    <div class="so-filter-dates">
-      <label>下单日期起<input type="date" name="date_from" value="{{ date_from }}"></label>
-      <label>下单日期止<input type="date" name="date_to" value="{{ date_to }}"></label>
-    </div>
-    <button type="submit" class="compact">应用筛选</button>
-  </details>
+  <div class="so-filter-date-group">
+    <details class="so-filter-more"{% if date_from or date_to %} open{% endif %}>
+      <summary>按下单日期筛选{% if date_from or date_to %}（已设置）{% endif %}</summary>
+      <div class="so-filter-dates">
+        <label>下单日期起<input type="date" name="date_from" value="{{ date_from }}"></label>
+        <label>下单日期止<input type="date" name="date_to" value="{{ date_to }}"></label>
+      </div>
+      <button type="submit" class="compact">应用筛选</button>
+    </details>
+    <details class="so-filter-more"{% if shipped_date_from or shipped_date_to %} open{% endif %}>
+      <summary>按发货日筛选{% if shipped_date_from or shipped_date_to %}（已设置）{% endif %}</summary>
+      <div class="so-filter-dates">
+        <label>发货日期起<input type="date" name="shipped_date_from" value="{{ shipped_date_from }}"></label>
+        <label>发货日期止<input type="date" name="shipped_date_to" value="{{ shipped_date_to }}"></label>
+      </div>
+      <button type="submit" class="compact">应用筛选</button>
+    </details>
+  </div>
 </form></section>
 
 <section class="so-list">
@@ -37,16 +47,16 @@
     </div>
     <div class="so-items">
       {% for item in order.items %}
-      {% set image = product_image_url(item.product) if item.product else none %}
+      {% set image = product_image_url(item.product) if item.product else (item.manual_image_relative_path and ('/sales-orders/item-images/' ~ item.id)) %}
       <div class="so-item-row">
         <div class="product-thumb-slot{% if not image %} image-load-failed{% endif %}">
-          {% if image %}<img class="product-thumb" src="{{ image }}" alt="商品主图" loading="lazy" referrerpolicy="no-referrer" onerror="this.parentElement.classList.add('image-load-failed')">{% endif %}
+          {% if image %}<img class="product-thumb zoomable" data-zoom-src="{{ image }}" src="{{ image }}" alt="商品主图" loading="lazy" referrerpolicy="no-referrer" onerror="this.parentElement.classList.add('image-load-failed')"><span class="zoom-hint">+</span>{% endif %}
           <div class="product-image-empty">无图</div>
         </div>
         <div>
-          <strong>{{ item.product_name_snapshot }}</strong>
+          <strong>{{ item.product_name_snapshot or '手工商品' }}</strong>
           <small>{{ item.jan_snapshot or 'JAN 未填写' }}</small>
-          <small>¥{{ item.unit_sale_price }} × {{ item.quantity }}</small>
+          <small>微信售价 ¥{{ item.unit_sale_price }} × {{ item.quantity }}{% if item.shipped_quantity %}（已发 {{ item.shipped_quantity }}）{% endif %}</small>
         </div>
       </div>
       {% endfor %}
@@ -55,14 +65,20 @@
       <p class="so-summary">{{ order.item_kind_count }} 种商品 · 共 {{ order.total_quantity }} 件</p>
       <p class="so-total">¥{{ order.total_amount }}</p>
       <p class="muted so-address">收货：{{ order.recipient_name_snapshot or order.customer.name }} {{ order.recipient_phone_snapshot or order.customer.phone or '' }}<br>{{ order.shipping_address_snapshot or order.customer.address or '地址待补充' }}</p>
-      {% if order.status != 'submitted' %}
-      <p class="muted so-shipping-hint">{{ '面单 ' ~ order.shipping_labels|length ~ ' 张' if order.shipping_labels else '面单未上传' }}</p>
+      {% if order.shipments %}
+      <p class="muted so-shipping-hint">发货单 {{ order.shipments|length }} 个 · {{ order.shipments|selectattr('status', 'equalto', 'shipped')|list|length }} 个已发货</p>
       {% endif %}
       <div class="button-row so-actions">
         <a class="button secondary compact" href="/sales-orders/{{ order.id }}">查看</a>
+        {% if order.status == 'submitted' %}
+        <a class="button secondary compact" href="/sales-orders/{{ order.id }}/edit">编辑</a>
+        {% endif %}
         {% set next = primary_next_action.get(order.status) %}
         {% if next %}
         <form method="post" action="/sales-orders/{{ order.id }}/status"><input type="hidden" name="status" value="{{ next[0] }}"><button type="submit" class="compact">{{ next[1] }}</button></form>
+        {% endif %}
+        {% if order.status in ('paid', 'partially_shipped') %}
+        <a class="button compact" href="/sales-orders/{{ order.id }}#create-shipment">创建发货单</a>
         {% endif %}
       </div>
     </div>

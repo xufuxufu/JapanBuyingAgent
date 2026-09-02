@@ -1,7 +1,7 @@
 {% extends "base.html" %}
 {% block title %}秦丝库存快照{% endblock %}
 {% block content %}
-<div class="section-head"><div><h1>秦丝库存快照</h1><p class="muted">秦丝仍是实时可售库存和销售扣减的唯一权威；本页只保存不可覆盖的导入快照。</p></div><a class="button" href="/qinsi-inventory-snapshots/upload">上传库存快照</a></div>
+<div class="section-head"><div><h1>秦丝库存快照</h1><p class="muted">秦丝仍是实时可售库存和销售扣减的唯一权威；本页只保存不可覆盖的导入快照。</p></div><div class="button-row"><a class="button secondary" href="/qinsi-inventory-snapshots/upload">上传单个文件</a><a class="button" href="/qinsi-inventory-snapshots/upload-batch">批量导入多文件（合并为一个快照）</a></div></div>
 {% if message %}<div class="success message">{{ message }}</div>{% endif %}
 <section class="card table-wrap"><h2>最新快照仓库分布</h2>{% if latest %}<p class="muted">{{ latest.batch_no }} · {{ latest.data_at|tokyo_datetime if latest.data_at else latest.imported_at|tokyo_datetime }}</p><table><thead><tr><th>秦丝仓库</th><th>商品数</th><th>件数</th></tr></thead><tbody>{% for name,products,quantity in warehouse_stats %}<tr><td>{{ name }}</td><td>{{ products }}</td><td>{{ quantity }}</td></tr>{% else %}<tr><td colspan="3">暂无可统计明细。</td></tr>{% endfor %}</tbody></table>{% else %}<p class="muted">尚未导入快照。</p>{% endif %}</section>
 <section class="card"><h2>已启用关注商品库存状态分布</h2><div class="summary-grid">{% for status,count in watch_status_stats.items() %}<span><strong>{{ count }}</strong>{{ inventory_status_labels.get(status,status) }}</span>{% else %}<span><strong>0</strong>暂无已启用关注商品</span>{% endfor %}</div></section>

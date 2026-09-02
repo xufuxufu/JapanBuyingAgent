@@ -102,7 +102,10 @@ def test_page_updates_after_submission(client):
     assert "执行路由商品6" not in response.text  # fully bought, drops off the checklist
 
 
-def test_fully_purchased_shows_in_planned_view_not_purchase_list(client):
+def test_fully_purchased_moves_from_planned_to_purchased_view(client):
+    # Phase 8 tab redesign: 待采购商品 (view=planned) only lists plans that
+    # still need buying; a fully-bought plan moves to 已采购 (view=purchased)
+    # instead of lingering in the "still need to buy" queue forever.
     test_client, db, _tmp = client
     shop = store(db, "路由已安排店")
     db.commit()
@@ -114,9 +117,12 @@ def test_fully_purchased_shows_in_planned_view_not_purchase_list(client):
     })
 
     planned_response = test_client.get("/procurement-demands?view=planned")
-    assert "计划已买齐" in planned_response.text
-    assert "已买记录" in planned_response.text
-    assert "已买待小票" in planned_response.text
+    assert "执行路由商品7" not in planned_response.text
+
+    purchased_response = test_client.get("/procurement-demands?view=purchased")
+    assert "计划已买齐" in purchased_response.text
+    assert "已买记录" in purchased_response.text
+    assert "已买待小票" in purchased_response.text
 
 
 def test_unassigned_purchase_requires_store_selection(client):

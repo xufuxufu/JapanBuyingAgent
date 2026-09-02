@@ -29,14 +29,14 @@ CONFIRMED_DEMAND_TYPES = {"sales_confirmed", "channel_shortage", "manual_restock
 
 DEMAND_TYPE_LABELS: dict[str, str] = {
     "sales_confirmed": "明确销售需求",
-    "channel_shortage": "渠道缺货",
+    "channel_shortage": "补货需求",
     "manual_restock": "人工补货",
     "investigation": "调查看货",
     "system_restock": "系统补货建议",
 }
 SOURCE_TYPE_LABELS: dict[str, str] = {
     "sales_order": "微信销售订单",
-    "channel_shortage": "渠道缺货上报",
+    "channel_shortage": "补货需求上报",
     "manual": "人工登记",
     "investigation": "调查任务",
     "system_restock": "系统预警",
@@ -60,8 +60,12 @@ def sync_demand_for_sales_order_item(session: Session, item: SalesOrderItem, *, 
     existing = session.scalar(select(ProcurementDemand).where(ProcurementDemand.sales_order_item_id == item.id))
     if existing is not None:
         return existing
+    # A manual sales-order item may have no name at all (identified only by a
+    # photo) -- procurement_demands.product_name_snapshot is still NOT NULL,
+    # so fall back to a generic label rather than widening that constraint.
+    name_snapshot = item.product_name_snapshot or "手工商品（图片）"
     demand = ProcurementDemand(
-        product_id=item.product_id, product_name_snapshot=item.product_name_snapshot,
+        product_id=item.product_id, product_name_snapshot=name_snapshot,
         jan_snapshot=item.jan_snapshot, demand_type="sales_confirmed", source_person="秀",
         source_channel="微信", source_type="sales_order", sales_order_item_id=item.id,
         requested_quantity=item.quantity, status="open",
@@ -103,19 +107,54 @@ def _resolve_product_or_manual_name(session: Session, *, product_id: int | None,
 
 def create_channel_shortage_demand(
     session: Session, *, product_id: int | None = None, manual_name: str | None = None,
+    manual_image_content: bytes | None = None, manual_image_filename: str | None = None,
     quantity: int | None = None, note: str | None = None, source_person: str = "丈母娘", commit: bool = True,
 ) -> ProcurementDemand:
+    """Create a 补货需求 (restock-request) demand.
+
+    Unlike _resolve_product_or_manual_name (used by investigation demands,
+    which always require a name), this allows identifying the item by photo
+    alone: product_id / manual_name / manual_image -- at least one must be
+    present, matching the same rule Phase 7 used for manual sales-order items.
+    """
     if source_person not in SOURCE_PERSONS:
         raise ValueError("未知来源人")
-    product, name_snapshot, jan_snapshot = _resolve_product_or_manual_name(session, product_id=product_id, manual_name=manual_name)
+    product = None
+    if product_id is not None:
+        product = session.get(Product, product_id)
+        if product is None:
+            raise LookupError("所选商品不存在")
+    if product is not None:
+        name_snapshot = product.display_name or product.name_cn or product.name_ja or product.internal_sku
+        jan_snapshot = product.jan
+    else:
+        name_snapshot = (manual_name or "").strip() or None
+        jan_snapshot = None
     if quantity is not None and quantity <= 0:
         raise ValueError("数量必须大于0")
+    if product is None and not name_snapshot and not manual_image_content:
+        raise ValueError("请填写商品名称或上传图片")
     demand = ProcurementDemand(
-        product_id=product.id if product else None, product_name_snapshot=name_snapshot, jan_snapshot=jan_snapshot,
+        product_id=product.id if product else None,
+        # product_name_snapshot stays NOT NULL even for a photo-only demand --
+        # same fallback used for photo-only sales-order items (Phase 7).
+        product_name_snapshot=(name_snapshot[:255] if name_snapshot else "手工商品（图片）"),
+        jan_snapshot=jan_snapshot[:32] if jan_snapshot else None,
         demand_type="channel_shortage", source_person=source_person, source_channel="国内销售渠道",
         source_type="channel_shortage", requested_quantity=quantity, note=(note or "").strip() or None, status="open",
     )
     session.add(demand)
+    session.flush()
+    if product is None and manual_image_content:
+        from app.procurement_image import save_procurement_demand_image_file
+
+        stored_filename, relative_path, content_type, safe_original_name, file_size = save_procurement_demand_image_file(
+            demand.id, content=manual_image_content, original_filename=manual_image_filename,
+        )
+        demand.manual_image_relative_path = relative_path
+        demand.manual_image_original_filename = safe_original_name
+        demand.manual_image_content_type = content_type
+        demand.manual_image_file_size = file_size
     if commit:
         session.commit()
     else:
@@ -403,6 +442,31 @@ def reference_inventory_for_products(
     }
 
 
+def in_transit_quantity_for_products(session: Session, product_ids: list[int]) -> dict[int, int]:
+    """How much of each product is already bought but not yet reconciled
+    (status='pending_receipt'), across every plan for that product.
+
+    This is a straightforward aggregate over existing execution/plan data --
+    not a new concept -- so a 补货需求 submitter can see "already on the way"
+    before asking for more. Batched into one query regardless of list size.
+    """
+    unique_ids = list(dict.fromkeys(product_ids))
+    if not unique_ids:
+        return {}
+    rows = session.execute(
+        select(ProcurementDemandPlan.product_id, func.coalesce(func.sum(ProcurementPurchaseExecution.quantity), 0))
+        .join(ProcurementPurchaseExecution, ProcurementPurchaseExecution.plan_id == ProcurementDemandPlan.id)
+        .where(
+            ProcurementDemandPlan.product_id.in_(unique_ids),
+            ProcurementPurchaseExecution.status == "pending_receipt",
+        )
+        .group_by(ProcurementDemandPlan.product_id)
+    ).all()
+    totals = {product_id: 0 for product_id in unique_ids}
+    totals.update({product_id: int(total) for product_id, total in rows})
+    return totals
+
+
 @dataclass(frozen=True, slots=True)
 class DemandInventoryContext:
     """Reference inventory plus the domestic-shortage judgement for one demand group/plan."""
@@ -671,6 +735,41 @@ def set_plans_selected_store_bulk(session: Session, plan_ids: list[int], store_i
         plan.selected_store_id = store.id if store else None
     session.commit()
     return plans
+
+
+def update_demand_plan(
+    session: Session, plan_id: int, *, planned_quantity: int, note: str | None = None,
+    product_id: int | None = None,
+) -> ProcurementDemandPlan:
+    """Edit a plan's own decision fields before/after purchasing starts.
+
+    planned_quantity may always move up or down, but never below what has
+    already actually been bought (non-cancelled executions) -- that quantity
+    is a fact of what happened, not a plan, and editing here must never
+    contradict it. product_id may only be set once, on a plan that started
+    without one (a manual/unidentified demand later recognized as a real
+    Product) -- an already-identified plan's product is never reassigned.
+    """
+    plan = session.get(ProcurementDemandPlan, plan_id)
+    if plan is None:
+        raise LookupError("采购计划不存在")
+    if planned_quantity <= 0:
+        raise ValueError("计划数量必须大于0")
+    purchased = purchased_quantity_for_plans(session, [plan.id]).get(plan.id, 0)
+    if planned_quantity < purchased:
+        raise ValueError(f"计划数量不得低于已采购数量（已采购 {purchased}）")
+    if product_id is not None and plan.product_id is None:
+        product = session.get(Product, product_id)
+        if product is None:
+            raise LookupError("所选商品不存在")
+        plan.product_id = product.id
+        plan.product_name_snapshot = (product.display_name or product.name_cn or product.name_ja or product.internal_sku)[:255]
+        plan.jan_snapshot = product.jan[:32] if product.jan else None
+    plan.planned_quantity = planned_quantity
+    plan.note = (note or "").strip() or None
+    session.commit()
+    session.refresh(plan)
+    return plan
 
 
 @dataclass(frozen=True, slots=True)

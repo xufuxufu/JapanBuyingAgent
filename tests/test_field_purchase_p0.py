@@ -717,7 +717,7 @@ def test_field_purchase_api_and_navigation_permissions(client, monkeypatch, jpeg
     buyer_more = test_client.get("/more")
     assert "现场作业" in buyer_more.text
     assert "秦丝数据" not in buyer_more.text
-    assert "/tasks" in buyer_more.text
+    assert "AI任务" in buyer_more.text
     assert "/receipts" in buyer_more.text and "小票记录" in buyer_more.text
     buyer_tasks = test_client.get("/tasks")
     assert "小票批次 / 小票记录" in buyer_tasks.text

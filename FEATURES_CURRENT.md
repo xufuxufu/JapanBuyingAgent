@@ -61,7 +61,8 @@ Last updated: 2026-08-27. This is implemented-feature inventory, not a roadmap.
 
 ## QinSi Inventory Snapshots
 
-- Upload/list/detail/review/download QinSi inventory snapshots.
-- Matching priority uses JAN/code/confirmed mapping; fuzzy names do not auto-match.
+- Upload/list/detail/review/download QinSi inventory snapshots; multi-file upload (`/qinsi-inventory-snapshots/upload-batch`) merges any number of segment files (e.g. 16 range-named Excel exports) into exactly one snapshot with one shared imported_at/data_at, via a read-only preview step before confirmation.
+- Matching is a cross-check, not a priority list: `qinsi_product_code` and JAN (JAN candidate = 条码 if present/valid, else 货号 as fallback if it alone passes JAN checksum) are resolved independently against local Products. Either one hitting alone is a normal match; both hitting the *same* Product is `code_jan_verified`; both hitting *different* Products is `matching_status="conflict"` and never auto-binds `product_id` -- it always goes to human review. Only when neither hits does matching fall back to confirmed_mapping, then internal_sku. Fuzzy names never auto-match.
 - Unknown warehouses are exceptions and are not silently created.
-- Latest inventory view aggregates warehouses and marks stale data.
+- Fully identical rows (same identity + warehouse + quantity) count once; the same code+warehouse reporting different quantities is excluded from aggregation as a conflict rather than summed/maxed/last-wins.
+- Latest inventory view aggregates warehouses and marks stale data. Warehouse-to-region mapping (China: 2025/2026千羽, 2025/2026招财猫, 招财猫店, 无条码商品; Japan: 新日本仓库) lives solely in `INVENTORY_REGION_BY_LOCATION_CODE` in `app/qinsi_inventory.py`.

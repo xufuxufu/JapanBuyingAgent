@@ -1,10 +1,11 @@
 {% extends "base.html" %}
-{% block title %}新建微信订单{% endblock %}
+{% block title %}{{ '编辑微信订单' if order else '新建微信订单' }}{% endblock %}
 {% block content %}
-<div class="section-head"><div><h1>新建微信订单</h1><p class="muted">只记录客户需求事实；不判断库存、不生成采购、不联系微信。</p></div><a class="button secondary" href="/sales-orders">返回列表</a></div>
+<div class="section-head"><div><h1>{{ '编辑微信订单' if order else '新建微信订单' }}</h1><p class="muted">只记录客户需求事实；不判断库存、不生成采购、不联系微信。</p></div><a class="button secondary" href="/sales-orders">返回列表</a></div>
 {% if error %}<div class="warning"><strong>提交失败：</strong>{{ error }}</div>{% endif %}
 {% if request.query_params.get('investigation_ok') %}<div class="badge state-completed">调查需求已提交，老婆会在采购需求中心看到。</div>{% endif %}
 
+{% if not order %}
 <section class="card">
   <h2>客户需求类型</h2>
   <div class="button-row">
@@ -21,24 +22,37 @@
     <button class="full" type="submit">提交调查需求</button>
   </section>
 </form>
+{% endif %}
 
-<form id="salesOrderForm" method="post" action="/sales-orders">
-  <input type="hidden" name="customer_id" id="customerIdInput">
-  <input type="hidden" name="salesperson_id" value="{{ default_salesperson.id }}">
+<form id="salesOrderForm" method="post" action="{{ '/sales-orders/' ~ order.id ~ '/edit' if order else '/sales-orders' }}" enctype="multipart/form-data">
+  <input type="hidden" name="customer_id" id="customerIdInput" value="{{ order.customer_id if order else '' }}">
+  <input type="hidden" name="customer_address_id" id="customerAddressIdInput">
+  {% if not order %}<input type="hidden" name="salesperson_id" value="{{ default_salesperson.id }}">{% endif %}
   <input type="hidden" name="items_json" id="itemsJsonInput">
 
   <section class="card">
     <h2>客户</h2>
-    <div id="customerPicked" hidden><p><strong id="customerPickedName"></strong> <button type="button" class="link-button" id="customerChange">更换</button></p><p class="muted" id="customerPickedMeta"></p></div>
-    <div id="customerSearchBlock">
+    <div id="customerPicked"{% if not order %} hidden{% endif %}><p><strong id="customerPickedName">{{ order.customer.name if order else '' }}</strong> <button type="button" class="link-button" id="customerChange">更换</button></p><p class="muted" id="customerPickedMeta"></p>
+      <div id="customerAddressPicker" class="stack"></div>
+    </div>
+    <div id="customerSearchBlock"{% if order %} hidden{% endif %}>
       <label>搜索已有客户（姓名 / 电话 / 微信名）<input type="search" id="customerSearchInput" autocomplete="off" placeholder="输入关键字搜索"></label>
       <div id="customerSearchResults" class="search-results" hidden></div>
       <button type="button" class="secondary" id="customerQuickAddToggle">+ 快速新增客户</button>
       <div id="customerQuickAddForm" class="stack" hidden>
         <label>客户姓名（必填）<input id="newCustomerName" maxlength="255"></label>
-        <label>电话（可空）<input id="newCustomerPhone" maxlength="50" inputmode="tel"></label>
+        <label>客户电话（可空）<input id="newCustomerPhone" maxlength="50" inputmode="tel"></label>
         <label>微信名（可空）<input id="newCustomerWechat" maxlength="128"></label>
-        <label>地址（可空）<input id="newCustomerAddress" maxlength="255"></label>
+        <details class="so-filter-more">
+          <summary>粘贴收货信息自动识别</summary>
+          <textarea id="newCustomerPasteText" rows="3" placeholder="例如：小徐 13900001111 湖北武汉市洪山区xxx"></textarea>
+          <div class="button-row"><button type="button" id="newCustomerPasteParse">解析</button></div>
+          <p id="newCustomerPasteError" class="error" hidden></p>
+        </details>
+        <p class="muted">收货地址（可空，可稍后在客户资料中管理）</p>
+        <label>收件人姓名<input id="newCustomerRecipientName" maxlength="255" placeholder="默认同客户姓名"></label>
+        <label>收件手机号（与客户电话分开，可空）<input id="newCustomerRecipientPhone" maxlength="50" inputmode="tel"></label>
+        <input id="newCustomerAddress" maxlength="500" placeholder="收货地址">
         <label>备注（可空）<input id="newCustomerNote" maxlength="255"></label>
         <div class="button-row"><button type="button" id="customerQuickAddSave">保存并使用</button><button type="button" class="secondary" id="customerQuickAddCancel">取消</button></div>
         <p id="customerQuickAddError" class="error" hidden></p>
@@ -46,16 +60,23 @@
     </div>
   </section>
 
-  <section class="card" id="recipientBlock" hidden>
+  <section class="card" id="recipientBlock"{% if not order %} hidden{% endif %}>
     <h2>收货信息</h2>
-    <p class="muted">默认带出客户资料，可为同一微信客户单独修改本次收货人。</p>
+    <p class="muted">默认带出客户资料，可为同一微信客户单独修改本次收货人；订单发货前仍可修改。</p>
+    <details class="so-filter-more">
+      <summary>粘贴收货信息自动识别</summary>
+      <textarea id="recipientPasteText" rows="3" placeholder="例如：小徐 13900001111 湖北武汉市洪山区xxx"></textarea>
+      <div class="button-row"><button type="button" id="recipientPasteParse">解析</button></div>
+      <p id="recipientPasteError" class="error" hidden></p>
+    </details>
     <div class="form-grid">
-      <label>收件人姓名<input name="recipient_name" id="recipientNameInput" maxlength="255"></label>
-      <label>收件手机号<input name="recipient_phone" id="recipientPhoneInput" maxlength="50" inputmode="tel"></label>
-      <label class="full">收货地址<input name="shipping_address" id="shippingAddressInput" maxlength="500"></label>
+      <label>收件人姓名<input name="recipient_name" id="recipientNameInput" maxlength="255" value="{{ (order.recipient_name_snapshot if order else '') or '' }}"></label>
+      <label>收件手机号<input name="recipient_phone" id="recipientPhoneInput" maxlength="50" inputmode="tel" value="{{ (order.recipient_phone_snapshot if order else '') or '' }}"></label>
+      <label class="full">收货地址<input name="shipping_address" id="shippingAddressInput" maxlength="500" value="{{ (order.shipping_address_snapshot if order else '') or '' }}"></label>
     </div>
   </section>
 
+  {% if not order %}
   <section class="card">
     <h2>销售员</h2>
     {% if salespersons|length > 1 %}
@@ -64,6 +85,7 @@
     <p class="badge">默认销售员：{{ default_salesperson.name }}</p>
     {% endif %}
   </section>
+  {% endif %}
 
   <section class="card">
     <div class="section-head"><h2>商品</h2><button type="button" id="addItemRow">+ 添加商品</button></div>
@@ -73,13 +95,24 @@
         <div class="button-row"><span class="badge">商品 <span class="item-index"></span></span><button type="button" class="link-button item-remove">删除</button></div>
         <label class="item-mode-existing">商品搜索<input type="search" class="item-product-search" autocomplete="off" placeholder="输入中文名/日文名/JAN/秦丝货号/内部SKU"></label>
         <div class="search-results item-search-results" hidden></div>
-        <p class="muted item-selected-name" hidden></p>
-        <button type="button" class="link-button item-manual-toggle">该商品未收录，改为手工输入名称</button>
-        <label class="item-mode-manual full" hidden>手工商品名（必填）<input class="item-manual-name" maxlength="255"></label>
+        <div class="item-image-search-mount"></div>
+        <div class="item-selected-card" hidden>
+          <img class="item-selected-image zoomable" hidden>
+          <div>
+            <p class="muted item-selected-name"></p>
+            <p class="muted item-selected-hint-price" hidden></p>
+          </div>
+        </div>
+        <button type="button" class="link-button item-manual-toggle">该商品未收录，改为手工输入名称/上传图片</button>
+        <div class="item-mode-manual full" hidden>
+          <label>手工商品名（可空，但需至少填名称或上传图片）<input class="item-manual-name" maxlength="255"></label>
+          <label>商品图片（可空）<input class="item-manual-image" type="file" accept="image/jpeg,image/png,image/webp"></label>
+          <img class="item-manual-image-preview zoomable" hidden>
+        </div>
         <div class="form-grid">
           <label>JAN（可空）<input class="item-jan" maxlength="32"></label>
           <label>数量<input class="item-quantity" type="number" min="1" step="1" inputmode="numeric" value="1"></label>
-          <label>实际销售单价（日元）<input class="item-price" type="number" min="0" step="1" inputmode="numeric"></label>
+          <label>微信售价（元）<small class="muted">本次实际收款</small><input class="item-price" type="number" min="0" step="0.01" inputmode="decimal"></label>
           <label>备注（可空）<input class="item-note" maxlength="255"></label>
         </div>
         <p class="muted">行金额：¥<span class="item-line-amount">0</span></p>
@@ -89,11 +122,56 @@
   </section>
 
   <section class="card order-submit-bar">
-    <label>订单备注（可空）<textarea name="note" rows="2" maxlength="500"></textarea></label>
+    <label>订单备注（可空）<textarea name="note" rows="2" maxlength="500">{{ (order.note if order else '') or '' }}</textarea></label>
     <p class="order-total">订单总金额：¥<span id="orderTotalAmount">0</span></p>
-    <button class="full" type="submit" id="submitOrderButton">提交订单</button>
+    <button class="full" type="button" id="submitOrderButton">{{ '保存修改' if order else '提交订单' }}</button>
     <p id="formError" class="error" hidden></p>
   </section>
 </form>
+
+<div class="confirm-modal-overlay" id="confirmModalOverlay" hidden>
+  <div class="confirm-modal">
+    <h2>请确认订单</h2>
+    <p><strong>客户：</strong><span id="confirmCustomerName"></span></p>
+    <p><strong>收货人：</strong><span id="confirmRecipientName"></span> <span id="confirmRecipientPhone"></span></p>
+    <p><strong>收货地址：</strong><span id="confirmShippingAddress"></span></p>
+    <div class="confirm-modal-items" id="confirmItemsList"></div>
+    <p><strong>总件数：</strong><span id="confirmTotalQuantity"></span> · <strong>总付款金额：</strong>¥<span id="confirmTotalAmount"></span></p>
+    <p class="confirm-modal-warning">请确定各商品单价、数量、总付款金额</p>
+    <div class="button-row">
+      <button type="button" class="secondary" id="confirmModalBack">返回检查</button>
+      <button type="button" id="confirmModalSubmit">确认提交</button>
+    </div>
+  </div>
+</div>
+<script>
+  window.__salesOrderEdit = {{ (order is not none)|tojson }};
+  {% if order %}
+  window.__salesOrderEditData = {
+    customer: {
+      id: {{ order.customer_id }},
+      name: {{ order.customer.name|tojson }},
+      phone: {{ order.customer.phone|tojson }},
+      wechat_name: {{ order.customer.wechat_name|tojson }},
+    },
+    items: [
+      {% for item in order.items %}
+      {
+        product_id: {{ item.product_id|tojson }},
+        display_name: {{ (item.product.display_name if item.product else item.product_name_snapshot)|tojson }},
+        manual_name: {{ (item.product_name_snapshot if not item.product_id else none)|tojson }},
+        jan: {{ item.jan_snapshot|tojson }},
+        quantity: {{ item.quantity }},
+        unit_sale_price: {{ item.unit_sale_price|string|tojson }},
+        note: {{ item.note|tojson }},
+        image_url: {{ (product_image_url(item.product) if item.product else (('/sales-orders/item-images/' ~ item.id) if item.manual_image_relative_path else none))|tojson }},
+      }{% if not loop.last %},{% endif %}
+      {% endfor %}
+    ],
+  };
+  {% endif %}
+</script>
+<script src="/static/address_paste.js" defer></script>
+<script src="/static/image_product_search.js" defer></script>
 <script src="/static/sales_order_new.js" defer></script>
 {% endblock %}

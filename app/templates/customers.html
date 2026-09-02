@@ -1,0 +1,23 @@
+{% extends "base.html" %}
+{% block title %}客户管理{% endblock %}
+{% block content %}
+<div class="section-head"><h1>客户管理</h1></div>
+<section class="card so-filter-card"><form class="so-filter" method="get">
+  <div class="so-filter-quick-row">
+    <input type="search" name="q" value="{{ q }}" placeholder="搜索客户姓名 / 电话 / 微信名" aria-label="搜索客户">
+    <button type="submit" class="compact">搜索</button>
+  </div>
+</form></section>
+
+<section class="stack customer-list">
+  {% for customer in rows %}
+  <a class="card row customer-list-row" href="/customers/{{ customer.id }}">
+    <span class="customer-list-main">
+      <strong>{{ customer.name }}</strong>
+      <small>{{ customer.phone or '—' }}{% if customer.wechat_name %} · 微信：{{ customer.wechat_name }}{% endif %}</small>
+    </span>
+    <span class="muted">管理地址 ›</span>
+  </a>
+  {% else %}<section class="card empty-state">暂无客户。</section>{% endfor %}
+</section>
+{% endblock %}

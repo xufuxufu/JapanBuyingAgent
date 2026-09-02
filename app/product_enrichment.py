@@ -1599,15 +1599,81 @@ def process_enrichment_task(
         return task
 
 
+def _run_gated_enrichment_task(session: Session, task: ProductEnrichmentTask) -> None:
+    """Apply the running/cooldown/global-concurrency gates before running the
+    (possibly slow, network-heavy) enrichment pipeline for one task.
+
+    Shared by every enrichment entry point -- price-check background lookups,
+    receipt-item bulk import, manual JAN corrections -- so a single global
+    cap protects the shared worker threadpool no matter which flow triggered
+    it. Without this, a 56-item receipt import queuing 30 unique JANs could
+    run all 30 concurrently with a price-check scan's own enrichment, right
+    back into the threadpool-starvation problem the cap exists to prevent.
+    """
+    jan = task.jan
+    if task.status == "running":
+        logger.info("enrichment_skipped reason=already_running jan=%s task_id=%s", jan, task.id)
+        return
+    if task.status in {"completed", "completed_with_warnings"} and task.completed_at is not None:
+        completed_at = task.completed_at
+        if completed_at.tzinfo is None:
+            completed_at = completed_at.replace(tzinfo=timezone.utc)
+        if datetime.now(timezone.utc) - completed_at < ENRICHMENT_RETRY_COOLDOWN:
+            logger.info("enrichment_skipped reason=cooldown jan=%s task_id=%s", jan, task.id)
+            return
+    # Global cap across ALL JANs and ALL trigger sources, checked only now
+    # (right before the expensive part) so the cheap dedup checks above
+    # never waste a concurrency slot. Foreground work (a scan, a page load)
+    # always takes priority over enrichment, so hitting the cap defers this
+    # task rather than queuing/blocking for a slot -- it will simply retry
+    # the next time something re-triggers enrichment for this JAN.
+    if not _enrichment_slots.acquire(blocking=False):
+        logger.info(
+            "enrichment_skipped reason=capacity jan=%s task_id=%s active=%s",
+            jan, task.id, enrichment_concurrency_snapshot(),
+        )
+        return
+    with _enrichment_state_lock:
+        _enrichment_running_jans.add(jan)
+    try:
+        process_enrichment_task(session, task)
+    finally:
+        with _enrichment_state_lock:
+            _enrichment_running_jans.discard(jan)
+        _enrichment_slots.release()
+
+
 def safe_trigger_receipt_items(session: Session, items: list[ReceiptItem], trigger_source: str) -> list[ProductEnrichmentTask]:
     try:
         tasks = ensure_receipt_item_tasks(session, items, trigger_source)
         for task in tasks:
-            process_enrichment_task(session, task)
+            _run_gated_enrichment_task(session, task)
         return tasks
     except Exception:
         session.rollback()
         return []
+
+
+def process_receipt_items_enrichment(database_url: str, receipt_item_ids: list[int], trigger_source: str) -> None:
+    """Background counterpart to safe_trigger_receipt_items() for bulk
+    imports (e.g. confirming a GPT-recognized receipt JSON with dozens of
+    line items). Runs on its OWN engine/session -- the request's session is
+    already closed by the time this executes in the background, so it must
+    never be reused here -- and reloads the ReceiptItem rows fresh by id.
+    """
+    if not receipt_item_ids:
+        return
+    engine = build_engine(database_url)
+    try:
+        with Session(engine) as session:
+            items = list(session.scalars(select(ReceiptItem).where(ReceiptItem.id.in_(receipt_item_ids))))
+            safe_trigger_receipt_items(session, items, trigger_source)
+    except Exception:
+        logger.exception(
+            "receipt_items_enrichment_failed trigger_source=%s item_count=%s", trigger_source, len(receipt_item_ids),
+        )
+    finally:
+        engine.dispose()
 
 
 def process_price_lookup_enrichment(database_url: str, jan: str, history_id: int) -> None:
@@ -1627,38 +1693,7 @@ def process_price_lookup_enrichment(database_url: str, jan: str, history_id: int
                 return
             attach_lookup_source(session, task, history_id)
             session.commit()
-            if task.status == "running":
-                logger.info("price_lookup_enrichment_skipped reason=already_running jan=%s task_id=%s", jan, task.id)
-                return
-            if task.status in {"completed", "completed_with_warnings"} and task.completed_at is not None:
-                completed_at = task.completed_at
-                if completed_at.tzinfo is None:
-                    completed_at = completed_at.replace(tzinfo=timezone.utc)
-                if datetime.now(timezone.utc) - completed_at < ENRICHMENT_RETRY_COOLDOWN:
-                    logger.info(
-                        "price_lookup_enrichment_skipped reason=cooldown jan=%s task_id=%s", jan, task.id,
-                    )
-                    return
-            # Global cap across ALL JANs, checked only now (right before the
-            # expensive part) so the cheap dedup checks above never waste a
-            # concurrency slot. On-site priority is the foreground scan, not
-            # enrichment, so hitting the cap defers this task rather than
-            # queuing/blocking for a slot -- it will simply retry on the
-            # scanned JAN's next lookup.
-            if not _enrichment_slots.acquire(blocking=False):
-                logger.info(
-                    "price_lookup_enrichment_skipped reason=capacity jan=%s task_id=%s active=%s",
-                    jan, task.id, enrichment_concurrency_snapshot(),
-                )
-                return
-            with _enrichment_state_lock:
-                _enrichment_running_jans.add(jan)
-            try:
-                process_enrichment_task(session, task)
-            finally:
-                with _enrichment_state_lock:
-                    _enrichment_running_jans.discard(jan)
-                _enrichment_slots.release()
+            _run_gated_enrichment_task(session, task)
     except Exception:
         logger.exception("price_lookup_enrichment_failed jan=%s history_id=%s", jan, history_id)
     finally:

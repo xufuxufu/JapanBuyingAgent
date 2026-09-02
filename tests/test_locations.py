@@ -12,15 +12,20 @@ from app.models import Location, Product, Receipt, ReceiptBatch, ReceiptItem
 from app.services import confirm_receipt
 
 
-QINSI_NAMES = {"2025千羽", "2025招财猫", "无条码商品", "新日本仓库", "日本家里库存"}
+# QinSi renamed "千羽"/"招财猫" for the new calendar year; both the 2025 and
+# 2026 spellings stay as separate seeded Location rows (see location_service.py).
+QINSI_NAMES = {
+    "2025千羽", "2025招财猫", "2026千羽", "2026招财猫", "无条码商品", "新日本仓库", "日本家里库存",
+}
+DEFAULT_LOCATION_COUNT = 11
 
 
-def test_nine_defaults_exist_and_repeated_initialization_is_idempotent(db_session):
+def test_default_locations_exist_and_repeated_initialization_is_idempotent(db_session):
     first = initialize_default_locations(db_session)
     second = initialize_default_locations(db_session)
-    assert len(first) == len(second) == 9
-    assert db_session.scalar(select(func.count()).select_from(Location)) == 9
-    assert len({location.internal_code for location in second}) == 9
+    assert len(first) == len(second) == DEFAULT_LOCATION_COUNT
+    assert db_session.scalar(select(func.count()).select_from(Location)) == DEFAULT_LOCATION_COUNT
+    assert len({location.internal_code for location in second}) == DEFAULT_LOCATION_COUNT
 
 
 def test_internal_code_is_database_unique(db_session):
@@ -70,7 +75,7 @@ def test_location_list_page_and_api_are_read_only_and_return_200(client):
     api = http.get("/api/locations")
     assert page.status_code == api.status_code == 200
     assert "位置管理" in page.text and "日本家里库存" in page.text
-    assert len(api.json()) == 9
+    assert len(api.json()) == DEFAULT_LOCATION_COUNT
     assert http.delete("/locations/1").status_code in {404, 405}
 
 

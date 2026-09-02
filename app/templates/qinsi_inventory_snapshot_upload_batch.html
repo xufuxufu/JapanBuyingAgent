@@ -1,0 +1,7 @@
+{% extends "base.html" %}
+{% block title %}批量导入秦丝库存快照{% endblock %}
+{% block content %}
+<div class="section-head"><div><h1>批量导入秦丝库存快照</h1><p class="muted">一次选择多个分段 Excel（例如"商品库存列表导出(1-500).xlsx"...(7501-7912).xlsx），它们会被当作同一次秦丝库存导出，合并解析后生成唯一一个快照。</p></div><a class="button secondary" href="/qinsi-inventory-snapshots">返回列表</a></div>
+{% if error %}<div class="warning"><strong>解析失败：</strong>{{ error }}</div>{% endif %}
+<section class="card"><form class="form-grid" method="post" enctype="multipart/form-data"><label class="full">秦丝 Excel（可多选）<input type="file" name="files" accept="{{ settings.allowed_extensions|join(',') }}" multiple required></label><label>数据对应时间（可空，16个文件共用一个时间）<input type="datetime-local" name="data_at"></label><button class="full" type="submit">解析并预览</button></form><p class="muted">最大单文件 {{ settings.max_upload_bytes // 1024 // 1024 }}MB；这一步只解析预览，不会写入任何快照数据，确认无误后才会创建。</p></section>
+{% endblock %}

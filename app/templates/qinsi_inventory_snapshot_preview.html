@@ -1,0 +1,81 @@
+{% extends "base.html" %}
+{% block title %}库存快照预览{% endblock %}
+{% block content %}
+<div class="section-head"><div><h1>库存快照预览</h1><p class="muted">尚未写入任何数据。确认无误后点击底部按钮，{{ encoded_files|length }}个文件会合并生成唯一一个快照。</p></div><a class="button secondary" href="/qinsi-inventory-snapshots/upload-batch">重新选择文件</a></div>
+{% if error %}<div class="warning"><strong>确认失败：</strong>{{ error }}</div>{% endif %}
+
+<section class="card table-wrap">
+  <h2>文件分段完整性</h2>
+  <div class="summary-grid">
+    <span><strong>{{ preview.completeness.files|length }}</strong>文件数</span>
+    <span><strong>{{ preview.completeness.expected_min if preview.completeness.expected_min is not none else '—' }}-{{ preview.completeness.expected_max if preview.completeness.expected_max is not none else '—' }}</strong>文件名范围</span>
+    <span><strong>{{ preview.total_rows }}</strong>有效数据行</span>
+    <span><strong>{{ preview.completeness.actual_total_rows }}</strong>Excel原始行数</span>
+  </div>
+  {% if not preview.completeness.all_ranges_parsed %}<p class="warning">部分文件名无法解析出范围，无法验证分段完整性（不影响导入，仍以文件实际数据为准）。</p>{% endif %}
+  {% if preview.completeness.gaps %}<p class="warning">发现缺段：{% for a,b in preview.completeness.gaps %}{{ a }}-{{ b }}{% if not loop.last %}、{% endif %}{% endfor %}</p>{% endif %}
+  {% if preview.completeness.overlaps %}<p class="warning">发现范围重叠：{% for a,b,c,d in preview.completeness.overlaps %}({{ a }}-{{ b }}) 与 ({{ c }}-{{ d }}){% if not loop.last %}、{% endif %}{% endfor %}</p>{% endif %}
+  {% if preview.completeness.header_mismatch %}<p class="warning">文件表头不一致，请确认这些文件确实来自同一次导出。</p>{% endif %}
+  <table><thead><tr><th>文件名</th><th>文件名范围</th><th>Excel行数</th></tr></thead><tbody>
+  {% for info in preview.completeness.files %}<tr><td>{{ info.filename }}</td><td>{{ '%d-%d'|format(info.range[0], info.range[1]) if info.range else '无法解析' }}</td><td>{{ info.row_count }}</td></tr>{% endfor %}
+  </tbody></table>
+</section>
+
+<section class="card">
+  <h2>匹配统计</h2>
+  <div class="summary-grid">
+    <span><strong>{{ preview.matched_count }}</strong>已匹配</span>
+    <span><strong>{{ preview.unmatched_count }}</strong>未匹配</span>
+    <span><strong>{{ preview.conflict_count }}</strong>冲突</span>
+    <span><strong>{{ preview.duplicate_count }}</strong>完全重复</span>
+    <span><strong>{{ preview.quantity_conflict_count }}</strong>数量冲突</span>
+  </div>
+  <table><thead><tr><th>匹配方式</th><th>行数</th></tr></thead><tbody>
+  {% for method, count in preview.method_counts.items() %}<tr><td>{{ match_method_labels.get(method, method) }}</td><td>{{ count }}</td></tr>{% endfor %}
+  </tbody></table>
+</section>
+
+<section class="card table-wrap">
+  <h2>仓库与区域统计</h2>
+  <div class="summary-grid"><span><strong>{{ preview.china_quantity }}</strong>中国参考库存</span><span><strong>{{ preview.japan_quantity }}</strong>日本参考库存</span>{% if preview.unclassified_quantity %}<span><strong>{{ preview.unclassified_quantity }}</strong>未分区仓库库存</span>{% endif %}</div>
+  <table><thead><tr><th>秦丝仓库</th><th>行数</th><th>库存合计</th></tr></thead><tbody>
+  {% for name, stat in preview.warehouse_counts.items() %}<tr><td>{{ name }}</td><td>{{ stat[0] }}</td><td>{{ stat[1] }}</td></tr>{% else %}<tr><td colspan="3">暂无可统计仓库明细。</td></tr>{% endfor %}
+  </tbody></table>
+</section>
+
+{% if preview.conflicts %}
+<section class="card table-wrap">
+  <h2>货号/JAN 冲突（不会自动绑定商品）</h2>
+  <table><thead><tr><th>秦丝商品名</th><th>货号</th><th>JAN</th><th>仓库</th><th>数量</th><th>货号匹配</th><th>JAN匹配</th></tr></thead><tbody>
+  {% for row in preview.conflicts %}<tr><td>{{ row.name or '—' }}</td><td>{{ row.code or '—' }}</td><td>{{ row.jan or '—' }}</td><td>{{ row.warehouse_name or '—' }}</td><td>{{ row.quantity if row.quantity is not none else '—' }}</td><td>{% if row.conflict_pair %}<a href="/products/{{ row.conflict_pair[0].id }}">{{ row.conflict_pair[0].internal_sku }}</a>{% endif %}</td><td>{% if row.conflict_pair %}<a href="/products/{{ row.conflict_pair[1].id }}">{{ row.conflict_pair[1].internal_sku }}</a>{% endif %}</td></tr>{% endfor %}
+  </tbody></table>
+</section>
+{% endif %}
+
+{% if preview.duplicates %}
+<section class="card table-wrap">
+  <h2>完全重复行（只计一次）</h2>
+  <table><thead><tr><th>商品名</th><th>货号</th><th>仓库</th><th>数量</th><th>说明</th></tr></thead><tbody>
+  {% for row in preview.duplicates %}<tr><td>{{ row.name or '—' }}</td><td>{{ row.code or '—' }}</td><td>{{ row.warehouse_name or '—' }}</td><td>{{ row.quantity if row.quantity is not none else '—' }}</td><td>{{ row.error_notes[0] if row.error_notes else '—' }}</td></tr>{% endfor %}
+  </tbody></table>
+</section>
+{% endif %}
+
+{% if preview.quantity_conflicts %}
+<section class="card table-wrap">
+  <h2>同货号同仓库数量冲突（未自动合并）</h2>
+  <table><thead><tr><th>商品名</th><th>货号</th><th>仓库</th><th>数量</th><th>说明</th></tr></thead><tbody>
+  {% for row in preview.quantity_conflicts %}<tr><td>{{ row.name or '—' }}</td><td>{{ row.code or '—' }}</td><td>{{ row.warehouse_name or '—' }}</td><td>{{ row.quantity if row.quantity is not none else '—' }}</td><td>{{ row.error_notes[0] if row.error_notes else '—' }}</td></tr>{% endfor %}
+  </tbody></table>
+</section>
+{% endif %}
+
+<section class="card">
+  <form method="post" action="/qinsi-inventory-snapshots/confirm-batch" class="stack">
+    {% for file in encoded_files %}<input type="hidden" name="filenames" value="{{ file.filename }}"><input type="hidden" name="file_contents" value="{{ file.content_b64 }}">{% endfor %}
+    <input type="hidden" name="data_at" value="{{ data_at }}">
+    {% if preview.completeness.has_blocking_issue %}<label class="checkbox"><input type="checkbox" name="override_completeness_warning" value="true" required>我已确认上方缺段/重叠/表头不一致的提示，仍要继续导入</label>{% endif %}
+    <button class="full" type="submit">确认创建库存快照（合并{{ encoded_files|length }}个文件）</button>
+  </form>
+</section>
+{% endblock %}

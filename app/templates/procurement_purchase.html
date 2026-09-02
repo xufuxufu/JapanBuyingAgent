@@ -12,11 +12,14 @@
     {% set summary = summaries.get(plan.id) %}
     <article class="card pd-purchase-card" data-plan-id="{{ plan.id }}" data-remaining="{{ summary.remaining_quantity }}">
       <div class="pd-card-main">
-        {% if plan.product and plan.product.preferred_image_url %}
-        <img class="product-thumb" loading="lazy" src="{{ plan.product.preferred_image_url }}" alt="商品主图">
-        {% else %}<div class="product-image-empty product-thumb">无图</div>{% endif %}
+        {% set manual_demand = plan.sources|map(attribute='demand')|selectattr('manual_image_relative_path')|first %}
+        {% set image = product_image_url(plan.product) if plan.product else (('/procurement-demands/item-images/' ~ manual_demand.id) if manual_demand else none) %}
+        <div class="product-thumb-slot{% if not image %} image-load-failed{% endif %}">
+          {% if image %}<img class="product-thumb zoomable" data-zoom-src="{{ image }}" src="{{ image }}" alt="商品主图" loading="lazy" referrerpolicy="no-referrer" onerror="this.parentElement.classList.add('image-load-failed')"><span class="zoom-hint">+</span>{% endif %}
+          <div class="product-image-empty">无图</div>
+        </div>
         <div class="pd-card-info">
-          <h2>{{ plan.product_name_snapshot }}</h2>
+          <h2 class="procurement-card-name">{{ plan.product_name_snapshot }}</h2>
           <p class="muted">{{ plan.jan_snapshot or 'JAN 未填写' }}</p>
           <p class="pd-purchase-qty-grid"><span>计划：<strong>{{ summary.planned_quantity }}</strong></span><span>已买：<strong>{{ summary.purchased_quantity }}</strong></span><span>剩余：<strong>{{ summary.remaining_quantity }}</strong></span></p>
         </div>

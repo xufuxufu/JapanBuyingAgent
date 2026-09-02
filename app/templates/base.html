@@ -21,16 +21,13 @@
     <aside id="desktopSidebar" class="desktop-sidebar">
       <div class="sidebar-brand"><a href="/">Japan Buying Agent</a><button id="sidebarToggle" type="button" class="secondary compact" aria-label="折叠菜单">☰</button></div>
       <nav class="sidebar-nav" aria-label="主导航">
-        {% if nav_can('field') %}<a href="/field-purchase"><span>▦</span><b>扫码</b></a>{% endif %}
-        {% if nav_can('purchase') %}<a href="/purchase-batches"><span>購</span><b>采购</b></a>{% endif %}
-        {% if nav_can('products') %}<a href="/products"><span>品</span><b>商品</b></a>{% endif %}
-        {% if nav_can('tasks') %}<a href="/tasks"><span>任</span><b>任务</b></a>{% endif %}
+        {% if nav_can('field') %}{% for entry in HOME_QUICK_ENTRIES %}<a href="{{ entry.href }}"><span>{{ entry.icon }}</span><b>{{ entry.label }}</b></a>{% endfor %}{% endif %}
         <a href="/more"><span>•••</span><b>更多</b></a>
       </nav>
       <div class="sidebar-groups">
         {% if nav_can('field') %}
         <details open><summary>现场作业</summary>
-          <a href="/price-check">扫码查价</a><a href="/receipts/upload">拍照识别</a><a href="/stores">门店</a><a href="/purchase-batches">采购批次</a><a href="/sales-orders">微信订单</a><a href="/procurement-demands">采购需求</a><a href="/procurement-demands/report-shortage">报缺货</a>
+          <a href="/price-check">扫码查价</a><a href="/field-purchase">扫码（批量）</a><a href="/receipts/upload">拍照识别</a><a href="/stores">门店</a><a href="/purchase-batches">采购批次</a><a href="/sales-orders">微信订单</a><a href="/customers">客户管理</a><a href="/procurement-demands">采购需求</a><a href="/procurement-demands/report-shortage">补货需求</a>
         </details>
         {% endif %}
         {% if nav_can('products') %}
@@ -59,10 +56,7 @@
     <main>{% block content %}{% endblock %}</main>
   </div>
   <nav class="mobile-bottom-nav" aria-label="手机主导航">
-    {% if nav_can('field') %}<a href="/field-purchase"><span>▦</span>扫码</a>{% endif %}
-    {% if nav_can('purchase') %}<a href="/purchase-batches"><span>購</span>采购</a>{% endif %}
-    {% if nav_can('products') %}<a href="/products"><span>品</span>商品</a>{% endif %}
-    {% if nav_can('tasks') %}<a href="/tasks"><span>任</span>任务</a>{% endif %}
+    {% if nav_can('field') %}{% for entry in HOME_QUICK_ENTRIES %}<a href="{{ entry.href }}"><span>{{ entry.icon }}</span>{{ entry.label }}</a>{% endfor %}{% endif %}
     <a href="/more"><span>•••</span>更多</a>
   </nav>
 <div id="imageViewer" class="image-viewer" hidden aria-modal="true" role="dialog" aria-label="图片查看器">
@@ -138,5 +132,6 @@
   stage.addEventListener('pointerup', release); stage.addEventListener('pointercancel', release);
 })();
 </script>
+<script src="/static/image_zoom.js" defer></script>
 </body>
 </html>

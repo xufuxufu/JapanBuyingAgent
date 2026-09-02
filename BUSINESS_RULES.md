@@ -8,10 +8,11 @@ Last updated: 2026-08-27. If this file conflicts with current code, migrations, 
 - Blank JAN is allowed.
 - QinSi 货号 is `qinsi_product_code`; it is unique when present and never automatically means JAN.
 - JAN/barcode values are text. Preserve leading zeroes and reject unsafe numeric conversion.
-- Valid JAN in QinSi imports is selected in this priority: 单品条码, 商品条码, then 货号 only if it passes JAN validation.
+- Valid JAN in QinSi imports is selected in this priority: 单品条码, 商品条码, 条码 (the inventory export's own barcode column), then 货号 only if it passes JAN validation.
 - A valid-looking QinSi 货号 can still be a QinSi code. Do not use it as a scan JAN unless current parser/matching rules prove it is the intended JAN.
 - Shared barcodes are allowed in `product_barcodes`; `ProductBarcode.barcode` is indexed but not globally unique.
 - Unique scan match may proceed directly. Ambiguous scan match must show candidate products for human choice.
+- QinSi inventory-snapshot matching is not "JAN first" or "code first": `qinsi_product_code` and JAN are cross-checked independently. Either one matching alone is a normal match; both matching the *same* Product is doubly verified; both matching *different* Products is a conflict that never auto-binds and always needs human review. A row with no JAN can still match purely on `qinsi_product_code` (covers products with no real barcode, e.g. gacha/gifts) -- it must never be dropped for lacking a JAN. See `app/qinsi_inventory.py::_match_product`.
 
 ## QinSi Product Master
 

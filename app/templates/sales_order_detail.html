@@ -4,6 +4,7 @@
 <div class="so-detail-page">
 <div class="section-head"><div><h1>{{ order.order_no }}</h1><p class="muted"><span class="badge state-{{ order.status }}">{{ status_labels.get(order.status, order.status) }}</span> · 下单 {{ order.order_date|tokyo_datetime }} · 销售员 {{ order.salesperson.name }}</p></div><a class="button secondary compact" href="/sales-orders">返回列表</a></div>
 {% if error %}<div class="warning"><strong>操作失败：</strong>{{ error }}</div>{% endif %}
+{% if not item_editable and order.status not in ('completed', 'cancelled') %}<div class="badge state-paid so-lock-notice">{{ item_locked_message }}</div>{% endif %}
 
 <section class="card so-detail-card">
   <h2>客户信息</h2>
@@ -14,28 +15,41 @@
 <section class="card so-detail-card">
   <h2>收货信息</h2>
   <div class="so-detail-line"><strong>{{ order.recipient_name_snapshot or order.customer.name }}</strong><span class="muted">{{ order.recipient_phone_snapshot or order.customer.phone or '—' }}</span></div>
-  <p class="muted so-detail-sub">地址：{{ order.shipping_address_snapshot or order.customer.address or '地址待补充' }}</p>
+  <p class="muted so-detail-sub">地址：{{ order.shipping_address_snapshot or '地址待补充' }}</p>
+  {% if address_editable %}
+  <button type="button" class="link-button" id="addressEditToggle">修改收货地址</button>
+  <form method="post" action="/sales-orders/{{ order.id }}/address" id="addressEditForm" class="form-grid" hidden>
+    {% if customer_addresses %}
+    <label class="full">从客户已存地址选择<select id="addressQuickPick"><option value="">-- 手动填写 --</option>{% for address in customer_addresses %}<option value="{{ address.id }}" data-name="{{ address.recipient_name }}" data-phone="{{ address.phone or '' }}" data-address="{{ address.address }}">{{ address.label or '' }} {{ address.recipient_name }} {{ address.phone or '' }} / {{ address.address }}</option>{% endfor %}</select></label>
+    {% endif %}
+    <label>收件人姓名<input name="recipient_name" id="addressEditName" value="{{ order.recipient_name_snapshot or '' }}" maxlength="255"></label>
+    <label>收件手机号<input name="recipient_phone" id="addressEditPhone" value="{{ order.recipient_phone_snapshot or '' }}" maxlength="50"></label>
+    <label class="full">收货地址<input name="shipping_address" id="addressEditAddress" value="{{ order.shipping_address_snapshot or '' }}" maxlength="500"></label>
+    <div class="button-row full"><button type="submit">保存地址</button><button type="button" class="secondary" id="addressEditCancel">取消</button></div>
+  </form>
+  {% elif order.status not in ('completed', 'cancelled') %}
+  <p class="muted">该订单已无未发货部分，收货地址不可再修改。</p>
+  {% endif %}
 </section>
 
 <section class="card so-detail-card">
   <h2>商品信息</h2>
   <div class="stack item-detail-list">
     {% for item in order.items %}
-    {% set image = product_image_url(item.product) if item.product else none %}
+    {% set image = product_image_url(item.product) if item.product else (('/sales-orders/item-images/' ~ item.id) if item.manual_image_relative_path else none) %}
     {% set product_href = '/products/' ~ item.product_id if item.product_id else none %}
     <div class="row item-detail-row">
-      {% if product_href %}<a href="{{ product_href }}" aria-label="查看商品">{% endif %}
       <div class="product-thumb-slot{% if not image %} image-load-failed{% endif %}">
-        {% if image %}<img class="product-thumb" src="{{ image }}" alt="商品主图" loading="lazy" referrerpolicy="no-referrer" onerror="this.parentElement.classList.add('image-load-failed')">{% endif %}
+        {% if image %}<img class="product-thumb zoomable" data-zoom-src="{{ image }}" src="{{ image }}" alt="商品主图" loading="lazy" referrerpolicy="no-referrer" onerror="this.parentElement.classList.add('image-load-failed')"><span class="zoom-hint">+</span>{% endif %}
         <div class="product-image-empty">无图</div>
       </div>
-      {% if product_href %}</a>{% endif %}
       <span class="item-detail-body">
-        {% if product_href %}<a class="item-detail-name" href="{{ product_href }}">{{ item.product_name_snapshot }}</a>{% else %}<strong class="item-detail-name">{{ item.product_name_snapshot }}</strong>{% endif %}
+        {% if product_href %}<a class="item-detail-name" href="{{ product_href }}">{{ item.product_name_snapshot }}</a>{% else %}<strong class="item-detail-name">{{ item.product_name_snapshot or '手工商品' }}</strong>{% endif %}
         <small>{{ item.jan_snapshot or 'JAN 未填写' }}{% if not item.product_id %} · 手工商品{% endif %}</small>
         {% if item.note %}<small>备注：{{ item.note }}</small>{% endif %}
+        {% if order.shipments %}<small>已发 {{ item.shipped_quantity }} / 共 {{ item.quantity }}（剩余 {{ item.remaining_quantity }}）</small>{% endif %}
       </span>
-      <span class="badge item-detail-price">×{{ item.quantity }} · ¥{{ item.line_amount }}</span>
+      <span class="badge item-detail-price">微信售价 ¥{{ item.unit_sale_price }} × {{ item.quantity }} = ¥{{ item.line_amount }}</span>
     </div>
     {% else %}<p class="empty-state">订单暂无商品明细。</p>{% endfor %}
   </div>
@@ -43,44 +57,157 @@
   {% if order.note %}<p><strong>订单备注：</strong>{{ order.note }}</p>{% endif %}
 </section>
 
-<section class="card so-detail-card">
-  <h2>发货面单{% if order.shipping_labels %}（{{ order.shipping_labels|length }}）{% endif %}</h2>
-  {% if order.status == 'submitted' %}
-  <p class="muted">订单进入待发货后才能上传面单。</p>
-  {% else %}
-    {% if order.shipping_labels %}
-    <div class="shipping-label-grid">
-      {% for label in order.shipping_labels %}
-      <div class="shipping-label-card">
-        <a href="/sales-orders/shipping-labels/{{ label.id }}" target="_blank"><img class="shipping-label-thumb" loading="lazy" src="/sales-orders/shipping-labels/{{ label.id }}" alt="发货面单"></a>
-        <small>{{ label.created_at|tokyo_datetime }}</small>
-        <div class="button-row">
-          <a class="button secondary compact" href="/sales-orders/shipping-labels/{{ label.id }}" target="_blank">查看</a>
-          <a class="button secondary compact" href="/sales-orders/shipping-labels/{{ label.id }}/download">下载</a>
-          {% if can_delete_shipping_label %}
-          <form method="post" action="/sales-orders/shipping-labels/{{ label.id }}/delete" onsubmit="return confirm('确认删除该面单图片？');"><button type="submit" class="secondary compact">删除</button></form>
-          {% endif %}
+{% if can_create_shipment %}
+{% set remaining_items = order.items|selectattr('remaining_quantity', 'greaterthan', 0)|list %}
+<section class="card so-detail-card" id="create-shipment">
+  <h2>创建发货单</h2>
+  {% if remaining_items %}
+  <form method="post" action="/sales-orders/{{ order.id }}/shipments" id="createShipmentForm">
+    <input type="hidden" name="items_json" id="shipmentItemsJsonInput">
+    <div class="stack shipment-item-picker">
+      {% for item in remaining_items %}
+      {% set image = product_image_url(item.product) if item.product else (('/sales-orders/item-images/' ~ item.id) if item.manual_image_relative_path else none) %}
+      <label class="row shipment-item-row">
+        <div class="shipment-item-image-slot product-thumb-slot{% if not image %} image-load-failed{% endif %}">
+          {% if image %}<img class="product-thumb zoomable" data-zoom-src="{{ image }}" src="{{ image }}" alt="商品主图" loading="lazy" referrerpolicy="no-referrer" onerror="this.parentElement.classList.add('image-load-failed')">{% endif %}
+          <div class="product-image-empty">无图</div>
         </div>
-      </div>
+        <input type="checkbox" class="shipment-item-checkbox" data-item-id="{{ item.id }}" data-remaining="{{ item.remaining_quantity }}">
+        <span class="shipment-item-info">
+          <strong>{{ item.product_name_snapshot or '手工商品' }}</strong>
+          <small>已订 {{ item.quantity }} · 已发 {{ item.shipped_quantity }} · 剩余 {{ item.remaining_quantity }}</small>
+        </span>
+        <span class="shipment-item-stepper">
+          <button type="button" class="compact shipment-qty-minus">-</button>
+          <input type="number" class="shipment-qty-input" min="1" max="{{ item.remaining_quantity }}" value="{{ item.remaining_quantity }}" inputmode="numeric">
+          <button type="button" class="compact shipment-qty-plus">+</button>
+        </span>
+      </label>
       {% endfor %}
     </div>
-    {% else %}<p class="empty-state">暂无面单</p>{% endif %}
-    {% if can_upload_shipping_label %}
-    <form method="post" action="/sales-orders/{{ order.id }}/shipping-labels" enctype="multipart/form-data" class="shipping-label-upload-form" id="shippingLabelForm">
-      <label class="tag-photo-picker" id="shippingLabelPicker">拍照或从相册选择面单图片<input type="file" name="file" accept="image/*" id="shippingLabelInput" hidden></label>
-      <div id="shippingLabelPreview" class="shipping-label-selected-preview" hidden>
-        <img id="shippingLabelPreviewImage" alt="面单预览">
-        <span id="shippingLabelFileName"></span>
-      </div>
-      <button type="submit" id="shippingLabelSubmit" disabled>上传面单</button>
-    </form>
-    {% endif %}
-  {% endif %}
+    <div class="form-grid">
+      <label>物流公司<input name="carrier" value="中通" maxlength="50"></label>
+      <label>运单号（可空，可稍后补填）<input name="tracking_no" maxlength="100"></label>
+      <label class="full">发货收件人<input name="recipient_name" value="{{ order.recipient_name_snapshot or '' }}" maxlength="255"></label>
+      <label>发货收件电话<input name="recipient_phone" value="{{ order.recipient_phone_snapshot or '' }}" maxlength="50"></label>
+      <label class="full">发货地址<input name="shipping_address" value="{{ order.shipping_address_snapshot or '' }}" maxlength="500"></label>
+    </div>
+    <div class="button-row">
+      <button type="button" class="secondary" id="selectAllShipmentItems">全选</button>
+      <button type="submit" id="shipSelectedButton">发选中商品</button>
+      <button type="button" id="shipAllButton">全部发货</button>
+    </div>
+  </form>
+  {% else %}<p class="empty-state">所有商品均已安排发货。</p>{% endif %}
 </section>
+{% endif %}
+
+{% if order.shipments %}
+<section class="card so-detail-card">
+  <h2>发货单</h2>
+  <div class="stack">
+    {% for shipment in order.shipments %}
+    <div class="card shipment-card">
+      <div class="so-head">
+        <h3>发货单 #{{ loop.index }} · {{ shipment.shipment_no }}</h3>
+        <span class="badge state-{{ 'shipped' if shipment.status == 'shipped' else 'submitted' }}">{{ '已发货' if shipment.status == 'shipped' else '待发货' }}</span>
+      </div>
+      <ul class="shipment-item-list">
+        {% for shipment_item in shipment.items %}
+        {% set sale_item = shipment_item.sales_order_item %}
+        {% set image = product_image_url(sale_item.product) if sale_item.product else (('/sales-orders/item-images/' ~ sale_item.id) if sale_item.manual_image_relative_path else none) %}
+        <li class="shipment-item-list-row">
+          <div class="shipment-item-image-slot product-thumb-slot{% if not image %} image-load-failed{% endif %}">
+            {% if image %}<img class="product-thumb zoomable" data-zoom-src="{{ image }}" src="{{ image }}" alt="商品主图" loading="lazy" referrerpolicy="no-referrer" onerror="this.parentElement.classList.add('image-load-failed')"><span class="zoom-hint">+</span>{% endif %}
+            <div class="product-image-empty">无图</div>
+          </div>
+          <span>{{ sale_item.product_name_snapshot or '手工商品' }} × {{ shipment_item.quantity }}</span>
+        </li>
+        {% endfor %}
+      </ul>
+      <p class="muted so-detail-sub">收货：{{ shipment.recipient_name_snapshot }} {{ shipment.recipient_phone_snapshot or '' }} / {{ shipment.shipping_address_snapshot }}</p>
+
+      {% if shipment.status == 'pending' %}
+      <div class="form-grid shipment-tracking-form">
+        <form method="post" action="/sales-orders/{{ order.id }}/shipments/{{ shipment.id }}/tracking" class="full form-grid">
+          <label>物流公司<input name="carrier" value="{{ shipment.carrier or '' }}" maxlength="50"></label>
+          <label>运单号<input name="tracking_no" value="{{ shipment.tracking_no or '' }}" maxlength="100"></label>
+          <button type="submit" class="compact">保存物流信息</button>
+        </form>
+      </div>
+      <div class="shipping-label-grid">
+        {% for label in shipment.shipping_labels %}
+        <div class="shipping-label-card">
+          <a href="/sales-orders/shipping-labels/{{ label.id }}" target="_blank"><img class="shipping-label-thumb zoomable" data-zoom-src="/sales-orders/shipping-labels/{{ label.id }}" loading="lazy" src="/sales-orders/shipping-labels/{{ label.id }}" alt="发货面单"></a>
+          <div class="button-row">
+            <a class="button secondary compact" href="/sales-orders/shipping-labels/{{ label.id }}/download">下载</a>
+            <form method="post" action="/sales-orders/shipping-labels/{{ label.id }}/delete" onsubmit="return confirm('确认删除该面单图片？');"><button type="submit" class="secondary compact">删除</button></form>
+          </div>
+        </div>
+        {% endfor %}
+      </div>
+      <form method="post" action="/sales-orders/{{ order.id }}/shipments/{{ shipment.id }}/shipping-labels" enctype="multipart/form-data" class="shipping-label-upload-form shipment-label-form">
+        <label class="tag-photo-picker">拍照或从相册选择面单图片<input type="file" name="file" accept="image/*" class="shipment-label-input" hidden></label>
+        <div class="shipment-label-preview" hidden><img class="shipment-label-preview-image" alt="面单预览"></div>
+        <button type="submit" class="shipment-label-submit" disabled>上传面单</button>
+      </form>
+      <form method="post" action="/sales-orders/{{ order.id }}/shipments/{{ shipment.id }}/ship" onsubmit="return confirm('确认标记该发货单已发货？发货后地址和商品将无法再修改。');">
+        <button type="submit"{% if not shipment.shipping_labels %} disabled title="请先上传发货面单图片"{% endif %}>标记已发货</button>
+      </form>
+      {% else %}
+      <p class="muted">{{ shipment.carrier or '中通' }} {{ shipment.tracking_no or '（未填写运单号）' }} · 发货时间 {{ shipment.shipped_at|tokyo_datetime }}</p>
+      <div class="shipping-label-grid">
+        {% for label in shipment.shipping_labels %}
+        <div class="shipping-label-card">
+          <a href="/sales-orders/shipping-labels/{{ label.id }}" target="_blank"><img class="shipping-label-thumb zoomable" data-zoom-src="/sales-orders/shipping-labels/{{ label.id }}" loading="lazy" src="/sales-orders/shipping-labels/{{ label.id }}" alt="发货面单"></a>
+          <a class="button secondary compact" href="/sales-orders/shipping-labels/{{ label.id }}/download">下载</a>
+        </div>
+        {% endfor %}
+      </div>
+      <button type="button" class="secondary compact logistics-fixup-toggle">修改物流信息</button>
+      <div class="logistics-fixup-block" hidden>
+        <p class="muted">用于纠正录入错误：可修改物流公司/运单号、补传或替换面单图片。不会改变已发商品、数量或发货时间。</p>
+        <form method="post" action="/sales-orders/{{ order.id }}/shipments/{{ shipment.id }}/tracking" class="form-grid">
+          <label>物流公司<input name="carrier" value="{{ shipment.carrier or '' }}" maxlength="50"></label>
+          <label>运单号<input name="tracking_no" value="{{ shipment.tracking_no or '' }}" maxlength="100"></label>
+          <button type="submit" class="compact">保存物流信息</button>
+        </form>
+        <form method="post" action="/sales-orders/{{ order.id }}/shipments/{{ shipment.id }}/shipping-labels" enctype="multipart/form-data" class="shipping-label-upload-form shipment-label-form">
+          <label class="tag-photo-picker">拍照或从相册选择替换面单图片<input type="file" name="file" accept="image/*" class="shipment-label-input" hidden></label>
+          <div class="shipment-label-preview" hidden><img class="shipment-label-preview-image" alt="面单预览"></div>
+          <button type="submit" class="shipment-label-submit" disabled>上传面单</button>
+        </form>
+        {% for label in shipment.shipping_labels %}
+        <form method="post" action="/sales-orders/shipping-labels/{{ label.id }}/delete" onsubmit="return confirm('确认删除该面单图片？此操作仅用于纠正录入错误。');" class="logistics-fixup-delete-form"><span class="muted">删除面单（{{ label.created_at|tokyo_datetime }}）</span><button type="submit" class="secondary compact">删除</button></form>
+        {% endfor %}
+      </div>
+      {% endif %}
+    </div>
+    {% endfor %}
+  </div>
+</section>
+{% endif %}
+
+{% if order.shipping_labels|selectattr('shipment_id', 'equalto', none)|list %}
+<section class="card so-detail-card">
+  <h2>历史面单（旧订单）</h2>
+  <div class="shipping-label-grid">
+    {% for label in order.shipping_labels if not label.shipment_id %}
+    <div class="shipping-label-card">
+      <a href="/sales-orders/shipping-labels/{{ label.id }}" target="_blank"><img class="shipping-label-thumb zoomable" data-zoom-src="/sales-orders/shipping-labels/{{ label.id }}" loading="lazy" src="/sales-orders/shipping-labels/{{ label.id }}" alt="发货面单"></a>
+      <a class="button secondary compact" href="/sales-orders/shipping-labels/{{ label.id }}/download">下载</a>
+    </div>
+    {% endfor %}
+  </div>
+</section>
+{% endif %}
 
 <section class="card so-detail-card">
   <h2>操作</h2>
   <div class="button-row">
+    {% if item_editable %}
+    <a class="button secondary compact" href="/sales-orders/{{ order.id }}/edit">编辑订单</a>
+    {% endif %}
     {% if primary_next_action %}
     <form method="post" action="/sales-orders/{{ order.id }}/status"><input type="hidden" name="status" value="{{ primary_next_action[0] }}"><button type="submit">{{ primary_next_action[1] }}</button></form>
     {% endif %}
@@ -88,36 +215,8 @@
     <form method="post" action="/sales-orders/{{ order.id }}/status" onsubmit="return confirm('确认取消该订单？取消后订单仍会保留，可用于后续核对。');"><input type="hidden" name="status" value="cancelled"><button type="submit" class="secondary">取消订单</button></form>
     {% endif %}
   </div>
-  {% if not primary_next_action and order.status not in ('cancelled',) %}<p class="muted">当前状态已是流转终点，无需继续操作。</p>{% endif %}
+  {% if not primary_next_action and order.status in ('completed', 'cancelled') %}<p class="muted">当前状态已是流转终点，无需继续操作。</p>{% endif %}
 </section>
 </div>
-<script>
-(() => {
-  const form = document.getElementById('shippingLabelForm');
-  if (!form) return;
-  const input = document.getElementById('shippingLabelInput');
-  const submitButton = document.getElementById('shippingLabelSubmit');
-  const preview = document.getElementById('shippingLabelPreview');
-  const previewImage = document.getElementById('shippingLabelPreviewImage');
-  const fileName = document.getElementById('shippingLabelFileName');
-  input.addEventListener('change', () => {
-    if (!input.files.length) {
-      submitButton.disabled = true;
-      preview.hidden = true;
-      previewImage.removeAttribute('src');
-      return;
-    }
-    const file = input.files[0];
-    fileName.textContent = `已选择：${file.name}`;
-    previewImage.src = URL.createObjectURL(file);
-    preview.hidden = false;
-    submitButton.disabled = false;
-  });
-  form.addEventListener('submit', () => {
-    if (!input.files.length) return;
-    submitButton.disabled = true;
-    submitButton.textContent = '上传中…';
-  });
-})();
-</script>
+<script src="/static/sales_order_detail.js" defer></script>
 {% endblock %}

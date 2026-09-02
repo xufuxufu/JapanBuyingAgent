@@ -5,5 +5,57 @@
 {% if message %}<div class="success message">{{ message }}</div>{% endif %}
 <section class="card"><div class="summary-grid"><span><strong>{{ snapshot.total_rows }}</strong>明细行</span><span><strong>{{ snapshot.success_rows }}</strong>成功</span><span><strong>{{ snapshot.unmatched_rows }}</strong>未匹配</span><span><strong>{{ snapshot.exception_rows }}</strong>异常</span><span><strong>{{ snapshot.data_at|tokyo_datetime if snapshot.data_at else '未提供' }}</strong>数据时间</span><span><strong>{{ snapshot.imported_at|tokyo_datetime }}</strong>导入时间</span></div>{% if snapshot.error_summary %}<p class="warning">{{ snapshot.error_summary }}</p>{% endif %}</section>
 <section class="card table-wrap"><h2>仓库分布</h2><table><thead><tr><th>仓库</th><th>件数</th></tr></thead><tbody>{% for name,quantity in warehouse_distribution.items() %}<tr><td>{{ name }}</td><td>{{ quantity }}</td></tr>{% else %}<tr><td colspan="2">暂无仓库明细。</td></tr>{% endfor %}</tbody></table></section>
-<section class="card table-wrap"><h2>快照明细</h2><table><thead><tr><th>原始行</th><th>商品</th><th>货号/JAN</th><th>仓库</th><th>账面数量</th><th>匹配</th><th>本地商品</th><th>异常</th></tr></thead><tbody>{% for line in snapshot.lines %}<tr><td>{{ line.original_row_no }}</td><td>{{ line.raw_product_name or '—' }}</td><td>{{ line.qinsi_product_code or '—' }} / {{ line.jan or '—' }}</td><td>{{ line.warehouse.display_name if line.warehouse else (line.raw_warehouse_name or '—') }}</td><td>{{ line.quantity if line.quantity is not none else '—' }}</td><td>{{ match_status_labels.get(line.matching_status,line.matching_status) }}{% if line.matching_method %} · {{ match_method_labels.get(line.matching_method,line.matching_method) }}{% endif %}</td><td>{% if line.product %}<a href="/products/{{ line.product.id }}">{{ line.product.internal_sku }}</a>{% else %}—{% endif %}</td><td>{{ line.error_message or '—' }}</td></tr>{% else %}<tr><td colspan="8">无有效库存行。</td></tr>{% endfor %}</tbody></table></section>
+
+<section class="card">
+  <h2>快照明细</h2>
+  <form method="get" class="so-filter">
+    <div class="form-grid">
+      <label>匹配状态<select name="matching_status">
+        <option value="all"{% if filters.matching_status == 'all' %} selected{% endif %}>全部</option>
+        <option value="matched"{% if filters.matching_status == 'matched' %} selected{% endif %}>已匹配</option>
+        <option value="unmatched"{% if filters.matching_status == 'unmatched' %} selected{% endif %}>未匹配</option>
+        <option value="conflict"{% if filters.matching_status == 'conflict' %} selected{% endif %}>冲突</option>
+        <option value="ignored"{% if filters.matching_status == 'ignored' %} selected{% endif %}>已忽略/重复</option>
+      </select></label>
+      <label>仓库<select name="warehouse_id">
+        <option value="">全部</option>
+        {% for warehouse in warehouses %}<option value="{{ warehouse.id }}"{% if filters.warehouse_id == warehouse.id|string %} selected{% endif %}>{{ warehouse.display_name }}</option>{% endfor %}
+      </select></label>
+      <label>商品名<input type="search" name="name_query" value="{{ filters.name_query }}"></label>
+      <label>JAN<input type="search" name="jan_query" value="{{ filters.jan_query }}"></label>
+      <label>秦丝货号<input type="search" name="qinsi_code_query" value="{{ filters.qinsi_code_query }}"></label>
+    </div>
+    <input type="hidden" name="page" value="1">
+    <input type="hidden" name="page_size" value="{{ lines_page.page_size }}">
+    <button type="submit" class="compact">应用筛选</button>
+  </form>
+
+  {% set qs = {'matching_status': filters.matching_status, 'warehouse_id': filters.warehouse_id, 'name_query': filters.name_query, 'jan_query': filters.jan_query, 'qinsi_code_query': filters.qinsi_code_query} %}
+  {% set base_qs = qs|urlencode %}
+  <div class="pagination-bar">
+    <span class="pagination-summary">共 {{ lines_page.total_count }} 行 · 第 {{ lines_page.page }} / {{ lines_page.total_pages }} 页</span>
+    <div class="pagination-controls">
+      <a class="{{ 'disabled' if lines_page.page <= 1 }}" href="?{{ base_qs }}&page={{ lines_page.page - 1 }}&page_size={{ lines_page.page_size }}">‹ 上一页</a>
+      <span class="active">{{ lines_page.page }}</span>
+      <a class="{{ 'disabled' if lines_page.page >= lines_page.total_pages }}" href="?{{ base_qs }}&page={{ lines_page.page + 1 }}&page_size={{ lines_page.page_size }}">下一页 ›</a>
+    </div>
+    <form method="get" class="page-size-select">
+      {% for key, value in qs.items() %}<input type="hidden" name="{{ key }}" value="{{ value }}">{% endfor %}
+      <input type="hidden" name="page" value="1">
+      <label>每页<select name="page_size" onchange="this.form.submit()">
+        {% for size in page_sizes %}<option value="{{ size }}"{% if lines_page.page_size == size %} selected{% endif %}>{{ size }}</option>{% endfor %}
+      </select></label>
+    </form>
+  </div>
+
+  <div class="table-wrap"><table><thead><tr><th>原始行</th><th>商品</th><th>货号/JAN</th><th>仓库</th><th>账面数量</th><th>匹配</th><th>本地商品</th><th>异常</th></tr></thead><tbody>{% for line in lines_page.lines %}<tr><td>{{ line.original_row_no }}</td><td>{{ line.raw_product_name or '—' }}</td><td>{{ line.qinsi_product_code or '—' }} / {{ line.jan or '—' }}</td><td>{{ line.warehouse.display_name if line.warehouse else (line.raw_warehouse_name or '—') }}</td><td>{{ line.quantity if line.quantity is not none else '—' }}</td><td>{{ match_status_labels.get(line.matching_status,line.matching_status) }}{% if line.matching_method %} · {{ match_method_labels.get(line.matching_method,line.matching_method) }}{% endif %}</td><td>{% if line.product %}<a href="/products/{{ line.product.id }}">{{ line.product.internal_sku }}</a>{% elif line.matching_status == 'conflict' and conflict_candidates.get(line.id) %}{% set by_code, by_jan = conflict_candidates[line.id] %}货号→{% if by_code %}<a href="/products/{{ by_code.id }}">{{ by_code.internal_sku }}</a>{% else %}—{% endif %}；JAN→{% if by_jan %}<a href="/products/{{ by_jan.id }}">{{ by_jan.internal_sku }}</a>{% else %}—{% endif %}{% else %}—{% endif %}</td><td>{{ line.error_message or '—' }}</td></tr>{% else %}<tr><td colspan="8">没有符合筛选条件的库存行。</td></tr>{% endfor %}</tbody></table></div>
+
+  <div class="pagination-bar">
+    <span class="pagination-summary">共 {{ lines_page.total_count }} 行 · 第 {{ lines_page.page }} / {{ lines_page.total_pages }} 页</span>
+    <div class="pagination-controls">
+      <a class="{{ 'disabled' if lines_page.page <= 1 }}" href="?{{ base_qs }}&page={{ lines_page.page - 1 }}&page_size={{ lines_page.page_size }}">‹ 上一页</a>
+      <a class="{{ 'disabled' if lines_page.page >= lines_page.total_pages }}" href="?{{ base_qs }}&page={{ lines_page.page + 1 }}&page_size={{ lines_page.page_size }}">下一页 ›</a>
+    </div>
+  </div>
+</section>
 {% endblock %}

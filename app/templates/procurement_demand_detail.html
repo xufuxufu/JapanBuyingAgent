@@ -1,7 +1,16 @@
 {% extends "base.html" %}
 {% block title %}需求详情{% endblock %}
 {% block content %}
-<div class="section-head"><div><h1>{{ group.display_name }}</h1><p class="muted">{{ group.jan or 'JAN 未填写' }}</p></div><a class="button secondary" href="/procurement-demands">返回采购需求</a></div>
+{% set manual_demand = group.confirmed_demands|selectattr('manual_image_relative_path')|first %}
+{% set image = product_image_url(group.product) if group.product else (('/procurement-demands/item-images/' ~ manual_demand.id) if manual_demand else none) %}
+<div class="section-head">
+  <div class="product-thumb-slot pd-detail-thumb{% if not image %} image-load-failed{% endif %}">
+    {% if image %}<img class="product-thumb zoomable" data-zoom-src="{{ image }}" src="{{ image }}" alt="商品主图" loading="lazy" referrerpolicy="no-referrer" onerror="this.parentElement.classList.add('image-load-failed')"><span class="zoom-hint">+</span>{% endif %}
+    <div class="product-image-empty">无图</div>
+  </div>
+  <div><h1>{{ group.display_name }}</h1><p class="muted">{{ group.jan or 'JAN 未填写' }}</p></div>
+  <a class="button secondary" href="/procurement-demands">返回采购需求</a>
+</div>
 
 <section class="card">
   <p class="pd-confirmed">明确需求合计：<strong>{{ group.confirmed_quantity }}</strong>（默认计划采购数量：{{ inventory_context.default_planned_quantity }}）</p>

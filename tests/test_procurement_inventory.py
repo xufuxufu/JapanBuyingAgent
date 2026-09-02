@@ -54,6 +54,19 @@ def japan_warehouse(db) -> Location:
 
 
 def unclassified_warehouse(db) -> Location:
+    # A warehouse code genuinely absent from INVENTORY_REGION_BY_LOCATION_CODE.
+    # QW-NO-BARCODE ("无条码商品") used to be this fixture's example, but it is
+    # now a real, mapped China warehouse (see qinsi_inventory.py) -- do not
+    # use it here, or this test would silently stop testing "unclassified".
+    loc = db.query(Location).filter_by(internal_code="QW-TRULY-UNCLASSIFIED").first()
+    if loc is None:
+        loc = Location(internal_code="QW-TRULY-UNCLASSIFIED", display_name="未分类测试仓库", location_type="qinsi_warehouse", is_qinsi_warehouse=True)
+        db.add(loc)
+        db.flush()
+    return loc
+
+
+def no_barcode_warehouse(db) -> Location:
     loc = db.query(Location).filter_by(internal_code="QW-NO-BARCODE").first()
     if loc is None:
         loc = Location(internal_code="QW-NO-BARCODE", display_name="无条码商品", location_type="qinsi_warehouse", is_qinsi_warehouse=True)
@@ -179,6 +192,18 @@ def test_unclassified_warehouse_does_not_count_as_known(db_session):
     result = reference_inventory_for_products(db_session, [prod.id])[prod.id]
     assert result.china_known is False
     assert result.japan_known is False
+
+
+def test_no_barcode_warehouse_counts_as_china_reference_inventory(db_session):
+    # Regression: "无条码商品" is a real China warehouse despite its name and
+    # must not be silently excluded from the China reference total.
+    prod = product(db_session, "10")
+    no_barcode = no_barcode_warehouse(db_session)
+    snap = snapshot(db_session, data_at=utcnow())
+    line(db_session, snap, product_id=prod.id, warehouse_id=no_barcode.id, quantity=6)
+    result = reference_inventory_for_products(db_session, [prod.id])[prod.id]
+    assert result.china_known is True
+    assert result.china_quantity == 6
 
 
 def test_manual_product_without_product_id_is_unknown(db_session):

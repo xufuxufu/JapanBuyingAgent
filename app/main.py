@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import io
 import json
 import os
@@ -24,7 +25,7 @@ from sqlalchemy.orm import Session, selectinload
 
 from app.config import PREVIEW_DIR, PRODUCT_IMAGE_DIR, PROJECT_ROOT, QINSI_PRODUCT_IMAGE_DIR, TAG_EVIDENCE_DIR, default_role, ensure_data_directories, get_deepseek_config, is_testing
 from app.db import SessionLocal, engine, get_db
-from app.models import Customer, DurableBackgroundJob, DuplicateDetectionLog, EnrichmentAuditLog, FieldPurchaseItem, PlatformProviderState, Product, ProductAlias, ProductEnrichmentCandidate, ProductWatchConfig, ProductWatchSnapshot, PurchaseBatch, PurchaseBatchItem, QinsiExportJob, QinsiGoodsImportRow, QinsiImportBatch, QinsiPurchaseExportJob, Receipt, ReceiptBatch, ReceiptImage, ReceiptItem, RestockList, RestockListItem, SalesOrder, Salesperson, Store, StoreBrand, TagEvidence, ZipPackageItem, ZipPackageJob
+from app.models import Customer, CustomerAddress, DurableBackgroundJob, DuplicateDetectionLog, EnrichmentAuditLog, FieldPurchaseItem, PlatformProviderState, ProcurementDemand, ProcurementDemandPlan, Product, ProductAlias, ProductEnrichmentCandidate, ProductWatchConfig, ProductWatchSnapshot, PurchaseBatch, PurchaseBatchItem, QinsiExportJob, QinsiGoodsImportRow, QinsiImportBatch, QinsiPurchaseExportJob, Receipt, ReceiptBatch, ReceiptImage, ReceiptItem, RestockList, RestockListItem, SalesOrder, SalesOrderItem, Salesperson, Store, StoreBrand, TagEvidence, ZipPackageItem, ZipPackageJob
 from app.analytics_service import analytics_dashboard, procurement_data, resolve_date_range
 from app.product_matching import (
     bind_product,
@@ -54,8 +55,8 @@ from app.product_admin import (
 from app.price_service import build_lookup_view, query_prices, recent_price_lookup_histories, update_store_price
 from app.product_enrichment import (
     accept_task, bind_task_to_existing, enrichment_summary_for_receipt, ensure_existing_product_enrichment_task, get_task,
-    list_review_tasks, process_enrichment_task, process_price_lookup_enrichment, refresh_existing_product_main_image,
-    product_needs_jan_completion, safe_trigger_receipt_items, translate_candidate,
+    list_review_tasks, process_enrichment_task, process_price_lookup_enrichment, process_receipt_items_enrichment,
+    refresh_existing_product_main_image, product_needs_jan_completion, safe_trigger_receipt_items, translate_candidate,
 )
 from app.field_purchase import (
     assign_field_item_jan, bind_field_item_to_product, bulk_edit_field_items, complete_field_batch, confirm_field_item,
@@ -110,11 +111,14 @@ from app.qinsi_product_master_import import (
     resolve_qinsi_master_conflict,
 )
 from app.qinsi_inventory import (
-    INVENTORY_STATUS_LABELS, MATCH_METHOD_LABELS, MATCH_STATUS_LABELS,
-    available_qinsi_warehouses, create_inventory_snapshot, get_inventory_snapshot,
+    DEFAULT_SNAPSHOT_LINE_PAGE_SIZE, INVENTORY_STATUS_LABELS, MATCH_METHOD_LABELS, MATCH_STATUS_LABELS,
+    SNAPSHOT_LINE_PAGE_SIZES,
+    analyze_multi_file_completeness, available_qinsi_warehouses, create_inventory_snapshot,
+    create_inventory_snapshot_from_files, get_inventory_snapshot, get_inventory_snapshot_lines_page,
+    get_inventory_snapshot_summary, get_snapshot_warehouse_distribution,
     ignore_snapshot_lines, inventory_settings, latest_inventory_for_product, latest_inventory_for_products,
     latest_snapshot_statistics, list_inventory_snapshots, manual_match_line,
-    map_line_warehouse, purchase_assistance, retry_snapshot_matching,
+    map_line_warehouse, preview_inventory_snapshot_files, purchase_assistance, retry_snapshot_matching,
     update_product_low_stock_threshold, watched_inventory_status_distribution,
 )
 from app.schemas import LocationOutput, PriceLookupInput, ProductCreateInput, ProductOutput, ProductUpdateInput, PurchaseBatchOutput, PurchaseConfirmationInput, QinsiExportConfirmationInput, ReceiptDraftInput, ReceiptItemDraftInput, StoreBrandCreateInput, StoreCreateInput
@@ -127,15 +131,20 @@ from app.restock_service import (
     update_restock_list_status,
 )
 from app.sales_order_service import (
-    ALLOWED_TRANSITIONS, PRIMARY_NEXT_ACTION, SHIPPING_LABEL_DELETABLE_STATUSES,
-    SHIPPING_LABEL_UPLOADABLE_STATUSES, STATUS_LABELS as SALES_ORDER_STATUS_CN,
-    SalesOrderItemInput, add_shipping_label, create_customer, create_sales_order,
-    ensure_default_salesperson, get_sales_order, get_shipping_label, list_sales_orders,
-    list_salespersons, remove_shipping_label, search_customers,
+    ADDRESS_EDITABLE_STATUSES, ALLOWED_TRANSITIONS, ITEM_EDITABLE_STATUSES, ITEM_LOCKED_MESSAGE,
+    PRIMARY_NEXT_ACTION, SHIPPING_LABEL_DELETABLE_STATUSES, SHIPPING_LABEL_UPLOADABLE_STATUSES,
+    STATUS_LABELS as SALES_ORDER_STATUS_CN,
+    DuplicateAddressError, SalesOrderItemInput, add_customer_address, add_shipping_label,
+    create_customer, create_shipment,
+    create_sales_order, delete_customer_address, ensure_default_salesperson, get_sales_order,
+    get_shipping_label,
+    last_sale_price_for_product, list_customer_addresses, list_sales_orders,
+    list_salespersons, mark_shipment_shipped, remove_shipping_label, search_customers,
     search_products as search_sales_order_products,
-    status_counts as sales_order_status_counts, update_sales_order_status,
+    status_counts as sales_order_status_counts, update_customer_address, update_sales_order,
+    update_sales_order_address, update_sales_order_status, update_shipment_tracking,
 )
-from app.sales_order_shipping import resolve_shipping_label_path
+from app.sales_order_shipping import resolve_shipping_label_path, resolve_sales_order_item_image_path
 from app.procurement_service import (
     CONFIDENCE_LABELS, DEMAND_TYPE_LABELS, EXECUTION_STATUS_LABELS, FRESHNESS_LABELS, SOURCE_TYPE_LABELS,
     STATUS_LABELS as PROCUREMENT_STATUS_LABELS, UNASSIGNED_STORE_GROUP_NAME,
@@ -146,7 +155,15 @@ from app.procurement_service import (
     create_channel_shortage_demand, create_investigation_demand, create_plans, default_planned_quantity_for_group,
     find_execution_candidates_for_receipt_items, get_group, group_plans_by_selected_store,
     list_investigation_demands, list_plans, list_plans_for_store_purchase,
-    record_purchase_executions_bulk, set_plan_selected_store, set_plans_selected_store_bulk,
+    in_transit_quantity_for_products, record_purchase_executions_bulk, reference_inventory_for_products,
+    set_plan_selected_store, set_plans_selected_store_bulk, update_demand_plan,
+)
+from app.procurement_image import resolve_procurement_demand_image_path
+from app.image_search import (
+    ImageSearchError, IndexCorruptError, IndexNotReadyError, ModelNotReadyError,
+    TOP_K_DEFAULT, TOP_K_MAX,
+    index_files_exist, is_build_in_progress, read_index_meta,
+    run_index_build_job, search_similar_products, try_reserve_build_slot, validate_query_image,
 )
 from app.provider_config import diagnostic_summary, provider_status_rows, test_provider_connection
 from app.rakuten_ip_monitor import rakuten_public_ip_status
@@ -261,6 +278,15 @@ def _nav_can(section: str) -> bool:
 
 
 templates.env.globals["nav_can"] = _nav_can
+
+HOME_QUICK_ENTRIES = (
+    {"href": "/price-check", "icon": "▦", "label": "扫码查价"},
+    {"href": "/sales-orders", "icon": "訂", "label": "微信订单"},
+    {"href": "/procurement-demands/report-shortage", "icon": "補", "label": "补货需求"},
+    {"href": "/procurement-demands", "icon": "購", "label": "采购"},
+)
+
+templates.env.globals["HOME_QUICK_ENTRIES"] = HOME_QUICK_ENTRIES
 
 
 def _translation_user_message(status: str, error: str | None = None) -> str:
@@ -1222,13 +1248,22 @@ def gpt_job_recognition_preview(job_id: int, request: Request, payload: str = Fo
 
 
 @app.post("/gpt-jobs/{job_id}/recognition-json")
-def gpt_job_recognition_import(job_id: int, payload: str = Form(...), db: Session = Depends(get_db)):
+def gpt_job_recognition_import(job_id: int, background_tasks: BackgroundTasks, payload: str = Form(...), db: Session = Depends(get_db)):
     job = load_gpt_job(db, job_id)
     try:
-        import_gpt_job_json(db, job, payload)
+        created = import_gpt_job_json(db, job, payload)
     except ValueError as exc:
         raise HTTPException(422, str(exc)) from exc
-    return RedirectResponse(f"/gpt-jobs/{job.id}", status_code=303)
+    # The import itself is already fully committed above -- receipts and
+    # receipt_items exist durably regardless of what happens next. Product
+    # enrichment (Yahoo/Rakuten/image/DeepSeek) runs as a background task on
+    # its own engine/session so a receipt with dozens of new JANs doesn't
+    # hold this request open for minutes; see process_receipt_items_enrichment.
+    item_ids = [item.id for receipt in created for item in receipt.items]
+    if item_ids:
+        database_url = db.get_bind().url.render_as_string(hide_password=False)
+        background_tasks.add_task(process_receipt_items_enrichment, database_url, item_ids, "gpt_receipt_json")
+    return RedirectResponse(f"/gpt-jobs/{job.id}?imported=1", status_code=303)
 
 
 @app.get("/receipts/recognition-images.zip")
@@ -1332,12 +1367,18 @@ def recognition_preview(batch_id: int, request: Request, payload: str = Form(...
 
 
 @app.post("/receipts/{batch_id}/recognition-json")
-def recognition_page_post(batch_id: int, payload: str = Form(...), db: Session = Depends(get_db)):
+def recognition_page_post(batch_id: int, background_tasks: BackgroundTasks, payload: str = Form(...), db: Session = Depends(get_db)):
     batch = load_batch(db, batch_id)
     try:
-        import_recognition_json(db, batch, payload)
+        receipt = import_recognition_json(db, batch, payload)
     except ValueError as exc:
         raise HTTPException(422, str(exc)) from exc
+    # Import is already fully committed above; enrichment runs in the
+    # background on its own engine/session -- see process_receipt_items_enrichment.
+    item_ids = [item.id for item in receipt.items]
+    if item_ids:
+        database_url = db.get_bind().url.render_as_string(hide_password=False)
+        background_tasks.add_task(process_receipt_items_enrichment, database_url, item_ids, "gpt_receipt_json")
     return RedirectResponse(f"/receipts/{batch_id}/review", status_code=303)
 
 
@@ -2120,6 +2161,9 @@ def products_page(
         "missing_chinese_name_count": count_missing_chinese_name_products(db),
         "product_display_label": product_display_label,
         "is_missing_chinese_name": is_missing_chinese_name,
+        "image_search_index_meta": read_index_meta(),
+        "image_search_index_exists": index_files_exist(),
+        "image_search_build_in_progress": is_build_in_progress(),
     })
 
 
@@ -3023,20 +3067,35 @@ def restock_list_item_link_purchase(item_id: int, purchase_batch_item_id: int = 
     return RedirectResponse(f"/restock-lists/{list_id}#restock-item-{item_id}", status_code=303)
 
 
-def _product_search_payload(product: Product) -> dict:
+def _product_search_payload(
+    product: Product, *, inventory_by_id: dict[int, object] | None = None, last_price: Decimal | None = None,
+) -> dict:
+    inventory = (inventory_by_id or {}).get(product.id)
     return {
         "id": product.id,
         "display_name": product.display_name or product.name_cn or product.name_ja or product.internal_sku,
         "jan": product.jan,
         "internal_sku": product.internal_sku,
-        "sale_price": str(product.sale_price) if product.sale_price is not None else None,
+        "qinsi_product_code": product.qinsi_product_code,
+        "image_url": preferred_product_image_url(product),
+        "china_quantity": inventory.china_quantity if inventory else None,
+        "japan_quantity": inventory.japan_quantity if inventory else None,
+        "last_sale_price": str(last_price) if last_price is not None else None,
     }
 
 
-def _customer_search_payload(customer: Customer) -> dict:
+def _customer_address_payload(address: CustomerAddress) -> dict:
+    return {
+        "id": address.id, "recipient_name": address.recipient_name, "phone": address.phone,
+        "address": address.address, "label": address.label, "is_default": address.is_default,
+    }
+
+
+def _customer_search_payload(customer: Customer, *, addresses: list[CustomerAddress] | None = None) -> dict:
     return {
         "id": customer.id, "name": customer.name, "phone": customer.phone,
-        "wechat_name": customer.wechat_name, "address": customer.address, "note": customer.note,
+        "wechat_name": customer.wechat_name, "note": customer.note,
+        "addresses": [_customer_address_payload(address) for address in (addresses if addresses is not None else customer.addresses)],
     }
 
 
@@ -3045,13 +3104,147 @@ class CustomerCreateInput(BaseModel):
     name: str = Field(min_length=1, max_length=255)
     phone: str | None = None
     wechat_name: str | None = None
-    address: str | None = None
     note: str | None = None
+    recipient_name: str | None = None
+    recipient_phone: str | None = None
+    address: str | None = None
+    address_label: str | None = None
+
+
+class CustomerAddressCreateInput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    recipient_name: str = Field(min_length=1, max_length=255)
+    phone: str | None = None
+    address: str = Field(min_length=1)
+    label: str | None = None
+    is_default: bool = False
+    allow_duplicate: bool = False
+
+
+class CustomerAddressUpdateInput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    recipient_name: str = Field(min_length=1, max_length=255)
+    phone: str | None = None
+    address: str = Field(min_length=1)
+    label: str | None = None
+    is_default: bool = False
 
 
 @app.get("/api/products/search")
 def api_sales_order_product_search(q: str = Query(""), db: Session = Depends(get_db)):
-    return [_product_search_payload(product) for product in search_sales_order_products(db, q, limit=20)]
+    products = search_sales_order_products(db, q, limit=20)
+    inventory_by_id = reference_inventory_for_products(db, [product.id for product in products])
+    return [
+        _product_search_payload(
+            product, inventory_by_id=inventory_by_id, last_price=last_sale_price_for_product(db, product.id),
+        )
+        for product in products
+    ]
+
+
+def _procurement_product_search_payload(
+    product: Product, *, inventory_by_id: dict[int, object], in_transit_by_id: dict[int, int],
+) -> dict:
+    inventory = inventory_by_id.get(product.id)
+    return {
+        "id": product.id,
+        "display_name": product.display_name or product.name_cn or product.name_ja or product.internal_sku,
+        "jan": product.jan,
+        "qinsi_product_code": product.qinsi_product_code,
+        "image_url": preferred_product_image_url(product),
+        "china_quantity": inventory.china_quantity if inventory else None,
+        "japan_quantity": inventory.japan_quantity if inventory else None,
+        "in_transit_quantity": in_transit_by_id.get(product.id, 0),
+        # No official 30-day-sales or reorder-quantity data source exists yet
+        # (audited this round) -- deliberately NOT sent as fabricated numbers;
+        # the page shows a static "--" for these two instead of a fake field.
+    }
+
+
+@app.get("/api/procurement/products/search")
+def api_procurement_product_search(q: str = Query(""), db: Session = Depends(get_db)):
+    """Separate from /api/products/search (used by the WeChat sales-order page,
+    currently under active phone review) so this round's changes can never
+    alter that endpoint's behavior or payload shape."""
+    products = search_sales_order_products(db, q, limit=20)
+    product_ids = [product.id for product in products]
+    inventory_by_id = reference_inventory_for_products(db, product_ids)
+    in_transit_by_id = in_transit_quantity_for_products(db, product_ids)
+    return [
+        _procurement_product_search_payload(product, inventory_by_id=inventory_by_id, in_transit_by_id=in_transit_by_id)
+        for product in products
+    ]
+
+
+def _image_search_result_payload(
+    product: Product, *, similarity: float, inventory_by_id: dict[int, object],
+) -> dict:
+    inventory = inventory_by_id.get(product.id)
+    return {
+        "product_id": product.id,
+        "name": product.display_name or product.name_cn or product.name_ja or product.internal_sku,
+        "jan": product.jan,
+        "qinsi_product_code": product.qinsi_product_code,
+        "image_url": preferred_product_image_url(product),
+        "china_quantity": inventory.china_quantity if inventory else None,
+        "china_known": bool(inventory.china_known) if inventory else False,
+        "japan_quantity": inventory.japan_quantity if inventory else None,
+        "japan_known": bool(inventory.japan_known) if inventory else False,
+        # Deliberately "相似度", never "置信度"/"准确率" -- this ranks candidates,
+        # it does not claim to recognize the product.
+        "similarity_score": similarity,
+    }
+
+
+@app.post("/api/products/image-search")
+async def api_products_image_search(
+    image: UploadFile = File(...), top_k: int = Form(TOP_K_DEFAULT), db: Session = Depends(get_db),
+):
+    top_k = max(1, min(top_k, TOP_K_MAX))
+    content = await image.read()
+    try:
+        pil_image = validate_query_image(content)
+    except ImageSearchError as exc:
+        return {"status": "error", "message": str(exc), "query": {"top_k": top_k}, "results": []}
+    try:
+        hits = search_similar_products(pil_image, top_k=top_k)
+    except IndexNotReadyError as exc:
+        return {"status": "no_index", "message": str(exc), "query": {"top_k": top_k}, "results": []}
+    except (ModelNotReadyError, IndexCorruptError) as exc:
+        logger.exception("image_search 查询失败: %s", exc)
+        return {"status": "error", "message": "图片搜索暂时不可用，请稍后重试或联系管理员。", "query": {"top_k": top_k}, "results": []}
+    except Exception:
+        logger.exception("image_search 查询发生未预期错误")
+        return {"status": "error", "message": "图片搜索暂时不可用，请稍后重试。", "query": {"top_k": top_k}, "results": []}
+
+    product_ids = [hit.product_id for hit in hits]
+    products_by_id = {p.id: p for p in db.scalars(select(Product).where(Product.id.in_(product_ids)))} if product_ids else {}
+    inventory_by_id = reference_inventory_for_products(db, product_ids)
+    results = []
+    for hit in hits:
+        product = products_by_id.get(hit.product_id)
+        if product is None:
+            continue
+        results.append(_image_search_result_payload(product, similarity=hit.similarity, inventory_by_id=inventory_by_id))
+    return {"status": "ok", "query": {"top_k": top_k}, "results": results}
+
+
+@app.get("/api/products/image-search/index-status")
+def api_image_search_index_status():
+    meta = read_index_meta()
+    return {
+        "exists": index_files_exist(),
+        "building": is_build_in_progress(),
+        "meta": meta,
+    }
+
+
+@app.post("/api/products/image-search/rebuild-index", status_code=202)
+def api_image_search_rebuild_index(background_tasks: BackgroundTasks, db: Session = Depends(get_db)):
+    if not try_reserve_build_slot():
+        return {"status": "already_running", "message": "图片索引正在构建，请稍后。"}
+    background_tasks.add_task(run_index_build_job, db.get_bind())
+    return {"status": "started", "message": "图片搜索索引开始重建，完成后自动生效。"}
 
 
 @app.get("/api/customers/search")
@@ -3063,8 +3256,9 @@ def api_customer_search(q: str = Query(""), db: Session = Depends(get_db)):
 def api_create_customer(data: CustomerCreateInput, db: Session = Depends(get_db)):
     try:
         customer = create_customer(
-            db, name=data.name, phone=data.phone, wechat_name=data.wechat_name,
-            address=data.address, note=data.note,
+            db, name=data.name, phone=data.phone, wechat_name=data.wechat_name, note=data.note,
+            recipient_name=data.recipient_name, recipient_phone=data.recipient_phone,
+            address=data.address, address_label=data.address_label,
         )
     except ValueError as exc:
         db.rollback()
@@ -3072,21 +3266,96 @@ def api_create_customer(data: CustomerCreateInput, db: Session = Depends(get_db)
     return _customer_search_payload(customer)
 
 
-SALES_ORDER_TAB_STATUSES = ("submitted", "ready_to_ship", "shipped", "completed", "cancelled")
+@app.get("/api/customers/{customer_id}/addresses")
+def api_customer_addresses(customer_id: int, db: Session = Depends(get_db)):
+    return [_customer_address_payload(address) for address in list_customer_addresses(db, customer_id)]
+
+
+@app.post("/api/customers/{customer_id}/addresses", status_code=201)
+def api_create_customer_address(customer_id: int, data: CustomerAddressCreateInput, db: Session = Depends(get_db)):
+    try:
+        address = add_customer_address(
+            db, customer_id, recipient_name=data.recipient_name, phone=data.phone,
+            address=data.address, label=data.label, is_default=data.is_default,
+            allow_duplicate=data.allow_duplicate,
+        )
+    except DuplicateAddressError as exc:
+        db.rollback()
+        raise HTTPException(409, {"message": str(exc), "existing": _customer_address_payload(exc.existing)}) from exc
+    except LookupError as exc:
+        db.rollback()
+        raise HTTPException(404, str(exc)) from exc
+    except ValueError as exc:
+        db.rollback()
+        raise HTTPException(422, str(exc)) from exc
+    return _customer_address_payload(address)
+
+
+@app.post("/api/customer-addresses/{address_id}")
+def api_update_customer_address(address_id: int, data: CustomerAddressUpdateInput, db: Session = Depends(get_db)):
+    try:
+        address = update_customer_address(
+            db, address_id, recipient_name=data.recipient_name, phone=data.phone,
+            address=data.address, label=data.label, is_default=data.is_default,
+        )
+    except LookupError as exc:
+        db.rollback()
+        raise HTTPException(404, str(exc)) from exc
+    except ValueError as exc:
+        db.rollback()
+        raise HTTPException(422, str(exc)) from exc
+    return _customer_address_payload(address)
+
+
+@app.post("/api/customer-addresses/{address_id}/delete")
+def api_delete_customer_address(address_id: int, db: Session = Depends(get_db)):
+    try:
+        delete_customer_address(db, address_id)
+    except LookupError as exc:
+        db.rollback()
+        raise HTTPException(404, str(exc)) from exc
+    return {"ok": True}
+
+
+@app.get("/customers", response_class=HTMLResponse)
+def customers_page(request: Request, q: str = Query(""), db: Session = Depends(get_db)):
+    rows = search_customers(db, q, limit=200) if q else list(db.scalars(
+        select(Customer).order_by(Customer.updated_at.desc(), Customer.id.desc()).limit(200)
+    ))
+    return templates.TemplateResponse(request, "customers.html", {"rows": rows, "q": q})
+
+
+@app.get("/customers/{customer_id}", response_class=HTMLResponse)
+def customer_detail_page(customer_id: int, request: Request, db: Session = Depends(get_db)):
+    customer = db.get(Customer, customer_id)
+    if customer is None:
+        raise HTTPException(404, "客户不存在")
+    addresses = list_customer_addresses(db, customer_id)
+    return templates.TemplateResponse(request, "customer_detail.html", {"customer": customer, "addresses": addresses})
+
+
+SALES_ORDER_TAB_STATUSES = ("submitted", "paid", "partially_shipped", "shipped", "completed", "cancelled")
 
 
 @app.get("/sales-orders", response_class=HTMLResponse)
 def sales_orders_page(
     request: Request, status: str = Query(""), q: str = Query(""),
-    date_from: str = Query(""), date_to: str = Query(""), db: Session = Depends(get_db),
+    date_from: str = Query(""), date_to: str = Query(""),
+    shipped_date_from: str = Query(""), shipped_date_to: str = Query(""), db: Session = Depends(get_db),
 ):
     parsed_from = date.fromisoformat(date_from) if date_from else None
     parsed_to = date.fromisoformat(date_to) if date_to else None
-    rows = list_sales_orders(db, status=status or None, q=q or None, date_from=parsed_from, date_to=parsed_to)
+    parsed_shipped_from = date.fromisoformat(shipped_date_from) if shipped_date_from else None
+    parsed_shipped_to = date.fromisoformat(shipped_date_to) if shipped_date_to else None
+    rows = list_sales_orders(
+        db, status=status or None, q=q or None, date_from=parsed_from, date_to=parsed_to,
+        shipped_date_from=parsed_shipped_from, shipped_date_to=parsed_shipped_to,
+    )
     counts = sales_order_status_counts(db)
     tabs = [(value, SALES_ORDER_STATUS_CN[value], counts.get(value, 0)) for value in SALES_ORDER_TAB_STATUSES]
     return templates.TemplateResponse(request, "sales_orders.html", {
         "rows": rows, "status": status, "q": q, "date_from": date_from, "date_to": date_to,
+        "shipped_date_from": shipped_date_from, "shipped_date_to": shipped_date_to,
         "status_labels": SALES_ORDER_STATUS_CN, "tabs": tabs, "total_count": sum(counts.values()),
         "primary_next_action": PRIMARY_NEXT_ACTION,
     })
@@ -3098,8 +3367,44 @@ def sales_order_new_page(request: Request, db: Session = Depends(get_db)):
     salespersons = list_salespersons(db)
     return templates.TemplateResponse(request, "sales_order_new.html", {
         "default_salesperson": default_salesperson, "salespersons": salespersons,
-        "error": request.query_params.get("error"),
+        "error": request.query_params.get("error"), "order": None,
     })
+
+
+async def _parse_order_items_from_form(form) -> list[SalesOrderItemInput]:
+    raw_items = json.loads(form.get("items_json") or "[]")
+    if not isinstance(raw_items, list):
+        raise ValueError("商品数据格式错误")
+    items: list[SalesOrderItemInput] = []
+    for raw in raw_items:
+        try:
+            quantity = int(raw.get("quantity"))
+            unit_sale_price = Decimal(str(raw.get("unit_sale_price")))
+        except (TypeError, ValueError, ArithmeticError) as exc:
+            raise ValueError("数量或微信售价格式错误") from exc
+        product_id_raw = raw.get("product_id")
+        manual_image_content = None
+        manual_image_filename = None
+        client_id = raw.get("client_id")
+        upload = form.get(f"item_image_{client_id}") if client_id else None
+        # Duck-typed, not isinstance(upload, UploadFile): Starlette's own
+        # request.form() returns starlette.datastructures.UploadFile, which is
+        # a DIFFERENT class from fastapi.UploadFile in this FastAPI version --
+        # isinstance() here always evaluated False, silently discarding every
+        # photo submitted through the real upload form (never caught because
+        # existing tests called the service function directly instead of
+        # posting a real multipart file). A plain string form field has no
+        # .filename attribute, so this check is unambiguous either way.
+        if upload is not None and getattr(upload, "filename", None):
+            manual_image_content = await upload.read()
+            manual_image_filename = upload.filename
+        items.append(SalesOrderItemInput(
+            product_id=int(product_id_raw) if product_id_raw not in (None, "", 0) else None,
+            manual_name=raw.get("manual_name"), jan=raw.get("jan"),
+            quantity=quantity, unit_sale_price=unit_sale_price, note=raw.get("note"),
+            manual_image_content=manual_image_content, manual_image_filename=manual_image_filename,
+        ))
+    return items
 
 
 @app.post("/sales-orders")
@@ -3108,35 +3413,63 @@ async def sales_order_create(request: Request, db: Session = Depends(get_db)):
     customer_id = str(form.get("customer_id") or "")
     salesperson_id = str(form.get("salesperson_id") or "")
     note = str(form.get("note") or "")
+    customer_address_id_raw = str(form.get("customer_address_id") or "")
     try:
         if not customer_id.isdigit() or not salesperson_id.isdigit():
             raise ValueError("请先选择客户")
-        raw_items = json.loads(form.get("items_json") or "[]")
-        if not isinstance(raw_items, list):
-            raise ValueError("商品数据格式错误")
-        items: list[SalesOrderItemInput] = []
-        for raw in raw_items:
-            try:
-                quantity = int(raw.get("quantity"))
-                unit_sale_price = Decimal(str(raw.get("unit_sale_price")))
-            except (TypeError, ValueError, ArithmeticError) as exc:
-                raise ValueError("数量或单价格式错误") from exc
-            product_id_raw = raw.get("product_id")
-            items.append(SalesOrderItemInput(
-                product_id=int(product_id_raw) if product_id_raw not in (None, "", 0) else None,
-                manual_name=raw.get("manual_name"), jan=raw.get("jan"),
-                quantity=quantity, unit_sale_price=unit_sale_price, note=raw.get("note"),
-            ))
+        items = await _parse_order_items_from_form(form)
         order = create_sales_order(
             db, customer_id=int(customer_id), salesperson_id=int(salesperson_id), items=items, note=note,
             recipient_name=str(form.get("recipient_name") or ""),
             recipient_phone=str(form.get("recipient_phone") or ""),
             shipping_address=str(form.get("shipping_address") or ""),
+            customer_address_id=int(customer_address_id_raw) if customer_address_id_raw.isdigit() else None,
         )
     except (LookupError, ValueError) as exc:
         db.rollback()
         return RedirectResponse(f"/sales-orders/new?error={quote(str(exc))}", status_code=303)
     return RedirectResponse(f"/sales-orders/{order.id}", status_code=303)
+
+
+@app.get("/sales-orders/{order_id}/edit", response_class=HTMLResponse)
+def sales_order_edit_page(order_id: int, request: Request, db: Session = Depends(get_db)):
+    order = get_sales_order(db, order_id)
+    if order is None:
+        raise HTTPException(404, "订单不存在")
+    if order.status not in ITEM_EDITABLE_STATUSES:
+        return RedirectResponse(f"/sales-orders/{order_id}?error={quote(ITEM_LOCKED_MESSAGE)}", status_code=303)
+    default_salesperson = ensure_default_salesperson(db)
+    salespersons = list_salespersons(db)
+    return templates.TemplateResponse(request, "sales_order_new.html", {
+        "default_salesperson": default_salesperson, "salespersons": salespersons,
+        "error": request.query_params.get("error"), "order": order,
+    })
+
+
+@app.post("/sales-orders/{order_id}/edit")
+async def sales_order_update(order_id: int, request: Request, db: Session = Depends(get_db)):
+    form = await request.form()
+    customer_id = str(form.get("customer_id") or "")
+    customer_address_id_raw = str(form.get("customer_address_id") or "")
+    try:
+        if not customer_id.isdigit():
+            raise ValueError("请先选择客户")
+        items = await _parse_order_items_from_form(form)
+        update_sales_order(
+            db, order_id, customer_id=int(customer_id), items=items,
+            note=str(form.get("note") or ""),
+            recipient_name=str(form.get("recipient_name") or ""),
+            recipient_phone=str(form.get("recipient_phone") or ""),
+            shipping_address=str(form.get("shipping_address") or ""),
+            customer_address_id=int(customer_address_id_raw) if customer_address_id_raw.isdigit() else None,
+        )
+    except LookupError as exc:
+        db.rollback()
+        raise HTTPException(404, str(exc)) from exc
+    except ValueError as exc:
+        db.rollback()
+        return RedirectResponse(f"/sales-orders/{order_id}/edit?error={quote(str(exc))}", status_code=303)
+    return RedirectResponse(f"/sales-orders/{order_id}", status_code=303)
 
 
 @app.get("/sales-orders/{order_id}", response_class=HTMLResponse)
@@ -3148,8 +3481,13 @@ def sales_order_detail_page(order_id: int, request: Request, db: Session = Depen
         "order": order, "status_labels": SALES_ORDER_STATUS_CN,
         "allowed_transitions": ALLOWED_TRANSITIONS.get(order.status, set()),
         "primary_next_action": PRIMARY_NEXT_ACTION.get(order.status),
-        "can_upload_shipping_label": order.status in SHIPPING_LABEL_UPLOADABLE_STATUSES,
-        "can_delete_shipping_label": order.status in SHIPPING_LABEL_DELETABLE_STATUSES,
+        "item_editable": order.status in ITEM_EDITABLE_STATUSES,
+        "item_locked_message": ITEM_LOCKED_MESSAGE,
+        "address_editable": order.status in ADDRESS_EDITABLE_STATUSES,
+        "can_create_shipment": order.status in {"paid", "partially_shipped"},
+        "shipping_label_uploadable_statuses": SHIPPING_LABEL_UPLOADABLE_STATUSES,
+        "shipping_label_deletable_statuses": SHIPPING_LABEL_DELETABLE_STATUSES,
+        "customer_addresses": list_customer_addresses(db, order.customer_id),
         "error": request.query_params.get("error"),
     })
 
@@ -3167,11 +3505,88 @@ def sales_order_status_update(order_id: int, status: str = Form(...), db: Sessio
     return RedirectResponse(f"/sales-orders/{order_id}", status_code=303)
 
 
-@app.post("/sales-orders/{order_id}/shipping-labels")
-async def sales_order_shipping_label_upload(order_id: int, file: UploadFile = File(...), db: Session = Depends(get_db)):
+@app.post("/sales-orders/{order_id}/address")
+def sales_order_address_update(
+    order_id: int, recipient_name: str = Form(...), recipient_phone: str = Form(""),
+    shipping_address: str = Form(...), db: Session = Depends(get_db),
+):
+    try:
+        update_sales_order_address(
+            db, order_id, recipient_name=recipient_name, recipient_phone=recipient_phone,
+            shipping_address=shipping_address,
+        )
+    except LookupError as exc:
+        db.rollback()
+        raise HTTPException(404, str(exc)) from exc
+    except ValueError as exc:
+        db.rollback()
+        return RedirectResponse(f"/sales-orders/{order_id}?error={quote(str(exc))}", status_code=303)
+    return RedirectResponse(f"/sales-orders/{order_id}", status_code=303)
+
+
+@app.post("/sales-orders/{order_id}/shipments")
+async def sales_order_shipment_create(order_id: int, request: Request, db: Session = Depends(get_db)):
+    form = await request.form()
+    try:
+        raw_items = json.loads(form.get("items_json") or "[]")
+        if not isinstance(raw_items, list) or not raw_items:
+            raise ValueError("请至少选择一个商品")
+        item_quantities: list[tuple[int, int]] = []
+        for raw in raw_items:
+            try:
+                item_quantities.append((int(raw.get("order_item_id")), int(raw.get("quantity"))))
+            except (TypeError, ValueError) as exc:
+                raise ValueError("发货数量格式错误") from exc
+        create_shipment(
+            db, order_id, item_quantities=item_quantities,
+            recipient_name=str(form.get("recipient_name") or ""),
+            recipient_phone=str(form.get("recipient_phone") or ""),
+            shipping_address=str(form.get("shipping_address") or ""),
+            carrier=str(form.get("carrier") or "中通"),
+            tracking_no=str(form.get("tracking_no") or ""),
+        )
+    except (LookupError, ValueError) as exc:
+        db.rollback()
+        return RedirectResponse(f"/sales-orders/{order_id}?error={quote(str(exc))}", status_code=303)
+    return RedirectResponse(f"/sales-orders/{order_id}", status_code=303)
+
+
+@app.post("/sales-orders/{order_id}/shipments/{shipment_id}/tracking")
+def sales_order_shipment_tracking_update(
+    order_id: int, shipment_id: int, carrier: str = Form(""), tracking_no: str = Form(""),
+    db: Session = Depends(get_db),
+):
+    try:
+        update_shipment_tracking(db, shipment_id, carrier=carrier, tracking_no=tracking_no)
+    except LookupError as exc:
+        db.rollback()
+        raise HTTPException(404, str(exc)) from exc
+    return RedirectResponse(f"/sales-orders/{order_id}", status_code=303)
+
+
+@app.post("/sales-orders/{order_id}/shipments/{shipment_id}/ship")
+def sales_order_shipment_mark_shipped(
+    order_id: int, shipment_id: int, carrier: str = Form(""), tracking_no: str = Form(""),
+    db: Session = Depends(get_db),
+):
+    try:
+        mark_shipment_shipped(db, shipment_id, carrier=carrier or None, tracking_no=tracking_no or None)
+    except LookupError as exc:
+        db.rollback()
+        raise HTTPException(404, str(exc)) from exc
+    except ValueError as exc:
+        db.rollback()
+        return RedirectResponse(f"/sales-orders/{order_id}?error={quote(str(exc))}", status_code=303)
+    return RedirectResponse(f"/sales-orders/{order_id}", status_code=303)
+
+
+@app.post("/sales-orders/{order_id}/shipments/{shipment_id}/shipping-labels")
+async def sales_order_shipment_shipping_label_upload(
+    order_id: int, shipment_id: int, file: UploadFile = File(...), db: Session = Depends(get_db),
+):
     content = await file.read()
     try:
-        add_shipping_label(db, order_id, content=content, original_filename=file.filename)
+        add_shipping_label(db, shipment_id, content=content, original_filename=file.filename)
     except LookupError as exc:
         db.rollback()
         raise HTTPException(404, str(exc)) from exc
@@ -3219,10 +3634,40 @@ def sales_order_shipping_label_delete(label_id: int, db: Session = Depends(get_d
     return RedirectResponse(f"/sales-orders/{order_id}", status_code=303)
 
 
-PROCUREMENT_DEMAND_VIEWS = ("open", "investigation", "planned", "all")
+@app.get("/sales-orders/item-images/{item_id}")
+def sales_order_item_image_view(item_id: int, db: Session = Depends(get_db)):
+    item = db.get(SalesOrderItem, item_id)
+    if item is None or not item.manual_image_relative_path:
+        raise HTTPException(404, "商品图片不存在")
+    path = resolve_sales_order_item_image_path(item.manual_image_relative_path)
+    if path is None:
+        raise HTTPException(404, "商品图片文件不存在")
+    return FileResponse(path, media_type=item.manual_image_content_type or "application/octet-stream")
+
+
+PROCUREMENT_DEMAND_VIEWS = ("open", "investigation", "planned", "purchased", "all")
 
 
 PROCUREMENT_PLAN_GROUP_BY = ("product", "store")
+
+# Business-facing tab bar (Phase 8): these are navigation views over the
+# existing demand/plan/execution status machines, not new DB states. Mapping:
+#   待采购    -> view=open          (confirmed demands not yet turned into a plan)
+#   找货需求  -> view=investigation (调查看货 demands)
+#   待采购商品 -> view=planned&group_by=product, filtered to remaining_quantity>0
+#   分拣      -> view=planned&group_by=store,   filtered to remaining_quantity>0
+#   采购      -> links out to /procurement-demands/purchase (unchanged page)
+#   已采购    -> view=purchased      (planned-status plans with purchased_quantity>0)
+#   全部      -> view=all
+PROCUREMENT_DEMAND_TABS = (
+    ("open", "待采购", "/procurement-demands?view=open"),
+    ("investigation", "找货需求", "/procurement-demands?view=investigation"),
+    ("planned", "待采购商品", "/procurement-demands?view=planned&group_by=product"),
+    ("sorting", "分拣", "/procurement-demands?view=planned&group_by=store"),
+    ("purchase", "采购", "/procurement-demands/purchase"),
+    ("purchased", "已采购", "/procurement-demands?view=purchased"),
+    ("all", "全部", "/procurement-demands?view=all"),
+)
 
 
 @app.get("/procurement-demands", response_class=HTMLResponse)
@@ -3234,6 +3679,9 @@ def procurement_demands_page(
         view = "open"
     if group_by not in PROCUREMENT_PLAN_GROUP_BY:
         group_by = "product"
+    # "分拣" (sorting-by-store) is the same view=planned&group_by=store URL,
+    # but the tab bar needs its own active-tab key distinct from "待采购商品".
+    active_tab = "sorting" if (view == "planned" and group_by == "store") else view
     groups: list = []
     investigations: list = []
     plans: list = []
@@ -3252,11 +3700,20 @@ def procurement_demands_page(
         inventory_contexts = build_group_inventory_contexts(db, groups)
     elif view == "investigation":
         investigations = list_investigation_demands(db, status="open")
-    elif view == "planned":
-        plans = list_plans(db, status="planned")
+    elif view in ("planned", "purchased"):
+        all_plans = list_plans(db, status="planned")
+        execution_summaries = build_plan_execution_summaries(db, all_plans)
+        if view == "planned":
+            # 待采购商品 / 分拣: only plans that still need buying.
+            plans = [plan for plan in all_plans if execution_summaries[plan.id].remaining_quantity > 0]
+        else:
+            # 已采购: plans with at least one real purchase recorded so far
+            # (still shown even if partially remaining -- "已采购" means "has
+            # purchase history", not "fully done").
+            plans = [plan for plan in all_plans if execution_summaries[plan.id].purchased_quantity > 0]
+            group_by = "product"
         plan_inventories = build_plan_inventory_contexts(db, plans)
         plan_store_contexts, store_coverage = build_plan_store_overview(db, plans)
-        execution_summaries = build_plan_execution_summaries(db, plans)
         plan_executions = build_plan_executions(db, plans)
         reconciliation_summaries = build_plan_reconciliation_summaries(db, plans)
         active_stores = list(db.scalars(
@@ -3268,7 +3725,8 @@ def procurement_demands_page(
     else:
         groups = aggregate_all_demand_groups(db)
     return templates.TemplateResponse(request, "procurement_demands.html", {
-        "view": view, "group_by": group_by, "groups": groups, "investigations": investigations, "plans": plans,
+        "view": view, "active_tab": active_tab, "tabs": PROCUREMENT_DEMAND_TABS,
+        "group_by": group_by, "groups": groups, "investigations": investigations, "plans": plans,
         "demand_type_labels": DEMAND_TYPE_LABELS, "source_type_labels": SOURCE_TYPE_LABELS,
         "status_labels": PROCUREMENT_STATUS_LABELS, "default_qty": default_planned_quantity_for_group,
         "inventory_contexts": inventory_contexts, "plan_inventories": plan_inventories,
@@ -3329,16 +3787,37 @@ async def procurement_demand_report_shortage_submit(request: Request, db: Sessio
     manual_name = str(form.get("manual_name") or "")
     quantity_raw = str(form.get("quantity") or "")
     note = str(form.get("note") or "")
+    manual_image_content: bytes | None = None
+    manual_image_filename: str | None = None
+    upload = form.get("manual_image")
+    # See _parse_order_items_from_form for why this is duck-typed rather than
+    # isinstance(upload, UploadFile).
+    if upload is not None and getattr(upload, "filename", None):
+        manual_image_content = await upload.read()
+        manual_image_filename = upload.filename
     try:
         create_channel_shortage_demand(
             db, product_id=int(product_id) if product_id.isdigit() else None,
-            manual_name=manual_name or None, quantity=int(quantity_raw) if quantity_raw.isdigit() else None,
+            manual_name=manual_name or None,
+            manual_image_content=manual_image_content, manual_image_filename=manual_image_filename,
+            quantity=int(quantity_raw) if quantity_raw.isdigit() else None,
             note=note or None,
         )
     except (ValueError, LookupError) as exc:
         db.rollback()
         return RedirectResponse(f"/procurement-demands/report-shortage?error={quote(str(exc))}", status_code=303)
     return RedirectResponse("/procurement-demands/report-shortage?ok=1", status_code=303)
+
+
+@app.get("/procurement-demands/item-images/{demand_id}")
+def procurement_demand_item_image_view(demand_id: int, db: Session = Depends(get_db)):
+    demand = db.get(ProcurementDemand, demand_id)
+    if demand is None or not demand.manual_image_relative_path:
+        raise HTTPException(404, "商品图片不存在")
+    path = resolve_procurement_demand_image_path(demand.manual_image_relative_path)
+    if path is None:
+        raise HTTPException(404, "商品图片文件不存在")
+    return FileResponse(path, media_type=demand.manual_image_content_type or "application/octet-stream")
 
 
 @app.post("/procurement-demands/investigations")
@@ -3404,6 +3883,27 @@ async def procurement_demand_plans_set_store_bulk(request: Request, db: Session 
     try:
         set_plans_selected_store_bulk(db, plan_ids, int(store_id) if store_id.isdigit() else None)
     except (ValueError, LookupError) as exc:
+        db.rollback()
+        return _redirect_back_to_planned(group_by, str(exc))
+    return _redirect_back_to_planned(group_by)
+
+
+@app.post("/procurement-demands/plans/{plan_id}/edit")
+def procurement_demand_plan_edit(
+    plan_id: int, planned_quantity: str = Form(...), note: str = Form(""), product_id: str = Form(""),
+    group_by: str = Form("product"), db: Session = Depends(get_db),
+):
+    try:
+        if not planned_quantity.isdigit():
+            raise ValueError("计划数量格式错误")
+        update_demand_plan(
+            db, plan_id, planned_quantity=int(planned_quantity), note=note or None,
+            product_id=int(product_id) if product_id.isdigit() else None,
+        )
+    except LookupError as exc:
+        db.rollback()
+        raise HTTPException(404, str(exc)) from exc
+    except ValueError as exc:
         db.rollback()
         return _redirect_back_to_planned(group_by, str(exc))
     return _redirect_back_to_planned(group_by)
@@ -3804,39 +4304,169 @@ async def qinsi_inventory_snapshot_upload(
     return RedirectResponse(f"/qinsi-inventory-snapshots/{snapshot.id}?message={quote(message)}", status_code=303)
 
 
+@app.get("/qinsi-inventory-snapshots/upload-batch", response_class=HTMLResponse)
+def qinsi_inventory_snapshot_upload_batch_page(request: Request):
+    return templates.TemplateResponse(request, "qinsi_inventory_snapshot_upload_batch.html", {
+        "settings": inventory_settings(), "error": None,
+    })
+
+
+def _parsed_data_at(data_at: str) -> datetime | None:
+    if not data_at.strip():
+        return None
+    parsed = datetime.fromisoformat(data_at)
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=TOKYO).astimezone(timezone.utc)
+    return parsed
+
+
+@app.post("/qinsi-inventory-snapshots/upload-batch", response_class=HTMLResponse)
+async def qinsi_inventory_snapshot_upload_batch(
+    request: Request,
+    files: list[UploadFile] = File(...),
+    data_at: str = Form(""),
+    db: Session = Depends(get_db),
+):
+    file_payload = [(file.filename or "unnamed.xlsx", await file.read()) for file in files]
+    try:
+        preview = preview_inventory_snapshot_files(db, file_payload)
+    except ValueError as exc:
+        return templates.TemplateResponse(request, "qinsi_inventory_snapshot_upload_batch.html", {
+            "settings": inventory_settings(), "error": str(exc),
+        }, status_code=422)
+    encoded_files = [
+        {"filename": name, "content_b64": base64.b64encode(content).decode("ascii")}
+        for name, content in file_payload
+    ]
+    return templates.TemplateResponse(request, "qinsi_inventory_snapshot_preview.html", {
+        "preview": preview, "encoded_files": encoded_files, "data_at": data_at,
+        "match_method_labels": MATCH_METHOD_LABELS, "error": None,
+    })
+
+
+@app.post("/qinsi-inventory-snapshots/confirm-batch", response_class=HTMLResponse)
+async def qinsi_inventory_snapshot_confirm_batch(
+    request: Request,
+    db: Session = Depends(get_db),
+):
+    form = await request.form()
+    filenames = form.getlist("filenames")
+    file_contents = form.getlist("file_contents")
+    data_at = str(form.get("data_at") or "")
+    override_completeness_warning = str(form.get("override_completeness_warning") or "").strip().lower() in {"true", "1", "on", "yes"}
+    if len(filenames) != len(file_contents) or not filenames:
+        raise HTTPException(422, "文件数据不完整，请重新上传")
+    file_payload = [(str(name), base64.b64decode(str(content))) for name, content in zip(filenames, file_contents)]
+    try:
+        completeness = analyze_multi_file_completeness(file_payload)
+        if completeness.has_blocking_issue and not override_completeness_warning:
+            raise ValueError("分段范围存在缺段/重叠/表头不一致，请先勾选“仍要继续”后再确认")
+        snapshot, reused = create_inventory_snapshot_from_files(
+            db, file_payload, data_at=_parsed_data_at(data_at),
+        )
+    except ValueError as exc:
+        preview = preview_inventory_snapshot_files(db, file_payload)
+        return templates.TemplateResponse(request, "qinsi_inventory_snapshot_preview.html", {
+            "preview": preview, "encoded_files": [
+                {"filename": name, "content_b64": content} for name, content in zip(filenames, file_contents)
+            ], "data_at": data_at, "match_method_labels": MATCH_METHOD_LABELS, "error": str(exc),
+        }, status_code=422)
+    message = "重复文件组合，已返回原快照" if reused else f"库存快照导入完成（合并{len(file_payload)}个文件）"
+    return RedirectResponse(f"/qinsi-inventory-snapshots/{snapshot.id}?message={quote(message)}", status_code=303)
+
+
 def _qinsi_inventory_snapshot_or_404(db: Session, snapshot_id: int):
-    snapshot = get_inventory_snapshot(db, snapshot_id)
+    snapshot = get_inventory_snapshot_summary(db, snapshot_id)
     if snapshot is None:
         raise HTTPException(404, "库存快照不存在")
     return snapshot
 
 
+def _conflict_candidates(db: Session, lines: list) -> dict[int, tuple[Product | None, Product | None]]:
+    """Built only for the lines actually being rendered (one page), not the
+    whole snapshot -- conflict resolution candidates are looked up per line."""
+    result: dict[int, tuple[Product | None, Product | None]] = {}
+    for line in lines:
+        if line.matching_status != "conflict":
+            continue
+        by_code = db.scalar(select(Product).where(Product.qinsi_product_code == line.qinsi_product_code)) if line.qinsi_product_code else None
+        by_jan = db.scalar(select(Product).where(Product.jan == line.jan)) if line.jan else None
+        result[line.id] = (by_code, by_jan)
+    return result
+
+
+def _parse_snapshot_page_params(request: Request) -> tuple[int, int]:
+    try:
+        page = max(1, int(request.query_params.get("page", "1")))
+    except ValueError:
+        page = 1
+    try:
+        page_size = int(request.query_params.get("page_size", str(DEFAULT_SNAPSHOT_LINE_PAGE_SIZE)))
+    except ValueError:
+        page_size = DEFAULT_SNAPSHOT_LINE_PAGE_SIZE
+    if page_size not in SNAPSHOT_LINE_PAGE_SIZES:
+        page_size = DEFAULT_SNAPSHOT_LINE_PAGE_SIZE
+    return page, page_size
+
+
 @app.get("/qinsi-inventory-snapshots/{snapshot_id}", response_class=HTMLResponse)
-def qinsi_inventory_snapshot_detail(snapshot_id: int, request: Request, db: Session = Depends(get_db)):
+def qinsi_inventory_snapshot_detail(
+    snapshot_id: int, request: Request, matching_status: str = Query("all"), warehouse_id: str = Query(""),
+    name_query: str = Query(""), jan_query: str = Query(""), qinsi_code_query: str = Query(""),
+    db: Session = Depends(get_db),
+):
     snapshot = _qinsi_inventory_snapshot_or_404(db, snapshot_id)
-    warehouse_distribution: dict[str, int] = {}
-    for line in snapshot.lines:
-        name = line.warehouse.display_name if line.warehouse else (line.raw_warehouse_name or "未知仓库")
-        warehouse_distribution[name] = warehouse_distribution.get(name, 0) + (line.quantity or 0)
+    page, page_size = _parse_snapshot_page_params(request)
+    lines_page = get_inventory_snapshot_lines_page(
+        db, snapshot_id, matching_status=matching_status or None,
+        warehouse_id=int(warehouse_id) if warehouse_id.isdigit() else None,
+        name_query=name_query or None, jan_query=jan_query or None, qinsi_code_query=qinsi_code_query or None,
+        page=page, page_size=page_size,
+    )
+    warehouse_distribution = get_snapshot_warehouse_distribution(db, snapshot_id)
     return templates.TemplateResponse(request, "qinsi_inventory_snapshot_detail.html", {
         "snapshot": snapshot,
         "status_labels": QINSI_SNAPSHOT_STATUS_CN,
         "match_status_labels": MATCH_STATUS_LABELS,
         "match_method_labels": MATCH_METHOD_LABELS,
         "warehouse_distribution": warehouse_distribution,
+        "conflict_candidates": _conflict_candidates(db, lines_page.lines),
+        "lines_page": lines_page, "page_sizes": SNAPSHOT_LINE_PAGE_SIZES,
+        "warehouses": available_qinsi_warehouses(db),
+        "filters": {
+            "matching_status": matching_status or "all", "warehouse_id": warehouse_id,
+            "name_query": name_query, "jan_query": jan_query, "qinsi_code_query": qinsi_code_query,
+        },
         "message": request.query_params.get("message"),
     })
 
 
 @app.get("/qinsi-inventory-snapshots/{snapshot_id}/review", response_class=HTMLResponse)
-def qinsi_inventory_snapshot_review(snapshot_id: int, request: Request, db: Session = Depends(get_db)):
+def qinsi_inventory_snapshot_review(
+    snapshot_id: int, request: Request, warehouse_id: str = Query(""),
+    name_query: str = Query(""), jan_query: str = Query(""), qinsi_code_query: str = Query(""),
+    db: Session = Depends(get_db),
+):
     snapshot = _qinsi_inventory_snapshot_or_404(db, snapshot_id)
+    page, page_size = _parse_snapshot_page_params(request)
+    lines_page = get_inventory_snapshot_lines_page(
+        db, snapshot_id, actionable_only=True,
+        warehouse_id=int(warehouse_id) if warehouse_id.isdigit() else None,
+        name_query=name_query or None, jan_query=jan_query or None, qinsi_code_query=qinsi_code_query or None,
+        page=page, page_size=page_size,
+    )
     products = list(db.scalars(select(Product).where(Product.status == "active").order_by(Product.internal_sku)))
     return templates.TemplateResponse(request, "qinsi_inventory_snapshot_review.html", {
         "snapshot": snapshot, "products": products,
         "warehouses": available_qinsi_warehouses(db),
         "match_status_labels": MATCH_STATUS_LABELS,
         "match_method_labels": MATCH_METHOD_LABELS,
+        "conflict_candidates": _conflict_candidates(db, lines_page.lines),
+        "lines_page": lines_page, "page_sizes": SNAPSHOT_LINE_PAGE_SIZES,
+        "filters": {
+            "warehouse_id": warehouse_id, "name_query": name_query,
+            "jan_query": jan_query, "qinsi_code_query": qinsi_code_query,
+        },
         "message": request.query_params.get("message"),
     })
 
@@ -3844,9 +4474,11 @@ def qinsi_inventory_snapshot_review(snapshot_id: int, request: Request, db: Sess
 @app.get("/qinsi-inventory-snapshots/{snapshot_id}/download")
 def qinsi_inventory_snapshot_download(snapshot_id: int, db: Session = Depends(get_db)):
     snapshot = _qinsi_inventory_snapshot_or_404(db, snapshot_id)
+    is_zip = snapshot.original_filename.lower().endswith(".zip")
+    media_type = "application/zip" if is_zip else "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
     return StreamingResponse(
         io.BytesIO(snapshot.file_content),
-        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        media_type=media_type,
         headers={"Content-Disposition": f"attachment; filename*=UTF-8''{quote(snapshot.original_filename)}"},
     )
 
@@ -4511,13 +5143,19 @@ async def api_upload(background_tasks: BackgroundTasks, request: Request, files:
 
 
 @app.post("/api/receipt-batches/{batch_id}/recognition-json")
-async def api_recognition(batch_id: int, request: Request, db: Session = Depends(get_db)):
+async def api_recognition(batch_id: int, request: Request, background_tasks: BackgroundTasks, db: Session = Depends(get_db)):
     raw = (await request.body()).decode("utf-8")
     batch = load_batch(db, batch_id)
     try:
         receipt = import_recognition_json(db, batch, raw)
     except ValueError as exc:
         raise HTTPException(422, str(exc)) from exc
+    # Import is already fully committed above; enrichment runs in the
+    # background on its own engine/session -- see process_receipt_items_enrichment.
+    item_ids = [item.id for item in receipt.items]
+    if item_ids:
+        database_url = db.get_bind().url.render_as_string(hide_password=False)
+        background_tasks.add_task(process_receipt_items_enrichment, database_url, item_ids, "gpt_receipt_json")
     return {"receipt_id": receipt.id, "batch_id": batch_id, "status": "imported", "recognition_run_count": len(batch.recognition_runs)}
 
 

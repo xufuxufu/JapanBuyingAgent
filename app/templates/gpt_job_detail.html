@@ -2,6 +2,7 @@
 {% block title %}GPT 任务 {{ job.job_no }}{% endblock %}
 {% block content %}
 <div class="section-head"><div><h1>GPT 识别任务</h1><p class="muted">任务编号 {{ job.job_no }}</p></div><span class="badge">{{ status_text }}</span></div>
+{% if request.query_params.get('imported') == '1' %}<div class="success">导入成功，商品资料正在后台补全。</div>{% endif %}
 <section class="card">
   <div class="summary-grid">
     <span>批次数<strong>{{ job.batch_count }}</strong></span><span>图片数<strong>{{ job.image_count }}</strong></span>

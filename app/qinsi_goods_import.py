@@ -111,6 +111,22 @@ FORMAL_HEADER_TO_TEMPLATE_HEADER = {
     "最低销售价": "最低销售价",
     "状态": "状态",
     "备注": "商品备注",
+    # QinSi's "商品库存列表导出" report carries per-row warehouse/quantity
+    # columns that the product-master formal format has no concept of. Map
+    # them onto the old template's single-warehouse-per-file headers so
+    # qinsi_inventory._inventory_entries() picks them up as one (warehouse,
+    # quantity) fact per row -- these two template headers are not in
+    # HEADER_TO_FIELD's PRODUCT_FIELDS, so this never touches product-master
+    # sync (confirm_import only applies PRODUCT_FIELDS).
+    "仓库": "盘点仓库:",
+    "数量": "盘点库存数量",
+    # Kept verbatim (novel keys, not in HEADER_TO_FIELD) purely so
+    # qinsi_inventory's raw_summary_json audit trail preserves them; they do
+    # not participate in matching or product-master sync.
+    "成本单价": "成本单价",
+    "库存成本": "库存成本",
+    "主辅数量": "主辅数量",
+    "规格型号": "规格型号",
 }
 PRODUCT_FIELDS = tuple(
     field for field in dict.fromkeys(HEADER_TO_FIELD.values())
@@ -254,7 +270,14 @@ def _classify_product_sheet(values_book, formulas_book) -> tuple[str, str, list[
 
 
 def _determine_formal_jan(raw: dict[str, str | None]) -> str | None:
-    for value in (raw.get("单品条码"), raw.get("商品条码"), raw.get("货号")):
+    # Priority: 单品条码/商品条码 (legacy formal barcode columns), then 条码
+    # (the "商品库存列表导出" report's own barcode column), then 货号 as a
+    # last-resort JAN fallback -- only when it independently passes JAN/GTIN
+    # checksum validation. 货号 always separately becomes qinsi_product_code
+    # via "货号（必填且唯一）" regardless of whether it is also used here;
+    # being a valid JAN fallback candidate never changes that field's own
+    # identity/semantics.
+    for value in (raw.get("单品条码"), raw.get("商品条码"), raw.get("条码"), raw.get("货号")):
         candidate = (value or "").strip()
         if is_valid_jan(candidate):
             return candidate

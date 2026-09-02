@@ -1,14 +1,13 @@
 {% extends "base.html" %}
 {% block title %}采购需求{% endblock %}
 {% block content %}
-<div class="section-head"><div><h1>采购需求中心</h1><p class="muted">秀的客户需求、丈母娘的渠道缺货，按商品自动汇总；先勾选，再决定采购多少。</p></div><a class="button secondary" href="/procurement-demands/report-shortage">报缺货</a></div>
+<div class="section-head"><div><h1>采购需求中心</h1><p class="muted">秀的客户需求、丈母娘的补货需求，按商品自动汇总；先勾选，再决定采购多少。</p></div><a class="button secondary" href="/procurement-demands/report-shortage">补货需求</a></div>
 {% if error %}<div class="warning"><strong>操作失败：</strong>{{ error }}</div>{% endif %}
 
 <nav class="so-tabs" aria-label="采购需求分类">
-  <a class="so-tab{% if view == 'open' %} active{% endif %}" href="/procurement-demands?view=open">待处理</a>
-  <a class="so-tab{% if view == 'investigation' %} active{% endif %}" href="/procurement-demands?view=investigation">调查</a>
-  <a class="so-tab{% if view == 'planned' %} active{% endif %}" href="/procurement-demands?view=planned">已安排</a>
-  <a class="so-tab{% if view == 'all' %} active{% endif %}" href="/procurement-demands?view=all">全部</a>
+  {% for key, label, href in tabs %}
+  <a class="so-tab{% if active_tab == key %} active{% endif %}" href="{{ href }}">{{ label }}</a>
+  {% endfor %}
 </nav>
 
 {% if view in ('open', 'all') %}
@@ -19,11 +18,14 @@
     {% set ctx = inventory_contexts.get(group.group_ref) %}
     <article class="card pd-card" data-kind="{{ group.kind }}" data-key="{{ group.key }}" data-default-qty="{{ ctx.default_planned_quantity if ctx else group.confirmed_quantity }}">
       <div class="pd-card-main">
-        {% if group.product and group.product.preferred_image_url %}
-        <img class="product-thumb" loading="lazy" src="{{ group.product.preferred_image_url }}" alt="商品主图">
-        {% else %}<div class="product-image-empty product-thumb">无图</div>{% endif %}
+        {% set manual_demand = group.confirmed_demands|selectattr('manual_image_relative_path')|first %}
+        {% set image = product_image_url(group.product) if group.product else (('/procurement-demands/item-images/' ~ manual_demand.id) if manual_demand else none) %}
+        <div class="product-thumb-slot{% if not image %} image-load-failed{% endif %}">
+          {% if image %}<img class="product-thumb zoomable" data-zoom-src="{{ image }}" src="{{ image }}" alt="商品主图" loading="lazy" referrerpolicy="no-referrer" onerror="this.parentElement.classList.add('image-load-failed')"><span class="zoom-hint">+</span>{% endif %}
+          <div class="product-image-empty">无图</div>
+        </div>
         <div class="pd-card-info">
-          <h2>{{ group.display_name }}</h2>
+          <h2 class="procurement-card-name">{{ group.display_name }}</h2>
           <p class="muted">{{ group.jan or 'JAN 未填写' }}</p>
           <p class="pd-confirmed">明确需求：<strong>{{ group.confirmed_quantity }}</strong></p>
           <div class="pd-sources">
@@ -69,10 +71,15 @@
 {% if view == 'investigation' %}
 <section class="pd-list">
   {% for demand in investigations %}
+  {% set image = product_image_url(demand.product) if demand.product else none %}
   <article class="card pd-card">
     <div class="pd-card-main">
+      <div class="product-thumb-slot{% if not image %} image-load-failed{% endif %}">
+        {% if image %}<img class="product-thumb zoomable" data-zoom-src="{{ image }}" src="{{ image }}" alt="商品主图" loading="lazy" referrerpolicy="no-referrer" onerror="this.parentElement.classList.add('image-load-failed')"><span class="zoom-hint">+</span>{% endif %}
+        <div class="product-image-empty">无图</div>
+      </div>
       <div class="pd-card-info">
-        <h2>{{ demand.product_name_snapshot }}</h2>
+        <h2 class="procurement-card-name">{{ demand.product_name_snapshot }}</h2>
         <p class="muted">{{ demand.source_person }} · {{ demand.source_channel or '' }} · {{ demand.created_at|tokyo_datetime }}</p>
         <p class="muted">数量：{{ demand.requested_quantity if demand.requested_quantity else '未填' }}</p>
         {% if demand.note %}<p>{{ demand.note }}</p>{% endif %}
@@ -87,11 +94,13 @@
 </section>
 {% endif %}
 
+{% if view in ('planned', 'purchased') %}
 {% if view == 'planned' %}
 <nav class="so-tabs pd-subtabs" aria-label="已安排采购分组方式">
-  <a class="so-tab{% if group_by == 'product' %} active{% endif %}" href="/procurement-demands?view=planned&group_by=product">按商品</a>
-  <a class="so-tab{% if group_by == 'store' %} active{% endif %}" href="/procurement-demands?view=planned&group_by=store">按店铺</a>
+  <a class="so-tab{% if group_by == 'product' %} active{% endif %}" href="/procurement-demands?view=planned&group_by=product">待采购商品</a>
+  <a class="so-tab{% if group_by == 'store' %} active{% endif %}" href="/procurement-demands?view=planned&group_by=store">分拣（按店铺）</a>
 </nav>
+{% endif %}
 
 {% if store_coverage %}
 <section class="card pd-coverage-board">
@@ -129,8 +138,14 @@
     <div class="pd-store-group-items">
       {% for plan in group.plans %}
       {% set summary = execution_summaries.get(plan.id) %}
+      {% set manual_demand = plan.sources|map(attribute='demand')|selectattr('manual_image_relative_path')|first %}
+      {% set image = product_image_url(plan.product) if plan.product else (('/procurement-demands/item-images/' ~ manual_demand.id) if manual_demand else none) %}
       <div class="pd-store-group-item">
-        <span>{{ plan.product_name_snapshot }} × {{ plan.planned_quantity }}{% if summary %}<br><small class="muted">已买 {{ summary.purchased_quantity }} · 剩余 {{ summary.remaining_quantity }}</small>{% endif %}</span>
+        <div class="product-thumb-slot{% if not image %} image-load-failed{% endif %}">
+          {% if image %}<img class="product-thumb zoomable" data-zoom-src="{{ image }}" src="{{ image }}" alt="商品主图" loading="lazy" referrerpolicy="no-referrer" onerror="this.parentElement.classList.add('image-load-failed')"><span class="zoom-hint">+</span>{% endif %}
+          <div class="product-image-empty">无图</div>
+        </div>
+        <span class="procurement-card-name">{{ plan.product_name_snapshot }} × {{ plan.planned_quantity }}{% if summary %}<br><small class="muted">已买 {{ summary.purchased_quantity }} · 剩余 {{ summary.remaining_quantity }}</small>{% endif %}</span>
         {{ store_select(plan, active_stores, group_by) }}
       </div>
       {% endfor %}
@@ -146,11 +161,14 @@
   {% set psc = plan_store_contexts.get(plan.id) %}
   <article class="card pd-card">
     <div class="pd-card-main">
-      {% if plan.product and plan.product.preferred_image_url %}
-      <img class="product-thumb" loading="lazy" src="{{ plan.product.preferred_image_url }}" alt="商品主图">
-      {% else %}<div class="product-image-empty product-thumb">无图</div>{% endif %}
+      {% set manual_demand = plan.sources|map(attribute='demand')|selectattr('manual_image_relative_path')|first %}
+      {% set image = product_image_url(plan.product) if plan.product else (('/procurement-demands/item-images/' ~ manual_demand.id) if manual_demand else none) %}
+      <div class="product-thumb-slot{% if not image %} image-load-failed{% endif %}">
+        {% if image %}<img class="product-thumb zoomable" data-zoom-src="{{ image }}" src="{{ image }}" alt="商品主图" loading="lazy" referrerpolicy="no-referrer" onerror="this.parentElement.classList.add('image-load-failed')"><span class="zoom-hint">+</span>{% endif %}
+        <div class="product-image-empty">无图</div>
+      </div>
       <div class="pd-card-info">
-        <h2>{{ plan.product_name_snapshot }}</h2>
+        <h2 class="procurement-card-name">{{ plan.product_name_snapshot }}</h2>
         <p class="muted">{{ plan.jan_snapshot or 'JAN 未填写' }} · {{ plan.created_at|tokyo_datetime }}</p>
         <p class="pd-confirmed">计划采购数量：<strong>{{ plan.planned_quantity }}</strong>{% if plan.confirmed_demand_quantity_snapshot is not none %} <span class="muted">（决策时明确需求 {{ plan.confirmed_demand_quantity_snapshot }}）</span>{% endif %}</p>
         {% set summary = execution_summaries.get(plan.id) %}
@@ -166,6 +184,26 @@
           <span class="pd-source-line">{{ source.demand.source_person }} {{ demand_type_labels.get(source.demand.demand_type, source.demand.demand_type) }} {{ '×' ~ source.quantity_snapshot if source.quantity_snapshot else '' }}</span>
           {% endfor %}
         </div>
+        <button type="button" class="link-button plan-edit-toggle">编辑计划</button>
+        <form method="post" action="/procurement-demands/plans/{{ plan.id }}/edit" class="plan-edit-form form-grid" hidden>
+          <input type="hidden" name="group_by" value="{{ group_by }}">
+          <label>计划采购数量（不得低于已采购 {{ summary.purchased_quantity if summary else 0 }}）
+            <input type="number" name="planned_quantity" class="plan-edit-quantity" min="{{ summary.purchased_quantity if summary and summary.purchased_quantity > 0 else 1 }}" step="1" inputmode="numeric" value="{{ plan.planned_quantity }}">
+          </label>
+          <label class="full">备注<textarea name="note" rows="2" maxlength="500">{{ plan.note or '' }}</textarea></label>
+          {% if not plan.product %}
+          <div class="full plan-edit-product-picker">
+            <label>关联正式商品（可空，识别后可选择）<input type="search" class="plan-edit-product-search" autocomplete="off" placeholder="输入中文名/日文名/JAN/秦丝货号搜索"></label>
+            <input type="hidden" name="product_id" class="plan-edit-product-id">
+            <div class="search-results plan-edit-product-results" hidden></div>
+            <p class="muted plan-edit-product-picked" hidden></p>
+          </div>
+          {% endif %}
+          <div class="button-row full">
+            <button type="submit" class="compact">保存修改</button>
+            <button type="button" class="secondary compact plan-edit-cancel">取消</button>
+          </div>
+        </form>
       </div>
     </div>
     {% if inv %}

@@ -1,26 +1,51 @@
 {% extends "base.html" %}
-{% block title %}报缺货{% endblock %}
+{% block title %}补货需求{% endblock %}
 {% block content %}
-<div class="section-head"><div><h1>报缺货</h1><p class="muted">告诉老婆哪个商品卖完了，不用打开采购系统。</p></div><a class="button secondary" href="/procurement-demands">查看采购需求</a></div>
+<div class="section-head"><div><h1>补货需求</h1><p class="muted">提醒库存即将短缺，需考虑物流时效。</p></div><a class="button secondary" href="/procurement-demands">查看采购需求</a></div>
 {% if error %}<div class="warning"><strong>提交失败：</strong>{{ error }}</div>{% endif %}
-{% if request.query_params.get('ok') %}<div class="badge state-completed">已提交，老婆会看到这条缺货信息。</div>{% endif %}
-<form id="shortageForm" method="post" action="/procurement-demands/report-shortage" class="stack">
+{% if request.query_params.get('ok') %}<div class="badge state-completed">已提交，采购需求中心会看到这条补货需求。</div>{% endif %}
+<form id="shortageForm" method="post" action="/procurement-demands/report-shortage" class="stack" enctype="multipart/form-data">
   <input type="hidden" name="product_id" id="shortageProductIdInput">
   <section class="card">
-    <div id="shortagePicked" hidden><p><strong id="shortagePickedName"></strong> <button type="button" class="link-button" id="shortageChange">更换</button></p></div>
+    <div id="shortagePicked" hidden>
+      <div class="row item-detail-row">
+        <div class="product-thumb-slot" id="shortagePickedThumbSlot">
+          <img class="product-thumb zoomable" id="shortagePickedImage" hidden alt="商品主图">
+          <div class="product-image-empty">无图</div>
+        </div>
+        <span class="item-detail-body">
+          <strong id="shortagePickedName"></strong>
+          <small id="shortagePickedMeta"></small>
+        </span>
+      </div>
+      <button type="button" class="link-button" id="shortageChange">更换</button>
+    </div>
     <div id="shortageSearchBlock">
-      <label>商品<input type="search" id="shortageSearchInput" autocomplete="off" placeholder="输入中文名/日文名/JAN搜索"></label>
+      <label>商品<input type="search" id="shortageSearchInput" autocomplete="off" placeholder="输入中文名/日文名/JAN/秦丝货号搜索"></label>
       <div id="shortageSearchResults" class="search-results" hidden></div>
-      <button type="button" class="link-button" id="shortageManualToggle">找不到商品，手工输入名称</button>
-      <label id="shortageManualLabel" hidden>商品名称<input id="shortageManualInput" maxlength="255"></label>
+      <div id="shortageImageSearchMount"></div>
+      <button type="button" class="link-button" id="shortageManualToggle">找不到商品，手工输入名称/上传图片</button>
+      <div id="shortageManualBlock" hidden>
+        <label>商品名称（可空，但需至少填名称或上传图片）<input id="shortageManualInput" maxlength="255"></label>
+        <label>商品图片（可空）<input type="file" name="manual_image" id="shortageManualImageInput" accept="image/jpeg,image/png,image/webp"></label>
+        <img id="shortageManualImagePreview" class="item-manual-image-preview zoomable" hidden alt="商品图片预览">
+      </div>
     </div>
   </section>
   <section class="card">
-    <label>数量（可空，估计一下就行）<input name="quantity" type="number" min="1" step="1" inputmode="numeric"></label>
-    <label>备注（可选，比如是淘宝还是小红书）<textarea name="note" rows="2" maxlength="500"></textarea></label>
+    <label>补货数量（仅参考，必填）</label>
+    <div class="quantity-stepper">
+      <button type="button" class="compact quantity-step" data-step="-5">-5</button>
+      <button type="button" class="compact quantity-step" data-step="-1">-1</button>
+      <input name="quantity" id="shortageQuantityInput" type="number" min="1" step="1" inputmode="numeric" value="1">
+      <button type="button" class="compact quantity-step" data-step="1">+1</button>
+      <button type="button" class="compact quantity-step" data-step="5">+5</button>
+    </div>
+    <label>备注<textarea name="note" rows="2" maxlength="500"></textarea></label>
   </section>
-  <button class="full" type="submit" id="shortageSubmitButton">提交缺货</button>
+  <button class="full" type="submit" id="shortageSubmitButton">提交补货需求</button>
   <p id="shortageFormError" class="error" hidden></p>
 </form>
+<script src="/static/image_product_search.js" defer></script>
 <script src="/static/procurement_demand_shortage.js" defer></script>
 {% endblock %}

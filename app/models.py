@@ -1647,11 +1647,30 @@ class Customer(Base):
     name: Mapped[str] = mapped_column(String(255), nullable=False)
     phone: Mapped[str | None] = mapped_column(String(50))
     wechat_name: Mapped[str | None] = mapped_column(String(128))
+    # Deprecated single free-text address, kept only so pre-multi-address rows
+    # stay readable; new code reads/writes CustomerAddress instead.
     address: Mapped[str | None] = mapped_column(Text)
     note: Mapped[str | None] = mapped_column(Text)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow, nullable=False)
     sales_orders: Mapped[list[SalesOrder]] = relationship(back_populates="customer")
+    addresses: Mapped[list[CustomerAddress]] = relationship(
+        back_populates="customer", cascade="all, delete-orphan", order_by="CustomerAddress.id",
+    )
+
+
+class CustomerAddress(Base):
+    __tablename__ = "customer_addresses"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    customer_id: Mapped[int] = mapped_column(ForeignKey("customers.id", ondelete="CASCADE"), nullable=False, index=True)
+    recipient_name: Mapped[str] = mapped_column(String(255), nullable=False)
+    phone: Mapped[str | None] = mapped_column(String(50))
+    address: Mapped[str] = mapped_column(Text, nullable=False)
+    label: Mapped[str | None] = mapped_column(String(50))
+    is_default: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow, nullable=False)
+    customer: Mapped[Customer] = relationship(back_populates="addresses")
 
 
 class Salesperson(Base):
@@ -1668,7 +1687,7 @@ class SalesOrder(Base):
     __tablename__ = "sales_orders"
     __table_args__ = (
         CheckConstraint(
-            "status IN ('submitted','ready_to_ship','shipped','completed','cancelled')",
+            "status IN ('submitted','paid','partially_shipped','shipped','completed','cancelled')",
             name="ck_sales_orders_status",
         ),
         Index("ix_sales_orders_status_created", "status", "created_at"),
@@ -1680,6 +1699,10 @@ class SalesOrder(Base):
     status: Mapped[str] = mapped_column(String(20), default="submitted", nullable=False, index=True)
     order_date: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     note: Mapped[str | None] = mapped_column(Text)
+    # Current/default address for whatever on this order hasn't shipped yet.
+    # Editable while any unshipped quantity remains (see ADDRESS_EDITABLE_STATUSES
+    # in sales_order_service.py); each SalesShipment copies its own frozen
+    # snapshot from this at the moment the shipment is created.
     recipient_name_snapshot: Mapped[str | None] = mapped_column(String(255))
     recipient_phone_snapshot: Mapped[str | None] = mapped_column(String(50))
     shipping_address_snapshot: Mapped[str | None] = mapped_column(Text)
@@ -1692,6 +1715,9 @@ class SalesOrder(Base):
     )
     shipping_labels: Mapped[list[SalesOrderShippingLabel]] = relationship(
         back_populates="sales_order", cascade="all, delete-orphan", order_by="SalesOrderShippingLabel.created_at",
+    )
+    shipments: Mapped[list[SalesShipment]] = relationship(
+        back_populates="sales_order", cascade="all, delete-orphan", order_by="SalesShipment.id",
     )
 
     @property
@@ -1712,29 +1738,62 @@ class SalesOrderItem(Base):
     __table_args__ = (
         CheckConstraint("quantity > 0", name="ck_sales_order_items_quantity_positive"),
         CheckConstraint("unit_sale_price >= 0", name="ck_sales_order_items_price_non_negative"),
+        CheckConstraint(
+            "product_id IS NOT NULL OR product_name_snapshot IS NOT NULL OR manual_image_relative_path IS NOT NULL",
+            name="ck_sales_order_items_identity_present",
+        ),
     )
     id: Mapped[int] = mapped_column(primary_key=True)
     sales_order_id: Mapped[int] = mapped_column(ForeignKey("sales_orders.id", ondelete="CASCADE"), nullable=False, index=True)
     product_id: Mapped[int | None] = mapped_column(ForeignKey("products.id", ondelete="SET NULL"), index=True)
-    product_name_snapshot: Mapped[str] = mapped_column(String(255), nullable=False)
+    # Doubles as the manual item's name for product_id-less rows; nullable so a
+    # manual item can be identified by image alone (see the identity CheckConstraint).
+    product_name_snapshot: Mapped[str | None] = mapped_column(String(255))
     jan_snapshot: Mapped[str | None] = mapped_column(String(32))
     quantity: Mapped[int] = mapped_column(Integer, nullable=False)
+    # CNY ("微信售价"), hand-entered per order line -- never defaulted from any
+    # JPY purchase/sale price field.
     unit_sale_price: Mapped[Decimal] = mapped_column(Numeric(18, 2), nullable=False)
     note: Mapped[str | None] = mapped_column(Text)
+    # Manual-item photo, a permanent historical snapshot of this order line --
+    # never deleted/replaced even if the line is later linked to a real Product.
+    manual_image_relative_path: Mapped[str | None] = mapped_column(Text)
+    manual_image_original_filename: Mapped[str | None] = mapped_column(String(255))
+    manual_image_content_type: Mapped[str | None] = mapped_column(String(100))
+    manual_image_file_size: Mapped[int | None] = mapped_column(Integer)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow, nullable=False)
     sales_order: Mapped[SalesOrder] = relationship(back_populates="items")
     product: Mapped[Product | None] = relationship()
+    shipment_items: Mapped[list[SalesShipmentItem]] = relationship(back_populates="sales_order_item")
 
     @property
     def line_amount(self) -> Decimal:
         return (self.unit_sale_price or Decimal("0")) * self.quantity
+
+    @property
+    def shipped_quantity(self) -> int:
+        """Quantity confirmed shipped so far (only counts shipments actually
+        marked shipped -- a pending, not-yet-shipped shipment does not count
+        as fulfilling the order yet)."""
+        return sum(
+            shipment_item.quantity
+            for shipment_item in self.shipment_items
+            if shipment_item.shipment.status == "shipped"
+        )
+
+    @property
+    def remaining_quantity(self) -> int:
+        return self.quantity - self.shipped_quantity
 
 
 class SalesOrderShippingLabel(Base):
     __tablename__ = "sales_order_shipping_labels"
     id: Mapped[int] = mapped_column(primary_key=True)
     sales_order_id: Mapped[int] = mapped_column(ForeignKey("sales_orders.id", ondelete="CASCADE"), nullable=False, index=True)
+    # Nullable: pre-shipment-model labels were attached directly to the order;
+    # new uploads always attach to the shipment they document.
+    shipment_id: Mapped[int | None] = mapped_column(ForeignKey("sales_shipments.id", ondelete="CASCADE"), index=True)
     stored_filename: Mapped[str] = mapped_column(String(255), nullable=False)
     original_filename: Mapped[str | None] = mapped_column(String(255))
     relative_path: Mapped[str] = mapped_column(Text, nullable=False)
@@ -1742,6 +1801,58 @@ class SalesOrderShippingLabel(Base):
     file_size: Mapped[int | None] = mapped_column(Integer)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False, index=True)
     sales_order: Mapped[SalesOrder] = relationship(back_populates="shipping_labels")
+    shipment: Mapped[SalesShipment | None] = relationship(back_populates="shipping_labels")
+
+
+class SalesShipment(Base):
+    """One dispatch event for part or all of a SalesOrder's items.
+
+    A paid order can have any number of shipments over time; each one is an
+    immutable historical fact once marked shipped (see mark_shipment_shipped
+    in sales_order_service.py) -- its address snapshot and item quantities
+    never change again after that point.
+    """
+
+    __tablename__ = "sales_shipments"
+    __table_args__ = (
+        CheckConstraint("status IN ('pending','shipped')", name="ck_sales_shipments_status"),
+    )
+    id: Mapped[int] = mapped_column(primary_key=True)
+    sales_order_id: Mapped[int] = mapped_column(ForeignKey("sales_orders.id", ondelete="CASCADE"), nullable=False, index=True)
+    shipment_no: Mapped[str] = mapped_column(String(40), unique=True, nullable=False)
+    status: Mapped[str] = mapped_column(String(20), default="pending", nullable=False, index=True)
+    recipient_name_snapshot: Mapped[str] = mapped_column(String(255), nullable=False)
+    recipient_phone_snapshot: Mapped[str | None] = mapped_column(String(50))
+    shipping_address_snapshot: Mapped[str] = mapped_column(Text, nullable=False)
+    # Reserved for future carrier API integration; not called this round.
+    carrier: Mapped[str | None] = mapped_column(String(50), default="中通")
+    tracking_no: Mapped[str | None] = mapped_column(String(100))
+    shipped_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow, nullable=False)
+    sales_order: Mapped[SalesOrder] = relationship(back_populates="shipments")
+    items: Mapped[list[SalesShipmentItem]] = relationship(
+        back_populates="shipment", cascade="all, delete-orphan", order_by="SalesShipmentItem.id",
+    )
+    shipping_labels: Mapped[list[SalesOrderShippingLabel]] = relationship(
+        back_populates="shipment", cascade="all, delete-orphan", order_by="SalesOrderShippingLabel.created_at",
+    )
+
+
+class SalesShipmentItem(Base):
+    __tablename__ = "sales_shipment_items"
+    __table_args__ = (
+        CheckConstraint("quantity > 0", name="ck_sales_shipment_items_quantity_positive"),
+    )
+    id: Mapped[int] = mapped_column(primary_key=True)
+    shipment_id: Mapped[int] = mapped_column(ForeignKey("sales_shipments.id", ondelete="CASCADE"), nullable=False, index=True)
+    # RESTRICT: a shipment referencing an order item must never be left
+    # dangling -- shipped history is never allowed to lose its item link.
+    sales_order_item_id: Mapped[int] = mapped_column(ForeignKey("sales_order_items.id", ondelete="RESTRICT"), nullable=False, index=True)
+    quantity: Mapped[int] = mapped_column(Integer, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
+    shipment: Mapped[SalesShipment] = relationship(back_populates="items")
+    sales_order_item: Mapped[SalesOrderItem] = relationship(back_populates="shipment_items")
 
 
 class ProcurementDemand(Base):
@@ -1784,6 +1895,15 @@ class ProcurementDemand(Base):
     requested_quantity: Mapped[int | None] = mapped_column(Integer)
     note: Mapped[str | None] = mapped_column(Text)
     status: Mapped[str] = mapped_column(String(20), default="open", nullable=False, index=True)
+    # A manual (no matching Product) demand raised via a photo only -- e.g. a
+    # customer sent a picture and nobody knows the JAN/name yet. Reuses the same
+    # safe-upload mechanism as sales_order_items' manual images (Phase 7); the
+    # image is a permanent historical snapshot, never auto-deleted even once the
+    # demand is later linked to a real Product.
+    manual_image_relative_path: Mapped[str | None] = mapped_column(Text)
+    manual_image_original_filename: Mapped[str | None] = mapped_column(String(255))
+    manual_image_content_type: Mapped[str | None] = mapped_column(String(100))
+    manual_image_file_size: Mapped[int | None] = mapped_column(Integer)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False, index=True)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow, nullable=False)
     product: Mapped[Product | None] = relationship()

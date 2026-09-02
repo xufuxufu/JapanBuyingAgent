@@ -131,6 +131,8 @@ def test_confirm_without_execution_selection_still_confirms(client):
 
 
 def test_planned_view_shows_reconciliation_breakdown(client):
+    # This plan is fully purchased (planned=5, bought=5), so under the Phase 8
+    # tab split it now lives under 已采购 (view=purchased), not 待采购商品.
     http, db, _tmp = client
     shop = store(db, "路由已安排店")
     prod = product(db, "5")
@@ -145,6 +147,6 @@ def test_planned_view_shows_reconciliation_breakdown(client):
         f"execution_match_{item.id}": str(execution.id), f"execution_match_qty_{item.id}": "3",
     })
 
-    response = http.get("/procurement-demands?view=planned")
+    response = http.get("/procurement-demands?view=purchased")
     assert "已对账" in response.text
     assert "待小票" in response.text

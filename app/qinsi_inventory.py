@@ -1,16 +1,19 @@
 from __future__ import annotations
 
 import hashlib
+import io
 import json
 import os
 import re
 import uuid
+import zipfile
+from collections import defaultdict
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 
-from sqlalchemy import func, select
+from sqlalchemy import func, or_, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, selectinload
 
@@ -26,7 +29,7 @@ from app.models import (
     QinsiPurchaseExportLine,
     QinsiPurchaseExportLineSource,
 )
-from app.qinsi_goods_import import read_product_sheet
+from app.qinsi_goods_import import parse_qinsi_workbook, read_product_sheet
 
 
 BASE_HEADERS = {
@@ -48,11 +51,14 @@ INVENTORY_STATUS_LABELS = {
 }
 MATCH_STATUS_LABELS = {"matched": "已匹配", "unmatched": "未匹配", "conflict": "冲突", "ignored": "已忽略"}
 MATCH_METHOD_LABELS = {
-    "qinsi_product_code": "秦丝商品编码",
+    "code_jan_verified": "货号+JAN双重确认",
+    "qinsi_product_code": "秦丝货号",
     "jan": "JAN",
     "confirmed_mapping": "已确认映射",
     "internal_sku": "内部SKU",
     "manual": "人工选择",
+    "duplicate": "系统去重（完全重复行）",
+    "quantity_conflict": "同货号同仓库数量冲突",
 }
 
 INVENTORY_REGION_CHINA = "china"
@@ -73,6 +79,9 @@ INVENTORY_REGION_BY_LOCATION_CODE: dict[str, str] = {
     "QW-2025-QIANYU": INVENTORY_REGION_CHINA,
     "QW-2025-ZHAOCAIMAO": INVENTORY_REGION_CHINA,
     "QW-QINSI-1DE1039D20FB": INVENTORY_REGION_CHINA,  # "招财猫店", same warehouse as QW-2025-ZHAOCAIMAO under a later raw name
+    "QW-2026-QIANYU": INVENTORY_REGION_CHINA,  # "2026千羽", QinSi renamed "千羽" for the new calendar year
+    "QW-2026-ZHAOCAIMAO": INVENTORY_REGION_CHINA,  # "2026招财猫", same for "招财猫"
+    "QW-NO-BARCODE": INVENTORY_REGION_CHINA,  # "无条码商品" -- a real China warehouse despite the name; must count
     "QW-NEW-JAPAN": INVENTORY_REGION_JAPAN,
     "LOC-JP-HOME": INVENTORY_REGION_JAPAN,
 }
@@ -201,15 +210,26 @@ def _inventory_entries(raw: dict[str, str | None]) -> list[tuple[str | None, str
 
 def _match_product(
     session: Session, *, code: str | None, jan: str | None, internal_sku: str | None,
-) -> tuple[Product | None, str | None, str]:
-    if code:
-        product = session.scalar(select(Product).where(Product.qinsi_product_code == code))
-        if product is not None:
-            return product, "qinsi_product_code", "matched"
-    if jan:
-        product = session.scalar(select(Product).where(Product.jan == jan))
-        if product is not None:
-            return product, "jan", "matched"
+) -> tuple[Product | None, str | None, str, tuple[Product, Product] | None]:
+    """Cross-validated code/JAN matching.
+
+    code (qinsi_product_code) and jan are independent identity keys -- a row
+    naming both is only a genuine product-identity conflict when they each
+    resolve to a *different* existing Product. Either one hitting alone is a
+    normal match; neither hitting falls back to confirmed_mapping/internal_sku.
+    A conflict never auto-binds product_id; the caller must keep raw values
+    and route it to human review.
+    """
+    by_code = session.scalar(select(Product).where(Product.qinsi_product_code == code)) if code else None
+    by_jan = session.scalar(select(Product).where(Product.jan == jan)) if jan else None
+    if by_code is not None and by_jan is not None:
+        if by_code.id == by_jan.id:
+            return by_code, "code_jan_verified", "matched", None
+        return None, None, "conflict", (by_code, by_jan)
+    if by_code is not None:
+        return by_code, "qinsi_product_code", "matched", None
+    if by_jan is not None:
+        return by_jan, "jan", "matched", None
     if code:
         mapping = session.scalar(
             select(QinsiProductMapping)
@@ -217,12 +237,12 @@ def _match_product(
             .options(selectinload(QinsiProductMapping.product))
         )
         if mapping is not None:
-            return mapping.product, "confirmed_mapping", "matched"
+            return mapping.product, "confirmed_mapping", "matched", None
     if internal_sku:
         product = session.scalar(select(Product).where(Product.internal_sku == internal_sku))
         if product is not None:
-            return product, "internal_sku", "matched"
-    return None, None, "unmatched"
+            return product, "internal_sku", "matched", None
+    return None, None, "unmatched", None
 
 
 def _warehouse(session: Session, name: str | None) -> Location | None:
@@ -252,6 +272,351 @@ def _refresh_snapshot_summary(snapshot: QinsiInventorySnapshot) -> None:
     snapshot.status = "completed_with_issues" if snapshot.unmatched_rows or snapshot.exception_rows else "completed"
 
 
+@dataclass(frozen=True, slots=True)
+class _RowResult:
+    global_row_no: int
+    source_file: str
+    source_row_no: int
+    name: str | None
+    code: str | None
+    jan: str | None
+    internal_sku: str | None
+    warehouse_name: str | None
+    quantity: int | None
+    raw: dict
+    product: Product | None
+    matching_method: str | None
+    matching_status: str
+    conflict_pair: tuple[Product, Product] | None
+    warehouse: Location | None
+    error_notes: tuple[str, ...]
+
+
+def _compute_row_results(
+    session: Session, source_rows: list[tuple[str, int, dict]],
+) -> list[_RowResult]:
+    """Match + duplicate/quantity-conflict detection shared by preview and confirm.
+
+    Runs read-only queries only (Product/QinsiProductMapping/Location lookups)
+    -- safe to call before any snapshot row exists, which is what the
+    multi-file preview step relies on.
+    """
+    expanded: list[dict] = []
+    global_no = 0
+    for source_file, source_row_no, raw in source_rows:
+        name, code, jan, internal_sku = _product_fields(raw)
+        if not any((name, code, jan, internal_sku)):
+            continue
+        product, method, status, conflict_pair = _match_product(
+            session, code=code, jan=jan, internal_sku=internal_sku,
+        )
+        for warehouse_name, raw_quantity in _inventory_entries(raw):
+            global_no += 1
+            try:
+                quantity = _quantity(raw_quantity)
+                qty_error: str | None = None
+            except ValueError as exc:
+                quantity = None
+                qty_error = str(exc)
+            expanded.append({
+                "global_row_no": global_no, "source_file": source_file, "source_row_no": source_row_no,
+                "name": name, "code": code, "jan": jan, "internal_sku": internal_sku,
+                "warehouse_name": warehouse_name, "quantity": quantity, "qty_error": qty_error, "raw": raw,
+                "product": product, "method": method, "status": status, "conflict_pair": conflict_pair,
+            })
+
+    # Type A: fully identical rows (same identity + warehouse + quantity) --
+    # only the first occurrence counts; later copies are excluded from
+    # aggregation so inventory is never double counted.
+    first_seen: dict[tuple, int] = {}
+    for idx, item in enumerate(expanded):
+        key = (item["name"], item["code"], item["jan"], item["warehouse_name"], item["quantity"])
+        item["duplicate_of"] = first_seen.get(key)
+        if item["duplicate_of"] is None:
+            first_seen[key] = idx
+
+    # Type B: same product code + warehouse but disagreeing quantity -- never
+    # silently summed/maxed/last-wins; all rows in the group are excluded
+    # from aggregation until a human resolves which value is correct.
+    qty_groups: dict[tuple, set] = defaultdict(set)
+    qty_group_rows: dict[tuple, list[int]] = defaultdict(list)
+    for idx, item in enumerate(expanded):
+        if item["duplicate_of"] is not None:
+            continue
+        if item["code"] and item["warehouse_name"]:
+            key = (item["code"], item["warehouse_name"])
+            qty_groups[key].add(item["quantity"])
+            qty_group_rows[key].append(idx)
+    conflicted_qty_keys = {key for key, values in qty_groups.items() if len(values) > 1}
+
+    results: list[_RowResult] = []
+    for idx, item in enumerate(expanded):
+        errors: list[str] = []
+        if item["qty_error"]:
+            errors.append(item["qty_error"])
+        if item["quantity"] is None:
+            errors.append("账面数量为空")
+
+        status = item["status"]
+        method = item["method"]
+        product = item["product"]
+        conflict_pair = item["conflict_pair"]
+
+        if item["duplicate_of"] is not None:
+            status, method, product = "ignored", "duplicate", None
+            original_row = expanded[item["duplicate_of"]]["global_row_no"]
+            errors.append(f"完全重复行（与第{original_row}行完全一致），已去重只计一次，本行不计入库存合计")
+        else:
+            key = (item["code"], item["warehouse_name"]) if item["code"] and item["warehouse_name"] else None
+            if key is not None and key in conflicted_qty_keys:
+                status, method, product = "ignored", "quantity_conflict", None
+                seen_qty = sorted(q for q in qty_groups[key] if q is not None)
+                other_rows = [expanded[i]["global_row_no"] for i in qty_group_rows[key] if i != idx]
+                errors.append(
+                    f"同货号同仓库出现不同数量{seen_qty}（另见第{other_rows}行），未自动合并/取最大/取最新，"
+                    "本行不计入库存合计，需人工核实"
+                )
+            elif status == "conflict" and conflict_pair is not None:
+                by_code_product, by_jan_product = conflict_pair
+                errors.append(
+                    f"货号命中商品{by_code_product.internal_sku}，JAN候选命中商品{by_jan_product.internal_sku}，"
+                    "二者不一致，需人工确认后再匹配库存"
+                )
+            elif status == "unmatched":
+                errors.append("未匹配到本地商品")
+
+        warehouse = _warehouse(session, item["warehouse_name"])
+        if warehouse is None:
+            errors.append(f"未知秦丝仓库：{item['warehouse_name'] or '未提供'}")
+
+        results.append(_RowResult(
+            global_row_no=item["global_row_no"], source_file=item["source_file"], source_row_no=item["source_row_no"],
+            name=item["name"], code=item["code"], jan=item["jan"], internal_sku=item["internal_sku"],
+            warehouse_name=item["warehouse_name"], quantity=item["quantity"], raw=item["raw"],
+            product=product, matching_method=method, matching_status=status, conflict_pair=conflict_pair,
+            warehouse=warehouse, error_notes=tuple(dict.fromkeys(errors)),
+        ))
+    return results
+
+
+def _line_from_result(snapshot: QinsiInventorySnapshot, result: _RowResult) -> QinsiInventorySnapshotLine:
+    summary = {key: value for key, value in result.raw.items() if (value or "").strip()}
+    summary["__源文件__"] = result.source_file
+    summary["__源行号__"] = result.source_row_no
+    return QinsiInventorySnapshotLine(
+        snapshot_id=snapshot.id,
+        original_row_no=result.global_row_no,
+        raw_product_name=result.name,
+        jan=result.jan,
+        qinsi_product_code=result.code,
+        internal_sku=result.internal_sku,
+        raw_warehouse_name=result.warehouse_name,
+        quantity=result.quantity,
+        raw_summary_json=json.dumps(summary, ensure_ascii=False, default=str),
+        product_id=result.product.id if result.product else None,
+        warehouse_id=result.warehouse.id if result.warehouse else None,
+        matching_method=result.matching_method,
+        matching_status=result.matching_status,
+        warehouse_status="matched" if result.warehouse else "unknown",
+        error_message="；".join(result.error_notes) or None,
+    )
+
+
+_FILENAME_RANGE_PATTERN = re.compile(r"\((\d+)\s*-\s*(\d+)\)")
+
+
+def _parse_filename_range(filename: str) -> tuple[int, int] | None:
+    match = _FILENAME_RANGE_PATTERN.search(filename)
+    if not match:
+        return None
+    start, end = int(match.group(1)), int(match.group(2))
+    return (start, end) if start <= end else None
+
+
+@dataclass(frozen=True, slots=True)
+class FileRangeInfo:
+    filename: str
+    range: tuple[int, int] | None
+    row_count: int
+
+
+@dataclass(frozen=True, slots=True)
+class MultiFileCompletenessReport:
+    files: tuple[FileRangeInfo, ...]
+    all_ranges_parsed: bool
+    expected_min: int | None
+    expected_max: int | None
+    expected_total_from_ranges: int | None
+    actual_total_rows: int
+    gaps: tuple[tuple[int, int], ...]
+    overlaps: tuple[tuple[int, int, int, int], ...]
+    header_mismatch: bool
+
+    @property
+    def has_blocking_issue(self) -> bool:
+        return bool(self.gaps) or bool(self.overlaps) or self.header_mismatch
+
+
+def analyze_multi_file_completeness(files: list[tuple[str, bytes]]) -> MultiFileCompletenessReport:
+    """Filename-range sanity check for a multi-file snapshot upload.
+
+    Filenames are a hint, never the source of truth for row counts -- the
+    caller still parses every file's actual rows regardless of what this
+    reports. An unparseable filename just can't be range-checked; it is
+    never treated as a gap/overlap/error on its own.
+    """
+    infos: list[FileRangeInfo] = []
+    headers_seen: set[tuple[str, ...]] = set()
+    ranges: list[tuple[int, int]] = []
+    for filename, content in files:
+        parsed = parse_qinsi_workbook(content)
+        # The legacy qinsi_goods_template format's last header cell holds the
+        # sheet's single warehouse NAME (a data value), not a real column
+        # header -- comparing it across files would flag every legitimate
+        # multi-warehouse merge of that format as a header mismatch.
+        comparable_headers = parsed.headers[:-1] if parsed.source_format == "qinsi_goods_template" else parsed.headers
+        headers_seen.add(comparable_headers)
+        row_range = _parse_filename_range(filename)
+        infos.append(FileRangeInfo(filename=Path(filename).name, range=row_range, row_count=len(parsed.rows)))
+        if row_range:
+            ranges.append(row_range)
+
+    all_ranges_parsed = bool(files) and len(ranges) == len(files)
+    ranges_sorted = sorted(ranges)
+    overlaps: list[tuple[int, int, int, int]] = []
+    for i in range(len(ranges_sorted)):
+        for j in range(i + 1, len(ranges_sorted)):
+            a_start, a_end = ranges_sorted[i]
+            b_start, b_end = ranges_sorted[j]
+            if b_start <= a_end:
+                overlaps.append((a_start, a_end, b_start, b_end))
+    gaps: list[tuple[int, int]] = []
+    running_end: int | None = None
+    for start, end in ranges_sorted:
+        if running_end is not None and start > running_end + 1:
+            gaps.append((running_end + 1, start - 1))
+        running_end = max(running_end, end) if running_end is not None else end
+
+    return MultiFileCompletenessReport(
+        files=tuple(infos),
+        all_ranges_parsed=all_ranges_parsed,
+        expected_min=ranges_sorted[0][0] if ranges_sorted else None,
+        expected_max=ranges_sorted[-1][1] if ranges_sorted else None,
+        expected_total_from_ranges=sum(end - start + 1 for start, end in ranges) if ranges else None,
+        actual_total_rows=sum(info.row_count for info in infos),
+        gaps=tuple(gaps),
+        overlaps=tuple(overlaps),
+        header_mismatch=len(headers_seen) > 1,
+    )
+
+
+def _validate_upload_files(files: list[tuple[str, bytes]], settings: InventorySettings) -> None:
+    if not files:
+        raise ValueError("至少需要一个Excel文件")
+    for filename, content in files:
+        extension = Path(filename or "").suffix.lower()
+        if extension not in settings.allowed_extensions:
+            raise ValueError(f"只允许上传：{', '.join(settings.allowed_extensions)}（{filename or '未命名文件'}）")
+        if not content or len(content) > settings.max_upload_bytes:
+            raise ValueError(f"Excel文件为空或超过允许大小（{filename or '未命名文件'}）")
+
+
+def _combined_file_hash(files: list[tuple[str, bytes]]) -> str:
+    if len(files) == 1:
+        return hashlib.sha256(files[0][1]).hexdigest()
+    digest = hashlib.sha256()
+    for name, content in sorted(files, key=lambda item: item[0]):
+        digest.update(f"{Path(name).name}:{len(content)}:".encode("utf-8"))
+        digest.update(hashlib.sha256(content).digest())
+    return digest.hexdigest()
+
+
+@dataclass(frozen=True, slots=True)
+class InventorySnapshotPreview:
+    completeness: MultiFileCompletenessReport
+    total_rows: int
+    matched_count: int
+    unmatched_count: int
+    conflict_count: int
+    duplicate_count: int
+    quantity_conflict_count: int
+    method_counts: dict[str, int]
+    warehouse_counts: dict[str, tuple[int, int]]
+    china_quantity: int
+    japan_quantity: int
+    unclassified_quantity: int
+    conflicts: tuple[_RowResult, ...]
+    duplicates: tuple[_RowResult, ...]
+    quantity_conflicts: tuple[_RowResult, ...]
+
+
+def preview_inventory_snapshot_files(
+    session: Session, files: list[tuple[str, bytes]],
+) -> InventorySnapshotPreview:
+    """Read-only dry run: parses + matches every row but writes nothing."""
+    settings = inventory_settings()
+    _validate_upload_files(files, settings)
+    completeness = analyze_multi_file_completeness(files)
+
+    source_rows: list[tuple[str, int, dict]] = []
+    for filename, content in files:
+        for row_no, raw in read_product_sheet(content):
+            source_rows.append((Path(filename).name, row_no, raw))
+    results = _compute_row_results(session, source_rows)
+
+    method_counts: dict[str, int] = {}
+    warehouse_counts: dict[str, list[int]] = {}
+    china_quantity = japan_quantity = unclassified_quantity = 0
+    matched = unmatched = conflict = duplicate = quantity_conflict = 0
+    conflicts: list[_RowResult] = []
+    duplicates: list[_RowResult] = []
+    quantity_conflicts: list[_RowResult] = []
+
+    for result in results:
+        method_key = result.matching_method or result.matching_status
+        method_counts[method_key] = method_counts.get(method_key, 0) + 1
+        if result.matching_status == "matched":
+            matched += 1
+        elif result.matching_status == "unmatched":
+            unmatched += 1
+        elif result.matching_status == "conflict":
+            conflict += 1
+            conflicts.append(result)
+        elif result.matching_status == "ignored":
+            if result.matching_method == "duplicate":
+                duplicate += 1
+                duplicates.append(result)
+            elif result.matching_method == "quantity_conflict":
+                quantity_conflict += 1
+                quantity_conflicts.append(result)
+        # Warehouse/region totals reflect QinSi's own reported stock per
+        # warehouse -- every row with a resolved warehouse + a real quantity
+        # counts, whether or not it matched a local Product yet. Rows
+        # collapsed as duplicate/quantity-conflict ("ignored") are excluded
+        # so nothing is double counted or guessed.
+        if result.warehouse is not None and result.quantity is not None and result.matching_status != "ignored":
+            bucket = warehouse_counts.setdefault(result.warehouse.display_name, [0, 0])
+            bucket[0] += 1
+            bucket[1] += result.quantity
+            region = inventory_region_for_location(result.warehouse)
+            if region == INVENTORY_REGION_CHINA:
+                china_quantity += result.quantity
+            elif region == INVENTORY_REGION_JAPAN:
+                japan_quantity += result.quantity
+            else:
+                unclassified_quantity += result.quantity
+
+    return InventorySnapshotPreview(
+        completeness=completeness, total_rows=len(results),
+        matched_count=matched, unmatched_count=unmatched, conflict_count=conflict,
+        duplicate_count=duplicate, quantity_conflict_count=quantity_conflict,
+        method_counts=method_counts,
+        warehouse_counts={name: (value[0], value[1]) for name, value in warehouse_counts.items()},
+        china_quantity=china_quantity, japan_quantity=japan_quantity, unclassified_quantity=unclassified_quantity,
+        conflicts=tuple(conflicts), duplicates=tuple(duplicates), quantity_conflicts=tuple(quantity_conflicts),
+    )
+
+
 def create_inventory_snapshot(
     session: Session,
     filename: str,
@@ -260,71 +625,63 @@ def create_inventory_snapshot(
     data_at: datetime | None = None,
     now: datetime | None = None,
 ) -> tuple[QinsiInventorySnapshot, bool]:
+    return create_inventory_snapshot_from_files(session, [(filename, content)], data_at=data_at, now=now)
+
+
+def create_inventory_snapshot_from_files(
+    session: Session,
+    files: list[tuple[str, bytes]],
+    *,
+    data_at: datetime | None = None,
+    now: datetime | None = None,
+) -> tuple[QinsiInventorySnapshot, bool]:
+    """Create exactly one snapshot from one or more source files.
+
+    Multiple files are treated as segments of a single QinSi export taken at
+    one point in time: one snapshot_id, one imported_at/data_at, matching and
+    duplicate detection run across the merged row set, never per file.
+    """
     settings = inventory_settings()
-    extension = Path(filename or "").suffix.lower()
-    if extension not in settings.allowed_extensions:
-        raise ValueError(f"只允许上传：{', '.join(settings.allowed_extensions)}")
-    if not content or len(content) > settings.max_upload_bytes:
-        raise ValueError("Excel文件为空或超过允许大小")
-    file_hash = hashlib.sha256(content).hexdigest()
+    _validate_upload_files(files, settings)
+    file_hash = _combined_file_hash(files)
     existing = session.scalar(select(QinsiInventorySnapshot).where(QinsiInventorySnapshot.file_hash == file_hash))
     if existing is not None:
         if settings.reuse_duplicate_file:
             return existing, True
-        raise ValueError("该文件已导入，当前配置禁止重复文件复用")
-    rows = read_product_sheet(content)
+        raise ValueError("该文件（组合）已导入，当前配置禁止重复文件复用")
+
     imported_at = now or datetime.now(timezone.utc)
+    if len(files) == 1:
+        original_filename = Path(files[0][0]).name[:255]
+        file_content = files[0][1]
+    else:
+        buffer = io.BytesIO()
+        with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as archive:
+            for name, content in files:
+                archive.writestr(Path(name).name, content)
+        file_content = buffer.getvalue()
+        original_filename = f"秦丝库存快照_合并{len(files)}个文件_{imported_at:%Y%m%d}.zip"[:255]
+
     snapshot = QinsiInventorySnapshot(
         batch_no=f"QS-{imported_at:%Y%m%d}-{uuid.uuid4().hex[:10].upper()}",
-        original_filename=Path(filename).name[:255],
+        original_filename=original_filename,
         file_hash=file_hash,
-        file_content=content,
+        file_content=file_content,
         imported_at=imported_at,
         data_at=data_at,
         status="completed",
     )
     session.add(snapshot)
     session.flush()
-    for row_no, raw in rows:
-        name, code, jan, internal_sku = _product_fields(raw)
-        if not any((name, code, jan, internal_sku)):
-            continue
-        product, method, matching_status = _match_product(
-            session, code=code, jan=jan, internal_sku=internal_sku,
-        )
-        for warehouse_name, raw_quantity in _inventory_entries(raw):
-            errors: list[str] = []
-            try:
-                quantity = _quantity(raw_quantity)
-            except ValueError as exc:
-                quantity = None
-                errors.append(str(exc))
-            if quantity is None:
-                errors.append("账面数量为空")
-            warehouse = _warehouse(session, warehouse_name)
-            if warehouse is None:
-                errors.append(f"未知秦丝仓库：{warehouse_name or '未提供'}")
-            if matching_status == "unmatched":
-                errors.append("未匹配到本地商品")
-            summary = {key: value for key, value in raw.items() if (value or "").strip()}
-            line = QinsiInventorySnapshotLine(
-                snapshot_id=snapshot.id,
-                original_row_no=row_no,
-                raw_product_name=name,
-                jan=jan,
-                qinsi_product_code=code,
-                internal_sku=internal_sku,
-                raw_warehouse_name=warehouse_name,
-                quantity=quantity,
-                raw_summary_json=json.dumps(summary, ensure_ascii=False),
-                product_id=product.id if product else None,
-                warehouse_id=warehouse.id if warehouse else None,
-                matching_method=method,
-                matching_status=matching_status,
-                warehouse_status="matched" if warehouse else "unknown",
-                error_message="；".join(dict.fromkeys(errors)) or None,
-            )
-            snapshot.lines.append(line)
+
+    source_rows: list[tuple[str, int, dict]] = []
+    for filename, content in files:
+        for row_no, raw in read_product_sheet(content):
+            source_rows.append((Path(filename).name, row_no, raw))
+
+    for result in _compute_row_results(session, source_rows):
+        snapshot.lines.append(_line_from_result(snapshot, result))
+
     _refresh_snapshot_summary(snapshot)
     try:
         session.commit()
@@ -353,6 +710,94 @@ def get_inventory_snapshot(session: Session, snapshot_id: int) -> QinsiInventory
             selectinload(QinsiInventorySnapshot.lines).selectinload(QinsiInventorySnapshotLine.warehouse),
         )
     )
+
+
+def get_inventory_snapshot_summary(session: Session, snapshot_id: int) -> QinsiInventorySnapshot | None:
+    """Same snapshot row as get_inventory_snapshot, but WITHOUT eager-loading
+    every line -- for the detail/review pages, which only need the snapshot's
+    own summary columns (total_rows/success_rows/... are precomputed at
+    import/retry time, not derived from .lines) plus a paginated line query."""
+    return session.get(QinsiInventorySnapshot, snapshot_id)
+
+
+SNAPSHOT_LINE_PAGE_SIZES = (10, 20, 50, 100)
+DEFAULT_SNAPSHOT_LINE_PAGE_SIZE = 20
+
+
+@dataclass(frozen=True, slots=True)
+class SnapshotLinesPage:
+    lines: list[QinsiInventorySnapshotLine]
+    total_count: int
+    page: int
+    page_size: int
+
+    @property
+    def total_pages(self) -> int:
+        return max(1, -(-self.total_count // self.page_size))
+
+
+def get_inventory_snapshot_lines_page(
+    session: Session, snapshot_id: int, *, matching_status: str | None = None, warehouse_id: int | None = None,
+    name_query: str | None = None, jan_query: str | None = None, qinsi_code_query: str | None = None,
+    actionable_only: bool = False, page: int = 1, page_size: int = DEFAULT_SNAPSHOT_LINE_PAGE_SIZE,
+) -> SnapshotLinesPage:
+    """Real SQL-level pagination -- never loads the whole (potentially
+    thousands-of-rows) line set to slice it in Python or hide rows with CSS.
+    Filtering happens in the WHERE clause too, so the count/pages reflect the
+    filtered set, not the whole snapshot.
+
+    actionable_only reproduces the review page's original in-memory filter
+    (unmatched/conflict OR a warehouse that still needs mapping) -- it takes
+    priority over matching_status, since the review page is inherently about
+    "still needs a human decision" rather than one single status value.
+    """
+    page_size = page_size if page_size in SNAPSHOT_LINE_PAGE_SIZES else DEFAULT_SNAPSHOT_LINE_PAGE_SIZE
+    page = max(1, page)
+
+    conditions = [QinsiInventorySnapshotLine.snapshot_id == snapshot_id]
+    if actionable_only:
+        conditions.append(or_(
+            QinsiInventorySnapshotLine.matching_status.in_(("unmatched", "conflict")),
+            QinsiInventorySnapshotLine.warehouse_status != "matched",
+        ))
+    elif matching_status and matching_status != "all":
+        conditions.append(QinsiInventorySnapshotLine.matching_status == matching_status)
+    if warehouse_id:
+        conditions.append(QinsiInventorySnapshotLine.warehouse_id == warehouse_id)
+    if name_query:
+        conditions.append(QinsiInventorySnapshotLine.raw_product_name.like(f"%{name_query}%"))
+    if jan_query:
+        conditions.append(QinsiInventorySnapshotLine.jan.like(f"%{jan_query}%"))
+    if qinsi_code_query:
+        conditions.append(QinsiInventorySnapshotLine.qinsi_product_code.like(f"%{qinsi_code_query}%"))
+
+    total_count = session.scalar(
+        select(func.count()).select_from(QinsiInventorySnapshotLine).where(*conditions)
+    ) or 0
+    lines = list(session.scalars(
+        select(QinsiInventorySnapshotLine).where(*conditions)
+        .options(selectinload(QinsiInventorySnapshotLine.product), selectinload(QinsiInventorySnapshotLine.warehouse))
+        .order_by(QinsiInventorySnapshotLine.original_row_no)
+        .limit(page_size).offset((page - 1) * page_size)
+    ))
+    return SnapshotLinesPage(lines=lines, total_count=total_count, page=page, page_size=page_size)
+
+
+def get_snapshot_warehouse_distribution(session: Session, snapshot_id: int) -> dict[str, int]:
+    """Quantity per warehouse across the WHOLE snapshot (never affected by line
+    pagination/filters) -- a SQL GROUP BY, not a Python loop over every row."""
+    warehouse_name = func.coalesce(Location.display_name, QinsiInventorySnapshotLine.raw_warehouse_name, "未知仓库")
+    rows = session.execute(
+        select(warehouse_name, func.coalesce(func.sum(QinsiInventorySnapshotLine.quantity), 0))
+        .select_from(QinsiInventorySnapshotLine)
+        .outerjoin(Location, Location.id == QinsiInventorySnapshotLine.warehouse_id)
+        .where(
+            QinsiInventorySnapshotLine.snapshot_id == snapshot_id,
+            QinsiInventorySnapshotLine.matching_status != "ignored",
+        )
+        .group_by(warehouse_name)
+    ).all()
+    return {name: int(quantity) for name, quantity in rows}
 
 
 def manual_match_line(session: Session, line_id: int, product_id: int) -> QinsiInventorySnapshotLine:
@@ -386,6 +831,16 @@ def manual_match_line(session: Session, line_id: int, product_id: int) -> QinsiI
 
 def _line_errors_without(line: QinsiInventorySnapshotLine, text: str) -> str | None:
     values = [value for value in (line.error_message or "").split("；") if value and value != text]
+    return "；".join(values) or None
+
+
+def _clear_matching_errors(line: QinsiInventorySnapshotLine) -> str | None:
+    values = [
+        value for value in (line.error_message or "").split("；")
+        if value
+        and value != "未匹配到本地商品"
+        and not value.startswith("货号命中商品")
+    ]
     return "；".join(values) or None
 
 
@@ -426,6 +881,10 @@ def ignore_snapshot_lines(session: Session, snapshot_id: int, line_ids: set[int]
 
 
 def retry_snapshot_matching(session: Session, snapshot_id: int) -> int:
+    """Recompute unmatched/conflict lines. Never bypasses a conflict: a row
+    that still resolves to two different products stays matching_status
+    "conflict" (with refreshed candidate info), it is not silently promoted
+    to matched."""
     snapshot = get_inventory_snapshot(session, snapshot_id)
     if snapshot is None:
         raise LookupError("库存快照不存在")
@@ -433,15 +892,26 @@ def retry_snapshot_matching(session: Session, snapshot_id: int) -> int:
     for line in snapshot.lines:
         if line.matching_status not in {"unmatched", "conflict"}:
             continue
-        product, method, status = _match_product(
+        product, method, status, conflict_pair = _match_product(
             session, code=line.qinsi_product_code, jan=line.jan, internal_sku=line.internal_sku,
         )
-        if product is not None:
+        if status == "matched" and product is not None:
             line.product_id = product.id
             line.matching_method = method
             line.matching_status = status
-            line.error_message = _line_errors_without(line, "未匹配到本地商品")
+            line.error_message = _clear_matching_errors(line)
             matched += 1
+        elif status == "conflict" and conflict_pair is not None:
+            by_code_product, by_jan_product = conflict_pair
+            line.product_id = None
+            line.matching_method = None
+            line.matching_status = "conflict"
+            note = (
+                f"货号命中商品{by_code_product.internal_sku}，JAN候选命中商品{by_jan_product.internal_sku}，"
+                "二者不一致，需人工确认后再匹配库存"
+            )
+            kept = _clear_matching_errors(line)
+            line.error_message = "；".join(dict.fromkeys(value for value in (kept, note) if value))
     _refresh_snapshot_summary(snapshot)
     session.commit()
     return matched
