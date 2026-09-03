@@ -79,3 +79,20 @@ def test_widget_never_auto_selects_top1():
     # code path that calls onSelect without a click.
     assert js.count("onSelect(") == 1
     assert "results[0]" not in js
+
+
+# ==================== no_similar_results (similarity-threshold filtering) ====================
+
+def test_widget_handles_no_similar_results_status():
+    js = _read("app/static/image_product_search.js")
+    assert '"no_similar_results"' in js
+    assert "没有找到足够相似的商品" in js
+
+
+def test_widget_has_no_dead_low_similarity_hint():
+    """The 0.5 client-side 'low similarity' hint became unreachable once the
+    backend enforces a 0.82 floor on everything it returns -- must not
+    linger as dead/misleading code."""
+    js = _read("app/static/image_product_search.js")
+    assert "similarity_score < 0.5" not in js
+    assert "结果相似度较低" not in js

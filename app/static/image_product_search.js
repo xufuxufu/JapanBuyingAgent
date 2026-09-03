@@ -80,6 +80,12 @@
         status.textContent = payload.message || "图片搜索暂时不可用，请稍后重试。";
         return;
       }
+      if (payload.status === "no_similar_results") {
+        status.hidden = true;
+        hint.hidden = false;
+        hint.textContent = payload.message || "没有找到足够相似的商品，请重新拍照或使用文字搜索。";
+        return;
+      }
       const items = payload.results || [];
       status.hidden = true;
       if (!items.length) {
@@ -89,10 +95,6 @@
       }
       hint.hidden = false;
       hint.textContent = "找到以下相似商品，请选择";
-      const lowSimilarity = items.every((item) => item.similarity_score < 0.5);
-      if (lowSimilarity) {
-        hint.textContent += "（结果相似度较低，请人工确认）";
-      }
       results.hidden = false;
       items.forEach((item) => {
         const card = document.createElement("article");

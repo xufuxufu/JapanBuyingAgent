@@ -72,6 +72,36 @@ def _fake_embed_one_hot(images):
     return out
 
 
+def _write_index_with_similarities(index_dir, product_ids: list[int], similarities: list[float]):
+    """Index whose i-th vector has EXACT cosine similarity similarities[i] to
+    the query vector used by _fake_embed_axis0 (both live on the unit circle
+    spanned by axes 0/1, padded with zeros) -- lets tests assert precise
+    threshold-filtering behaviour instead of just "some ranking"."""
+    import faiss
+    dim = 512
+    vectors = np.zeros((len(product_ids), dim), dtype=np.float32)
+    for i, sim in enumerate(similarities):
+        sim = max(-1.0, min(1.0, sim))
+        vectors[i, 0] = sim
+        vectors[i, 1] = (1 - sim ** 2) ** 0.5
+    idx = faiss.IndexFlatIP(dim)
+    idx.add(vectors)
+    faiss.write_index(idx, str(index_dir / "products.faiss"))
+    (index_dir / "product_image_map.json").write_text(json.dumps(product_ids), encoding="utf-8")
+    (index_dir / "index_meta.json").write_text(json.dumps({
+        "built_at": "2026-01-01T00:00:00+00:00", "model_name": "fake-test-model",
+        "embedding_dim": dim, "product_count": len(product_ids), "image_count": len(product_ids),
+        "skipped_no_image": 0, "failed_image_download": 0, "duration_seconds": 0.1,
+    }), encoding="utf-8")
+
+
+def _fake_embed_axis0(images):
+    dim = 512
+    out = np.zeros((len(images), dim), dtype=np.float32)
+    out[:, 0] = 1.0
+    return out
+
+
 # ==================== no index -> friendly, no 500 ====================
 
 def test_image_search_api_returns_friendly_status_without_index(client, isolated_index_paths):
@@ -197,25 +227,9 @@ def test_image_search_api_similarity_field_present_and_descending(client, isolat
     for p in products:
         db.refresh(p)
 
-    import faiss
-    dim = 512
-    vectors = np.zeros((3, dim), dtype=np.float32)
-    vectors[0, 0] = 1.0
-    vectors[1, 0], vectors[1, 1] = 0.8, 0.2
-    vectors[1] /= np.linalg.norm(vectors[1])
-    vectors[2, 1] = 1.0
-    idx = faiss.IndexFlatIP(dim)
-    idx.add(vectors)
-    faiss.write_index(idx, str(isolated_index_paths / "products.faiss"))
-    (isolated_index_paths / "product_image_map.json").write_text(
-        json.dumps([p.id for p in products]), encoding="utf-8",
-    )
-    (isolated_index_paths / "index_meta.json").write_text(json.dumps({
-        "built_at": "t", "model_name": "fake", "embedding_dim": dim,
-        "product_count": 3, "image_count": 3, "skipped_no_image": 0, "failed_image_download": 0,
-        "duration_seconds": 0.1,
-    }), encoding="utf-8")
-    monkeypatch.setattr(image_search, "embed_images", _fake_embed_one_hot)
+    # all three above the 0.82 default threshold, distinct order
+    _write_index_with_similarities(isolated_index_paths, [p.id for p in products], [0.95, 0.90, 0.85])
+    monkeypatch.setattr(image_search, "embed_images", _fake_embed_axis0)
 
     response = http.post(
         "/api/products/image-search",
@@ -239,8 +253,10 @@ def test_image_search_api_top_k_default_is_ten(client, isolated_index_paths, mon
         db.flush()
         ids.append(p.id)
     db.commit()
-    _write_fake_index_for_products(isolated_index_paths, ids)
-    monkeypatch.setattr(image_search, "embed_images", _fake_embed_one_hot)
+    # all 15 above threshold so top_k's default ceiling (not the threshold) is what's tested
+    similarities = [0.99 - i * 0.005 for i in range(15)]
+    _write_index_with_similarities(isolated_index_paths, ids, similarities)
+    monkeypatch.setattr(image_search, "embed_images", _fake_embed_axis0)
 
     response = http.post("/api/products/image-search", files={"image": ("q.jpg", jpeg_bytes(), "image/jpeg")})
     assert len(response.json()["results"]) == image_search.TOP_K_DEFAULT
@@ -255,8 +271,11 @@ def test_image_search_api_top_k_clamped_to_max(client, isolated_index_paths, mon
         db.flush()
         ids.append(p.id)
     db.commit()
-    _write_fake_index_for_products(isolated_index_paths, ids)
-    monkeypatch.setattr(image_search, "embed_images", _fake_embed_one_hot)
+    # top 20 comfortably above threshold, remaining 10 far below -- FAISS's
+    # own top_k=20 cap (clamped from 999) never even considers those 10.
+    similarities = [0.95 - i * 0.003 for i in range(20)] + [0.3] * 10
+    _write_index_with_similarities(isolated_index_paths, ids, similarities)
+    monkeypatch.setattr(image_search, "embed_images", _fake_embed_axis0)
 
     response = http.post(
         "/api/products/image-search",
@@ -287,3 +306,54 @@ def test_index_status_endpoint_reports_no_index(client, isolated_index_paths):
     assert payload["exists"] is False
     assert payload["building"] is False
     assert payload["meta"] is None
+
+
+# ==================== similarity threshold at the API layer ====================
+
+def test_image_search_api_returns_no_similar_results_when_all_below_threshold(
+    client, isolated_index_paths, monkeypatch,
+):
+    http, db, _tmp = client
+    product = Product(internal_sku="IMGAPI-LOWSIM-001", name_cn="低相似度测试")
+    db.add(product)
+    db.commit()
+    db.refresh(product)
+
+    _write_index_with_similarities(isolated_index_paths, [product.id], [0.5])
+    monkeypatch.setattr(image_search, "embed_images", _fake_embed_axis0)
+
+    response = http.post(
+        "/api/products/image-search",
+        files={"image": ("q.jpg", jpeg_bytes(), "image/jpeg")},
+    )
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["status"] == "no_similar_results"
+    assert payload["results"] == []
+    assert "没有找到足够相似的商品" in payload["message"]
+
+
+def test_image_search_api_drops_below_threshold_keeps_above(client, isolated_index_paths, monkeypatch):
+    http, db, _tmp = client
+    products = []
+    for i in range(4):
+        p = Product(internal_sku=f"IMGAPI-THRESH-{i}")
+        db.add(p)
+        products.append(p)
+    db.commit()
+    for p in products:
+        db.refresh(p)
+    ids = [p.id for p in products]
+
+    _write_index_with_similarities(isolated_index_paths, ids, [0.90, 0.88, 0.84, 0.80])
+    monkeypatch.setattr(image_search, "embed_images", _fake_embed_axis0)
+
+    response = http.post(
+        "/api/products/image-search",
+        files={"image": ("q.jpg", jpeg_bytes(), "image/jpeg")},
+    )
+    payload = response.json()
+    assert payload["status"] == "ok"
+    result_ids = [r["product_id"] for r in payload["results"]]
+    assert result_ids == ids[:3]
+    assert all(r["similarity_score"] >= 0.82 for r in payload["results"])

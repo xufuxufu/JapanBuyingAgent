@@ -79,6 +79,24 @@ def _write_fake_faiss_index(index_dir, vectors: np.ndarray, product_ids: list[in
     }), encoding="utf-8")
 
 
+def _vectors_for_similarities(similarities: list[float], dim: int = 2) -> np.ndarray:
+    """Vectors on the unit circle (axes 0/1, zero elsewhere) with EXACT
+    cosine similarity to the query [1,0,...,0] equal to each requested
+    value -- lets tests assert precise threshold-filtering behaviour."""
+    vectors = np.zeros((len(similarities), dim), dtype=np.float32)
+    for i, sim in enumerate(similarities):
+        sim = max(-1.0, min(1.0, sim))
+        vectors[i, 0] = sim
+        vectors[i, 1] = (1 - sim ** 2) ** 0.5
+    return vectors
+
+
+def _axis0_query(dim: int = 2) -> np.ndarray:
+    vec = np.zeros((1, dim), dtype=np.float32)
+    vec[0, 0] = 1.0
+    return vec
+
+
 def _make_product_with_local_image(db, image_dir, filename, *, sku, color=(10, 20, 30)):
     path = image_dir / filename
     path.write_bytes(jpeg_bytes(color))
@@ -160,37 +178,32 @@ def test_validate_query_image_rejects_over_10mb():
 # ==================== 7-9. top_k defaults / clamping / ordering ====================
 
 def test_search_similar_products_default_top_k(isolated_index_paths, monkeypatch):
-    dim = 2
-    rng = np.random.default_rng(0)
-    vectors = rng.normal(size=(15, dim)).astype(np.float32)
-    vectors = vectors / np.linalg.norm(vectors, axis=1, keepdims=True)
+    # all 15 comfortably above the 0.82 threshold so top_k's ceiling (not
+    # the threshold) is what's under test here
+    similarities = [0.99 - i * 0.005 for i in range(15)]
+    vectors = _vectors_for_similarities(similarities)
     _write_fake_faiss_index(isolated_index_paths, vectors, list(range(1, 16)))
-    monkeypatch.setattr(image_search, "embed_images", lambda images: np.array([[1.0, 0.0]], dtype=np.float32))
+    monkeypatch.setattr(image_search, "embed_images", lambda images: _axis0_query())
     hits = image_search.search_similar_products(Image.new("RGB", (8, 8)))
     assert len(hits) == TOP_K_DEFAULT
 
 
 def test_search_similar_products_clamps_top_k_to_max(isolated_index_paths, monkeypatch):
-    dim = 2
-    rng = np.random.default_rng(1)
-    vectors = rng.normal(size=(30, dim)).astype(np.float32)
-    vectors = vectors / np.linalg.norm(vectors, axis=1, keepdims=True)
+    # top 25 above threshold, remaining 5 far below -- FAISS's own top_k=20
+    # cap (clamped from 999) never even considers those low ones.
+    similarities = [0.97 - i * 0.004 for i in range(25)] + [0.3] * 5
+    vectors = _vectors_for_similarities(similarities)
     _write_fake_faiss_index(isolated_index_paths, vectors, list(range(1, 31)))
-    monkeypatch.setattr(image_search, "embed_images", lambda images: np.array([[1.0, 0.0]], dtype=np.float32))
+    monkeypatch.setattr(image_search, "embed_images", lambda images: _axis0_query())
     hits = image_search.search_similar_products(Image.new("RGB", (8, 8)), top_k=999)
     assert len(hits) == TOP_K_MAX
 
 
 def test_search_similar_products_orders_by_similarity_descending(isolated_index_paths, monkeypatch):
-    vectors = np.array([
-        [1.0, 0.0, 0.0, 0.0],
-        [0.9, 0.1, 0.0, 0.0],
-        [0.0, 1.0, 0.0, 0.0],
-        [-1.0, 0.0, 0.0, 0.0],
-    ], dtype=np.float32)
-    vectors = vectors / np.linalg.norm(vectors, axis=1, keepdims=True)
+    # all four above threshold, distinct order
+    vectors = _vectors_for_similarities([0.99, 0.95, 0.90, 0.85])
     _write_fake_faiss_index(isolated_index_paths, vectors, [101, 102, 103, 104])
-    monkeypatch.setattr(image_search, "embed_images", lambda images: np.array([[1.0, 0.0, 0.0, 0.0]], dtype=np.float32))
+    monkeypatch.setattr(image_search, "embed_images", lambda images: _axis0_query())
     hits = image_search.search_similar_products(Image.new("RGB", (8, 8)), top_k=10)
     assert [hit.product_id for hit in hits] == [101, 102, 103, 104]
     sims = [hit.similarity for hit in hits]
@@ -364,3 +377,65 @@ def test_build_index_concurrent_mixed_failures_do_not_abort(
     assert result.indexed_products + result.failed_image_download == 10
     assert result.failed_image_download > 0
     assert result.indexed_products > 0
+
+
+# ==================== similarity threshold filtering ====================
+
+def test_min_similarity_threshold_default_is_082():
+    assert image_search.min_similarity_threshold() == pytest.approx(0.82)
+
+
+def test_min_similarity_threshold_env_override(monkeypatch):
+    monkeypatch.setenv("JBA_IMAGE_SEARCH_MIN_SIMILARITY", "0.9")
+    assert image_search.min_similarity_threshold() == pytest.approx(0.9)
+
+
+def test_min_similarity_threshold_ignores_invalid_env(monkeypatch):
+    monkeypatch.setenv("JBA_IMAGE_SEARCH_MIN_SIMILARITY", "not-a-number")
+    assert image_search.min_similarity_threshold() == pytest.approx(0.82)
+
+
+def test_threshold_drops_candidates_below_082_keeps_above(isolated_index_paths, monkeypatch):
+    """0.90, 0.88, 0.84, 0.80 with threshold=0.82 -> only the first three survive."""
+    vectors = _vectors_for_similarities([0.90, 0.88, 0.84, 0.80])
+    _write_fake_faiss_index(isolated_index_paths, vectors, [201, 202, 203, 204])
+    monkeypatch.setattr(image_search, "embed_images", lambda images: _axis0_query())
+    hits = image_search.search_similar_products(Image.new("RGB", (8, 8)), top_k=10)
+    assert [hit.product_id for hit in hits] == [201, 202, 203]
+    assert all(hit.similarity >= 0.82 for hit in hits)
+
+
+def test_threshold_all_below_082_returns_empty(isolated_index_paths, monkeypatch):
+    vectors = _vectors_for_similarities([0.81, 0.79, 0.70])
+    _write_fake_faiss_index(isolated_index_paths, vectors, [301, 302, 303])
+    monkeypatch.setattr(image_search, "embed_images", lambda images: _axis0_query())
+    hits = image_search.search_similar_products(Image.new("RGB", (8, 8)), top_k=10)
+    assert hits == []
+
+
+def test_threshold_single_candidate_above_082_returned(isolated_index_paths, monkeypatch):
+    vectors = _vectors_for_similarities([0.91])
+    _write_fake_faiss_index(isolated_index_paths, vectors, [401])
+    monkeypatch.setattr(image_search, "embed_images", lambda images: _axis0_query())
+    hits = image_search.search_similar_products(Image.new("RGB", (8, 8)), top_k=10)
+    assert len(hits) == 1
+    assert hits[0].product_id == 401
+
+
+def test_threshold_filtered_results_still_strictly_descending(isolated_index_paths, monkeypatch):
+    vectors = _vectors_for_similarities([0.99, 0.90, 0.83, 0.60])
+    _write_fake_faiss_index(isolated_index_paths, vectors, [501, 502, 503, 504])
+    monkeypatch.setattr(image_search, "embed_images", lambda images: _axis0_query())
+    hits = image_search.search_similar_products(Image.new("RGB", (8, 8)), top_k=10)
+    sims = [hit.similarity for hit in hits]
+    assert sims == sorted(sims, reverse=True)
+    assert len(hits) == 3  # the 0.60 one is dropped
+
+
+def test_threshold_top_k_ten_but_only_three_above_threshold(isolated_index_paths, monkeypatch):
+    similarities = [0.90, 0.88, 0.84] + [0.5] * 7  # 10 candidates total, only 3 survive
+    vectors = _vectors_for_similarities(similarities)
+    _write_fake_faiss_index(isolated_index_paths, vectors, list(range(601, 611)))
+    monkeypatch.setattr(image_search, "embed_images", lambda images: _axis0_query())
+    hits = image_search.search_similar_products(Image.new("RGB", (8, 8)), top_k=10)
+    assert len(hits) == 3

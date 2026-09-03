@@ -3217,6 +3217,13 @@ async def api_products_image_search(
         logger.exception("image_search 查询发生未预期错误")
         return {"status": "error", "message": "图片搜索暂时不可用，请稍后重试。", "query": {"top_k": top_k}, "results": []}
 
+    if not hits:
+        return {
+            "status": "no_similar_results",
+            "message": "没有找到足够相似的商品，请重新拍照或使用文字搜索。",
+            "query": {"top_k": top_k}, "results": [],
+        }
+
     product_ids = [hit.product_id for hit in hits]
     products_by_id = {p.id: p for p in db.scalars(select(Product).where(Product.id.in_(product_ids)))} if product_ids else {}
     inventory_by_id = reference_inventory_for_products(db, product_ids)
@@ -3226,6 +3233,12 @@ async def api_products_image_search(
         if product is None:
             continue
         results.append(_image_search_result_payload(product, similarity=hit.similarity, inventory_by_id=inventory_by_id))
+    if not results:
+        return {
+            "status": "no_similar_results",
+            "message": "没有找到足够相似的商品，请重新拍照或使用文字搜索。",
+            "query": {"top_k": top_k}, "results": [],
+        }
     return {"status": "ok", "query": {"top_k": top_k}, "results": results}
 
 

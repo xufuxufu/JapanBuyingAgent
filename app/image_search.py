@@ -59,6 +59,13 @@ MAX_QUERY_IMAGE_BYTES = 10 * 1024 * 1024
 ALLOWED_QUERY_FORMATS = {"JPEG", "PNG", "WEBP"}
 TOP_K_DEFAULT = 10
 TOP_K_MAX = 20
+# Cosine-similarity floor for a candidate to be shown to a human at all.
+# top_k is a ceiling ("at most this many"), never a floor -- candidates
+# below this are dropped rather than padding the list with unrelated
+# products just to reach top_k. First-version fixed value (from real
+# phone-test data: clearly-correct matches clustered >=0.885, clearly-wrong
+# ones <=0.80); no per-category/dynamic threshold this round.
+IMAGE_SEARCH_MIN_SIMILARITY_DEFAULT = 0.82
 BUILD_DOWNLOAD_TIMEOUT_SECONDS = 6.0
 # Fetch (download/local-read) concurrency for index building. Bounded on
 # purpose -- this is a courtesy limit for remote hosts we don't control, not
@@ -234,17 +241,35 @@ def _get_loaded_index() -> _LoadedIndex:
         return loaded
 
 
+def min_similarity_threshold() -> float:
+    raw = os.getenv("JBA_IMAGE_SEARCH_MIN_SIMILARITY")
+    if not raw:
+        return IMAGE_SEARCH_MIN_SIMILARITY_DEFAULT
+    try:
+        return float(raw)
+    except ValueError:
+        return IMAGE_SEARCH_MIN_SIMILARITY_DEFAULT
+
+
 def search_similar_products(image: Image.Image, top_k: int = TOP_K_DEFAULT) -> list[SearchHit]:
-    """Never decides "the" match -- always returns a ranked candidate list for a human to pick from."""
+    """Never decides "the" match -- always returns a ranked candidate list for
+    a human to pick from. FAISS is still asked for top_k internally, but any
+    candidate below min_similarity_threshold() is dropped rather than kept
+    just to pad the list out to top_k -- an unrelated product is worse than
+    a shorter list."""
     top_k = max(1, min(top_k, TOP_K_MAX))
     loaded = _get_loaded_index()
     vec = embed_images([image])
     scores, indices = loaded.faiss_index.search(vec, top_k)
+    threshold = min_similarity_threshold()
     hits: list[SearchHit] = []
     for score, idx in zip(scores[0], indices[0]):
         if idx < 0 or idx >= len(loaded.product_ids):
             continue
-        hits.append(SearchHit(product_id=loaded.product_ids[idx], similarity=float(score)))
+        similarity = float(score)
+        if similarity < threshold:
+            continue
+        hits.append(SearchHit(product_id=loaded.product_ids[idx], similarity=similarity))
     return hits
 
 
