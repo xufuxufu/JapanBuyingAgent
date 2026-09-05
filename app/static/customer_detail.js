@@ -26,6 +26,11 @@
   addToggle?.addEventListener("click", () => {
     addForm.hidden = !addForm.hidden;
   });
+  // Deep-link from the customer list page's "+ 新增地址" quick entry.
+  if (addForm && new URLSearchParams(window.location.search).get("open_address_form") === "1") {
+    addForm.hidden = false;
+    addForm.scrollIntoView({ behavior: "smooth", block: "start" });
+  }
   addCancel?.addEventListener("click", () => {
     addForm.hidden = true;
   });

@@ -1459,6 +1459,31 @@ def test_customers_list_page_returns_200(client):
     assert "列表页客户" in response.text
 
 
+def test_customers_list_page_has_add_address_quick_entry(client):
+    http, db, _ = client
+    row = customer(db, "快捷入口客户")
+    response = http.get("/customers")
+    assert response.status_code == 200
+    # both the new quick-add-address entry and the pre-existing "管理地址"
+    # link must be present -- neither replaces the other.
+    assert f"/customers/{row.id}?open_address_form=1" in response.text
+    assert "+ 新增地址" in response.text
+    assert f'href="/customers/{row.id}"' in response.text
+    assert "管理地址" in response.text
+
+
+def test_customer_detail_page_loads_with_open_address_form_param(client):
+    # The open_address_form query param only drives client-side JS (auto-show
+    # the existing add-address form) -- this confirms the deep link itself
+    # doesn't break the route and the form it targets is actually present.
+    http, db, _ = client
+    row = customer(db, "深链接客户")
+    response = http.get(f"/customers/{row.id}", params={"open_address_form": "1"})
+    assert response.status_code == 200
+    assert 'id="addAddressForm"' in response.text
+    assert 'id="addAddressToggle"' in response.text
+
+
 def test_customer_detail_page_shows_all_addresses(client):
     http, db, _ = client
     row = create_customer(db, name="详情页客户", address="地址甲")

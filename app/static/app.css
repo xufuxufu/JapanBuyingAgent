@@ -240,8 +240,10 @@ body{font-size:calc(1rem * var(--jba-font-scale))}
 @media(max-width:800px){.search-result-item{grid-template-columns:44px minmax(0,1fr)}.search-result-thumb,.search-result-thumb-empty{width:44px;height:44px}.item-selected-card{grid-template-columns:44px minmax(0,1fr)}.item-selected-image{width:44px;height:44px}.shipment-item-row{grid-template-columns:auto minmax(0,1fr);grid-template-areas:"check info" "stepper stepper"}.shipment-item-row input[type="checkbox"]{grid-area:check}.shipment-item-info{grid-area:info}.shipment-item-stepper{grid-area:stepper;justify-content:flex-end}}
 
 /* -- customer list/detail + address management (Phase 7) -- */
-.customer-list-row{display:flex;justify-content:space-between;align-items:center;text-decoration:none;color:inherit;gap:.75rem}
+.customer-list-row{display:flex;justify-content:space-between;align-items:center;gap:.75rem}
+.customer-list-main{flex:1;min-width:0;text-decoration:none;color:inherit}
 .customer-list-main strong{display:block}.customer-list-main small{display:block;color:#63716f;margin-top:2px;overflow-wrap:anywhere}
+.customer-list-actions{display:flex;align-items:center;gap:10px;flex-wrap:wrap;flex-shrink:0}
 .address-card{margin:0}
 .address-form textarea{width:100%;resize:vertical}
 .confirm-modal-overlay{position:fixed;inset:0;z-index:1900;background:rgba(10,15,13,.55);display:grid;place-items:center;padding:4vw}

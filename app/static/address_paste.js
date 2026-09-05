@@ -25,37 +25,47 @@ function parseAddressPasteText(raw) {
   }
 
   // Unlabeled form: name/phone/address separated by spaces, commas, or
-  // newlines in some order, e.g. "小徐 138... 湖北..." or one per line.
-  const withoutPhone = text.replace(phone, "\n");
-  const segments = withoutPhone
+  // newlines in some order, e.g. "小徐 138... 湖北..." or one per line, or
+  // a name glued directly onto the phone within the same segment via a
+  // colon or bare space, e.g. "张测试：138..."/"张测试:138..."/"张测试 138...".
+  const segments = text
     .split(/[\n,，]+/)
     .map((segment) => segment.trim())
     .filter(Boolean);
+  const phoneSegmentIndex = segments.findIndex((segment) => segment.includes(phone));
 
   let name = "";
-  let address = "";
-  if (segments.length >= 2) {
-    name = segments[0];
-    address = segments.slice(1).join(" ");
-  } else if (segments.length === 1) {
-    const spaceParts = segments[0].split(/\s+/).filter(Boolean);
-    if (spaceParts.length >= 2) {
-      name = spaceParts[0];
-      address = spaceParts.slice(1).join(" ");
-    } else {
-      address = segments[0];
+  const addressParts = [];
+  segments.forEach((segment, index) => {
+    if (index !== phoneSegmentIndex) {
+      addressParts.push(segment);
+      return;
     }
+    // Whatever sits directly before the phone within its own segment --
+    // stripped of a trailing "："/":"/space -- is the name candidate. A real
+    // name is short; something longer here is address text that merely
+    // happens to share a line with the phone (e.g. "138... 湖北..."), so it
+    // must stay part of the address, never get consumed as a name.
+    const phoneIndex = segment.indexOf(phone);
+    const before = segment.slice(0, phoneIndex).replace(/[：:\s]+$/, "").trim();
+    const after = segment.slice(phoneIndex + phone.length).replace(/^[：:\s]+/, "").trim();
+    if (before && before.length <= 6 && !/\d/.test(before)) {
+      name = before;
+      if (after) addressParts.push(after);
+    } else {
+      const leftover = [before, after].filter(Boolean).join(" ");
+      if (leftover) addressParts.push(leftover);
+    }
+  });
+
+  // No name was glued to the phone itself (e.g. "张测试，138..." or
+  // "小徐\n138...\n湖北..." -- name is its own separate segment) -- fall
+  // back to the leading remaining segment when it looks name-shaped.
+  if (!name && addressParts.length && addressParts[0].length <= 6 && !/\d/.test(addressParts[0])) {
+    name = addressParts.shift();
   }
 
-  // A real name is short; if what we split off is long, it's almost
-  // certainly still part of the address (e.g. a one-line address with no
-  // name at all) -- fold it back in rather than mis-labeling it as a name.
-  if (name.length > 6) {
-    address = [name, address].filter(Boolean).join("");
-    name = "";
-  }
-
-  return { name, phone, address };
+  return { name, phone, address: addressParts.join(" ") };
 }
 
 if (typeof module !== "undefined" && module.exports) module.exports = { parseAddressPasteText };

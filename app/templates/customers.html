@@ -11,13 +11,16 @@
 
 <section class="stack customer-list">
   {% for customer in rows %}
-  <a class="card row customer-list-row" href="/customers/{{ customer.id }}">
-    <span class="customer-list-main">
+  <div class="card row customer-list-row">
+    <a class="customer-list-main" href="/customers/{{ customer.id }}">
       <strong>{{ customer.name }}</strong>
       <small>{{ customer.phone or '—' }}{% if customer.wechat_name %} · 微信：{{ customer.wechat_name }}{% endif %}</small>
+    </a>
+    <span class="customer-list-actions">
+      <a class="button secondary compact" href="/customers/{{ customer.id }}?open_address_form=1">+ 新增地址</a>
+      <a class="muted" href="/customers/{{ customer.id }}">管理地址 ›</a>
     </span>
-    <span class="muted">管理地址 ›</span>
-  </a>
+  </div>
   {% else %}<section class="card empty-state">暂无客户。</section>{% endfor %}
 </section>
 {% endblock %}
