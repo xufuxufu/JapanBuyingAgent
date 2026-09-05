@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import io
 import json
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 
 import pytest
@@ -11,6 +11,7 @@ from sqlalchemy import select
 
 from app.models import Customer, CustomerAddress, Product, SalesOrder, SalesOrderShippingLabel, SalesShipment, Salesperson
 from app.sales_order_service import (
+    TOKYO,
     ADDRESS_EDITABLE_STATUSES, ALLOWED_TRANSITIONS, DEFAULT_SALESPERSON_NAME, ITEM_EDITABLE_STATUSES,
     ITEM_LOCKED_MESSAGE, SHIPPING_LABEL_DELETABLE_STATUSES, SHIPPING_LABEL_UPLOADABLE_STATUSES,
     DuplicateAddressError, SalesOrderItemInput, add_customer_address, add_shipping_label, cancel_sales_order,
@@ -834,13 +835,44 @@ def test_ship_date_filter_matches_any_shipment_in_range(client):
     order_shipped_today = ship_full(db, order_shipped_today)
     order_not_shipped = simple_order(db, name_suffix="ship-date-2")
 
-    today = date.today()
+    # The filter interprets shipped_date_from/to as a Tokyo-local calendar
+    # day (matching the rest of this app's date conventions -- see TOKYO in
+    # sales_order_service.py), not the test runner's own local/UTC date.
+    # Tokyo is UTC+9, so date.today() drifts a day behind Tokyo's date for
+    # roughly 9 hours out of every UTC day; using it here made this test
+    # fail whenever it happened to run during that window.
+    today = datetime.now(timezone.utc).astimezone(TOKYO).date()
     filtered = http.get("/sales-orders", params={
         "shipped_date_from": today.isoformat(), "shipped_date_to": today.isoformat(),
     })
     assert filtered.status_code == 200
     assert "状态测试商品ship-date-1" in filtered.text
     assert "状态测试商品ship-date-2" not in filtered.text
+
+
+def test_ship_date_filter_uses_tokyo_calendar_day_not_utc_date(client):
+    """Regression for the UTC/Tokyo boundary bug above, pinned to a fixed
+    instant instead of depending on when the test happens to run. shipped_at
+    is stored in UTC; 2026-01-01 20:00 UTC is already 2026-01-02 05:00 in
+    Tokyo (UTC+9). The filter must bucket this shipment under the Tokyo
+    date (01-02), matching this app's universal date convention -- not the
+    UTC date the raw timestamp happens to fall on (01-01)."""
+    http, db, _ = client
+    order = simple_order(db, name_suffix="ship-date-tz")
+    order = ship_full(db, order)
+    shipment = order.shipments[0]
+    shipment.shipped_at = datetime(2026, 1, 1, 20, 0, tzinfo=timezone.utc)
+    db.commit()
+
+    same_utc_date = http.get("/sales-orders", params={
+        "shipped_date_from": "2026-01-01", "shipped_date_to": "2026-01-01",
+    })
+    assert "状态测试商品ship-date-tz" not in same_utc_date.text
+
+    correct_tokyo_date = http.get("/sales-orders", params={
+        "shipped_date_from": "2026-01-02", "shipped_date_to": "2026-01-02",
+    })
+    assert "状态测试商品ship-date-tz" in correct_tokyo_date.text
 
 
 def test_ship_date_filter_excludes_out_of_range_shipments(client):
