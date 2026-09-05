@@ -1,0 +1,40 @@
+{% extends "base.html" %}
+{% block title %}国内物流{% endblock %}
+{% block content %}
+<div class="so-page-header"><h1>国内物流</h1></div>
+<p class="muted so-page-sub">中通发货单的物流状态；点击"立即查询"手动刷新，已签收的单不再自动查询。</p>
+{% if message %}<div class="success message">{{ message }}</div>{% endif %}
+{% if error %}<div class="error message">{{ error }}</div>{% endif %}
+
+<nav class="so-tabs" aria-label="物流状态">
+  <a class="so-tab{% if status == 'all' %} active{% endif %}" href="/domestic-logistics">全部<span class="badge">{{ total_count }}</span></a>
+  {% for value, label in filters %}
+  <a class="so-tab{% if status == value %} active{% endif %}" href="/domestic-logistics?status={{ value }}">{{ label }}<span class="badge">{{ counts.get(value, 0) }}</span></a>
+  {% endfor %}
+</nav>
+
+<section class="so-list">
+  {% for shipment in shipments %}
+  {% set order = shipment.sales_order %}
+  <article class="card so-card dl-card">
+    <div class="so-head">
+      <h2>{{ order.customer.name if order else '' }}</h2>
+      <p class="muted">{{ order.order_no if order else '' }} · {{ shipment.shipment_no }}</p>
+      <span class="badge state-{{ shipment.tracking_status or 'no_info' }}">{{ status_labels.get(shipment.tracking_status, '暂无轨迹') }}</span>
+    </div>
+    <div class="so-side">
+      <p class="muted">中通 {{ shipment.tracking_no or '（未填写运单号）' }}</p>
+      {% set latest = shipment.tracking_events[0] if shipment.tracking_events else none %}
+      <p class="muted dl-latest-event">{{ latest.description if latest else '暂无轨迹' }}</p>
+      <p class="muted">最新轨迹时间：{{ shipment.tracking_last_event_at|beijing_datetime if shipment.tracking_last_event_at else '—' }}</p>
+      <p class="muted">最后查询时间：{{ shipment.tracking_last_checked_at|beijing_datetime(seconds=true) if shipment.tracking_last_checked_at else '尚未查询' }}</p>
+      {% if shipment.tracking_error %}<p class="error-text">上次查询失败：{{ shipment.tracking_error }}</p>{% endif %}
+      <div class="button-row so-actions">
+        <form method="post" action="/domestic-logistics/{{ shipment.id }}/track-now"><button type="submit" class="compact">立即查询</button></form>
+        <a class="button secondary compact" href="/domestic-logistics/{{ shipment.id }}">查看轨迹</a>
+      </div>
+    </div>
+  </article>
+  {% else %}<section class="card empty-state">暂无符合条件的中通发货单。</section>{% endfor %}
+</section>
+{% endblock %}

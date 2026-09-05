@@ -1891,6 +1891,7 @@ class SalesShipment(Base):
     __tablename__ = "sales_shipments"
     __table_args__ = (
         CheckConstraint("status IN ('pending','shipped')", name="ck_sales_shipments_status"),
+        Index("ix_sales_shipments_tracking_due", "tracking_terminal", "tracking_next_check_at"),
     )
     id: Mapped[int] = mapped_column(primary_key=True)
     sales_order_id: Mapped[int] = mapped_column(ForeignKey("sales_orders.id", ondelete="CASCADE"), nullable=False, index=True)
@@ -1899,10 +1900,21 @@ class SalesShipment(Base):
     recipient_name_snapshot: Mapped[str] = mapped_column(String(255), nullable=False)
     recipient_phone_snapshot: Mapped[str | None] = mapped_column(String(50))
     shipping_address_snapshot: Mapped[str] = mapped_column(Text, nullable=False)
-    # Reserved for future carrier API integration; not called this round.
     carrier: Mapped[str | None] = mapped_column(String(50), default="中通")
     tracking_no: Mapped[str | None] = mapped_column(String(100))
     shipped_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    # Kuaidi100-sourced domestic (中通-only, Phase 10A) tracking state --
+    # separate from `status` above, which is JBA's own dispatch lifecycle and
+    # must never be auto-changed by carrier tracking (see
+    # app/shipment_tracking_service.py). tracking_status is one of
+    # TRACKING_STATUS_LABELS' keys; tracking_terminal is driven solely by the
+    # official `ischeck` field (never guessed from Chinese status text).
+    tracking_status: Mapped[str | None] = mapped_column(String(20))
+    tracking_terminal: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    tracking_last_checked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    tracking_last_event_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    tracking_next_check_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    tracking_error: Mapped[str | None] = mapped_column(Text)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow, nullable=False)
     sales_order: Mapped[SalesOrder] = relationship(back_populates="shipments")
@@ -1911,6 +1923,9 @@ class SalesShipment(Base):
     )
     shipping_labels: Mapped[list[SalesOrderShippingLabel]] = relationship(
         back_populates="shipment", cascade="all, delete-orphan", order_by="SalesOrderShippingLabel.created_at",
+    )
+    tracking_events: Mapped[list[ShipmentTrackingEvent]] = relationship(
+        back_populates="shipment", cascade="all, delete-orphan", order_by="ShipmentTrackingEvent.event_time.desc()",
     )
 
 
@@ -1928,6 +1943,31 @@ class SalesShipmentItem(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
     shipment: Mapped[SalesShipment] = relationship(back_populates="items")
     sales_order_item: Mapped[SalesOrderItem] = relationship(back_populates="shipment_items")
+
+
+class ShipmentTrackingEvent(Base):
+    """One de-duplicated tracking-history entry from Kuaidi100 for a shipment.
+
+    Kuaidi100 always returns the full history on every query, not just new
+    events -- event_hash (over event_time+status+description) is how repeat
+    queries avoid inserting the same event twice.
+    """
+
+    __tablename__ = "shipment_tracking_events"
+    __table_args__ = (
+        Index("uq_shipment_tracking_events_dedupe", "shipment_id", "event_hash", unique=True),
+        Index("ix_shipment_tracking_events_shipment_time", "shipment_id", "event_time"),
+    )
+    id: Mapped[int] = mapped_column(primary_key=True)
+    shipment_id: Mapped[int] = mapped_column(ForeignKey("sales_shipments.id", ondelete="CASCADE"), nullable=False)
+    event_time: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    description: Mapped[str | None] = mapped_column(Text)
+    area_code: Mapped[str | None] = mapped_column(String(30))
+    area_name: Mapped[str | None] = mapped_column(String(100))
+    status: Mapped[str | None] = mapped_column(String(50))
+    event_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
+    shipment: Mapped[SalesShipment] = relationship(back_populates="tracking_events")
 
 
 class ProcurementDemand(Base):

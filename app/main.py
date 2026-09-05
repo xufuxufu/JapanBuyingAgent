@@ -25,7 +25,7 @@ from sqlalchemy.orm import Session, selectinload
 
 from app.config import PREVIEW_DIR, PRODUCT_IMAGE_DIR, PROJECT_ROOT, QINSI_PRODUCT_IMAGE_DIR, TAG_EVIDENCE_DIR, default_role, ensure_data_directories, get_deepseek_config, is_testing
 from app.db import SessionLocal, engine, get_db
-from app.models import Customer, CustomerAddress, DurableBackgroundJob, DuplicateDetectionLog, EnrichmentAuditLog, FieldPurchaseItem, PlatformProviderState, ProcurementDemand, ProcurementDemandPlan, Product, ProductAlias, ProductEnrichmentCandidate, ProductWatchConfig, ProductWatchSnapshot, PurchaseBatch, PurchaseBatchItem, QinsiExportJob, QinsiGoodsImportRow, QinsiImportBatch, QinsiPurchaseExportJob, Receipt, ReceiptBatch, ReceiptImage, ReceiptItem, RestockList, RestockListItem, SalesOrder, SalesOrderItem, Salesperson, Store, StoreBrand, TagEvidence, ZipPackageItem, ZipPackageJob
+from app.models import Customer, CustomerAddress, DurableBackgroundJob, DuplicateDetectionLog, EnrichmentAuditLog, FieldPurchaseItem, PlatformProviderState, ProcurementDemand, ProcurementDemandPlan, Product, ProductAlias, ProductEnrichmentCandidate, ProductWatchConfig, ProductWatchSnapshot, PurchaseBatch, PurchaseBatchItem, QinsiExportJob, QinsiGoodsImportRow, QinsiImportBatch, QinsiPurchaseExportJob, Receipt, ReceiptBatch, ReceiptImage, ReceiptItem, RestockList, RestockListItem, SalesOrder, SalesOrderItem, SalesShipment, Salesperson, ShipmentTrackingEvent, Store, StoreBrand, TagEvidence, ZipPackageItem, ZipPackageJob
 from app.analytics_service import analytics_dashboard, procurement_data, resolve_date_range
 from app.product_matching import (
     bind_product,
@@ -153,6 +153,11 @@ from app.sales_order_service import (
     update_sales_order_address, update_sales_order_status, update_shipment_tracking,
 )
 from app.sales_order_shipping import resolve_shipping_label_path, resolve_sales_order_item_image_path
+from app.kuaidi100_tracking_client import TRACKING_STATUS_LABELS
+from app.shipment_tracking_service import (
+    TRACKING_THROTTLE_SECONDS, list_domestic_shipments, query_shipment_tracking,
+    tracking_eligibility_error, tracking_status_counts,
+)
 from app.procurement_service import (
     CONFIDENCE_LABELS, DEMAND_TYPE_LABELS, EXECUTION_STATUS_LABELS, FRESHNESS_LABELS, SOURCE_TYPE_LABELS,
     STATUS_LABELS as PROCUREMENT_STATUS_LABELS, UNASSIGNED_STORE_GROUP_NAME,
@@ -253,6 +258,19 @@ def tokyo_datetime(value: datetime, seconds: bool = False) -> str:
 
 
 templates.env.filters["tokyo_datetime"] = tokyo_datetime
+
+CHINA_TZ = timezone(timedelta(hours=8), "Asia/Shanghai")
+
+
+def beijing_datetime(value: datetime, seconds: bool = False) -> str:
+    if value.tzinfo is None:
+        value = value.replace(tzinfo=timezone.utc)
+    local = value.astimezone(CHINA_TZ)
+    suffix = f" {local:%H:%M:%S}" if seconds else f" {local:%H:%M}"
+    return f"{local.year}年{local.month}月{local.day}日{suffix}"
+
+
+templates.env.filters["beijing_datetime"] = beijing_datetime
 app.mount("/static", StaticFiles(directory=str(PROJECT_ROOT / "app" / "static")), name="static")
 app.mount("/media/preview", StaticFiles(directory=str(PREVIEW_DIR)), name="preview")
 PROMPT_PATH = PROJECT_ROOT / "docs" / "GPT_RECEIPT_PROMPT.md"
@@ -290,6 +308,7 @@ templates.env.globals["nav_can"] = _nav_can
 HOME_QUICK_ENTRIES = (
     {"href": "/price-check", "icon": "▦", "label": "扫码查价"},
     {"href": "/sales-orders", "icon": "訂", "label": "微信订单"},
+    {"href": "/domestic-logistics", "icon": "递", "label": "国内物流"},
     {"href": "/procurement-demands/report-shortage", "icon": "補", "label": "补货需求"},
     {"href": "/procurement-demands", "icon": "購", "label": "采购"},
 )
@@ -3668,6 +3687,73 @@ def sales_order_shipping_label_delete(label_id: int, db: Session = Depends(get_d
         db.rollback()
         return RedirectResponse(f"/sales-orders/{order_id}?error={quote(str(exc))}", status_code=303)
     return RedirectResponse(f"/sales-orders/{order_id}", status_code=303)
+
+
+@app.post("/sales-orders/{order_id}/shipments/{shipment_id}/track-now")
+def sales_order_shipment_track_now(order_id: int, shipment_id: int, db: Session = Depends(get_db)):
+    try:
+        query_shipment_tracking(db, shipment_id)
+    except LookupError as exc:
+        db.rollback()
+        raise HTTPException(404, str(exc)) from exc
+    except ValueError as exc:
+        db.rollback()
+        return RedirectResponse(f"/sales-orders/{order_id}?error={quote(str(exc))}", status_code=303)
+    return RedirectResponse(f"/sales-orders/{order_id}", status_code=303)
+
+
+DOMESTIC_LOGISTICS_FILTERS = (
+    ("in_transit", "运输中"),
+    ("out_for_delivery", "派送中"),
+    ("exception", "异常"),
+    ("delivered", "已签收"),
+)
+
+
+@app.get("/domestic-logistics", response_class=HTMLResponse)
+def domestic_logistics_page(request: Request, status: str = Query("all"), db: Session = Depends(get_db)):
+    if status not in {value for value, _ in DOMESTIC_LOGISTICS_FILTERS} | {"all"}:
+        status = "all"
+    shipments = list_domestic_shipments(db, status_filter=status)
+    counts = tracking_status_counts(db)
+    return templates.TemplateResponse(request, "domestic_logistics.html", {
+        "shipments": shipments, "status": status, "filters": DOMESTIC_LOGISTICS_FILTERS,
+        "counts": counts, "total_count": sum(counts.values()),
+        "status_labels": TRACKING_STATUS_LABELS,
+        "throttle_seconds": TRACKING_THROTTLE_SECONDS,
+        "message": request.query_params.get("message"), "error": request.query_params.get("error"),
+    })
+
+
+@app.get("/domestic-logistics/{shipment_id}", response_class=HTMLResponse)
+def domestic_logistics_detail_page(shipment_id: int, request: Request, db: Session = Depends(get_db)):
+    shipment = db.get(SalesShipment, shipment_id)
+    if shipment is None:
+        raise HTTPException(404, "发货单不存在")
+    events = list(db.scalars(
+        select(ShipmentTrackingEvent)
+        .where(ShipmentTrackingEvent.shipment_id == shipment_id)
+        .order_by(ShipmentTrackingEvent.event_time.desc())
+    ))
+    return templates.TemplateResponse(request, "domestic_logistics_detail.html", {
+        "shipment": shipment, "events": events, "status_labels": TRACKING_STATUS_LABELS,
+        "eligibility_error": tracking_eligibility_error(shipment),
+        "throttle_seconds": TRACKING_THROTTLE_SECONDS,
+        "message": request.query_params.get("message"), "error": request.query_params.get("error"),
+    })
+
+
+@app.post("/domestic-logistics/{shipment_id}/track-now")
+def domestic_logistics_track_now(shipment_id: int, db: Session = Depends(get_db)):
+    try:
+        query_shipment_tracking(db, shipment_id)
+    except LookupError as exc:
+        db.rollback()
+        raise HTTPException(404, str(exc)) from exc
+    except ValueError as exc:
+        db.rollback()
+        return RedirectResponse(f"/domestic-logistics/{shipment_id}?error={quote(str(exc))}", status_code=303)
+    return RedirectResponse(f"/domestic-logistics/{shipment_id}?message={quote('查询已完成')}", status_code=303)
 
 
 @app.get("/sales-orders/item-images/{item_id}")

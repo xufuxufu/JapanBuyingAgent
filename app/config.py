@@ -116,6 +116,30 @@ def is_deepseek_configured() -> bool:
     return get_deepseek_config().configured
 
 
+@dataclass(frozen=True, slots=True)
+class Kuaidi100Config:
+    key: str
+    customer: str
+    # Read for parity with the account's provisioned credentials, but NOT
+    # used in the 实时查询 (query.do) signature -- verified against the
+    # official python-demo repo (kuaidi100-api/python-demo, code/synquery.py),
+    # which signs with only key+customer. Kept here in case a future
+    # Kuaidi100 product on this same account needs it.
+    secret: str
+
+    @property
+    def configured(self) -> bool:
+        return bool(self.key and self.customer)
+
+
+def get_kuaidi100_config() -> Kuaidi100Config:
+    return Kuaidi100Config(
+        key=clean_env_value(os.getenv("KUAIDI100_KEY")) or "",
+        customer=clean_env_value(os.getenv("KUAIDI100_CUSTOMER")) or "",
+        secret=clean_env_value(os.getenv("KUAIDI100_SECRET")) or "",
+    )
+
+
 def database_url() -> str:
     configured = clean_env_value(os.getenv("JBA_DATABASE_URL"))
     return configured or f"sqlite:///{DEFAULT_DB_PATH.as_posix()}"

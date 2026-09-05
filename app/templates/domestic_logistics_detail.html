@@ -1,0 +1,41 @@
+{% extends "base.html" %}
+{% block title %}国内物流详情{% endblock %}
+{% block content %}
+{% set order = shipment.sales_order %}
+<div class="section-head"><div><h1>{{ shipment.shipment_no }}</h1><p class="muted">{{ order.customer.name if order else '' }} · {{ order.order_no if order else '' }}</p></div><a class="button secondary" href="/domestic-logistics">返回列表</a></div>
+{% if message %}<div class="success message">{{ message }}</div>{% endif %}
+{% if error %}<div class="error message">{{ error }}</div>{% endif %}
+
+<section class="card">
+  <div class="so-head">
+    <span class="badge state-{{ shipment.tracking_status or 'no_info' }}">{{ status_labels.get(shipment.tracking_status, '暂无轨迹') }}</span>
+  </div>
+  <p class="muted">中通 {{ shipment.tracking_no or '（未填写运单号）' }}</p>
+  <p class="muted">收货：{{ shipment.recipient_name_snapshot }} {{ shipment.recipient_phone_snapshot or '' }}<br>{{ shipment.shipping_address_snapshot }}</p>
+  <p class="muted">最新轨迹时间：{{ shipment.tracking_last_event_at|beijing_datetime(seconds=true) if shipment.tracking_last_event_at else '—' }}</p>
+  <p class="muted">最后查询时间：{{ shipment.tracking_last_checked_at|beijing_datetime(seconds=true) if shipment.tracking_last_checked_at else '尚未查询' }}</p>
+  {% if shipment.tracking_error %}<p class="error-text">上次查询失败：{{ shipment.tracking_error }}</p>{% endif %}
+  <form method="post" action="/domestic-logistics/{{ shipment.id }}/track-now">
+    <button type="submit"{% if eligibility_error %} disabled title="{{ eligibility_error }}"{% endif %}>立即查询</button>
+  </form>
+  {% if eligibility_error %}<p class="muted">{{ eligibility_error }}</p>{% endif %}
+</section>
+
+<section class="card">
+  <h2>物流轨迹（{{ events|length }} 条，按时间倒序）</h2>
+  {% if events %}
+  <ul class="dl-event-list">
+    {% for event in events %}
+    <li class="dl-event-row">
+      <span class="dl-event-time">{{ event.event_time|beijing_datetime(seconds=true) }}</span>
+      <span class="dl-event-status">{{ event.status or '' }}</span>
+      <p class="dl-event-desc">{{ event.description or '' }}</p>
+      {% if event.area_name %}<p class="muted dl-event-area">{{ event.area_name }}</p>{% endif %}
+    </li>
+    {% endfor %}
+  </ul>
+  {% else %}
+  <p class="muted">暂无轨迹，点击"立即查询"获取。</p>
+  {% endif %}
+</section>
+{% endblock %}

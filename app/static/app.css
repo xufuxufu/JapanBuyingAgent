@@ -294,3 +294,16 @@ body{font-size:calc(1rem * var(--jba-font-scale))}
 .image-search-result-name{display:-webkit-box;-webkit-box-orient:vertical;-webkit-line-clamp:2;overflow:hidden;overflow-wrap:anywhere;line-height:1.3;margin:0 0 4px}
 .image-search-result-meta{margin:0;font-size:.85rem}
 .image-search-index-status{margin:8px 0;padding:10px;border-radius:8px;background:#f1f5f4;font-size:.9rem}
+
+/* -- domestic (中通) logistics tracking, Phase 10A -- */
+.state-in_transit{background:#e6f0ff;color:#174a84}.state-out_for_delivery{background:#fdeccb;color:#7a4a00}
+.state-delivered{background:#e4f6ec;color:#17643a}.state-exception{background:#ffebe9;color:#8f1d15}
+.state-no_info,.state-unknown{background:#f1f6f4;color:#63716f}
+.error-text{color:#8f1d15;font-weight:700}
+.dl-latest-event{overflow-wrap:anywhere}
+.dl-event-list{display:grid;gap:12px;list-style:none;margin:0;padding:0}
+.dl-event-row{border-left:3px solid #0b5d4b;padding:2px 0 2px 14px}
+.dl-event-time{display:block;font-weight:700}
+.dl-event-status{display:inline-block;color:#0b5d4b;font-weight:700;margin-top:2px}
+.dl-event-desc{margin:4px 0 0;overflow-wrap:anywhere}
+.dl-event-area{margin:2px 0 0}

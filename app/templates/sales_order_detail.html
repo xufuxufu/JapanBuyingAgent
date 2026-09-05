@@ -156,6 +156,9 @@
       </form>
       {% else %}
       <p class="muted">{{ shipment.carrier or '中通' }} {{ shipment.tracking_no or '（未填写运单号）' }} · 发货时间 {{ shipment.shipped_at|tokyo_datetime }}</p>
+      {% if shipment.carrier == '中通' and shipment.tracking_no %}
+      <a class="button secondary compact" href="/domestic-logistics/{{ shipment.id }}">查看国内物流</a>
+      {% endif %}
       <div class="shipping-label-grid">
         {% for label in shipment.shipping_labels %}
         <div class="shipping-label-card">

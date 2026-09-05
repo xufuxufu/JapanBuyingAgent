@@ -9,7 +9,7 @@ from alembic import command
 from alembic.config import Config
 
 
-HEAD_REVISION = "20260901_0046"
+HEAD_REVISION = "20260905_0048"
 
 
 def test_migration_from_empty_and_repeat_safe(tmp_path, monkeypatch):
@@ -142,6 +142,66 @@ def test_0047_qinsi_sales_summary_upgrade_downgrade_reupgrade(tmp_path, monkeypa
         tables = {row[0] for row in connection.execute("SELECT name FROM sqlite_master WHERE type='table'")}
     assert revision == (HEAD_REVISION,)
     assert {"qinsi_sales_summary_snapshots", "qinsi_sales_summary_lines"} <= tables
+
+
+def test_0048_domestic_logistics_tracking_upgrade_downgrade_reupgrade(tmp_path, monkeypatch):
+    db_path = tmp_path / "domestic-logistics.sqlite3"
+    monkeypatch.setenv("JBA_DATABASE_URL", f"sqlite:///{db_path.as_posix()}")
+    config = Config(str(Path(__file__).resolve().parents[1] / "alembic.ini"))
+    command.upgrade(config, "head")
+    command.upgrade(config, "head")
+    with sqlite3.connect(db_path) as connection:
+        connection.execute("PRAGMA foreign_keys=ON")
+        shipment_columns = {row[1] for row in connection.execute("PRAGMA table_info(sales_shipments)")}
+        event_columns = {row[1] for row in connection.execute("PRAGMA table_info(shipment_tracking_events)")}
+        connection.execute("INSERT INTO customers (name, created_at, updated_at) VALUES ('测试客户', datetime('now'), datetime('now'))")
+        customer_id = connection.execute("SELECT id FROM customers").fetchone()[0]
+        connection.execute("INSERT INTO salespersons (name, active, created_at, updated_at) VALUES ('测试销售', 1, datetime('now'), datetime('now'))")
+        salesperson_id = connection.execute("SELECT id FROM salespersons").fetchone()[0]
+        connection.execute(
+            "INSERT INTO sales_orders (order_no, customer_id, salesperson_id, status, order_date, created_at, updated_at) "
+            "VALUES ('SO-TEST-0048', ?, ?, 'paid', datetime('now'), datetime('now'), datetime('now'))",
+            (customer_id, salesperson_id),
+        )
+        order_id = connection.execute("SELECT id FROM sales_orders").fetchone()[0]
+        connection.execute(
+            "INSERT INTO sales_shipments "
+            "(sales_order_id, shipment_no, status, recipient_name_snapshot, shipping_address_snapshot, "
+            "carrier, tracking_no, tracking_terminal, created_at, updated_at) "
+            "VALUES (?, 'SO-TEST-0048-S1', 'shipped', '测试客户', '测试地址', '中通', '79028271571578', 0, datetime('now'), datetime('now'))",
+            (order_id,),
+        )
+        shipment_id = connection.execute("SELECT id FROM sales_shipments").fetchone()[0]
+        connection.execute(
+            "INSERT INTO shipment_tracking_events "
+            "(shipment_id, event_time, description, status, event_hash, created_at) "
+            "VALUES (?, datetime('now'), '已签收', '签收', 'testhash1', datetime('now'))",
+            (shipment_id,),
+        )
+        connection.commit()
+        fk_check = connection.execute("PRAGMA foreign_key_check").fetchall()
+    assert {
+        "tracking_status", "tracking_terminal", "tracking_last_checked_at",
+        "tracking_last_event_at", "tracking_next_check_at", "tracking_error",
+    } <= shipment_columns
+    assert {"shipment_id", "event_time", "description", "area_code", "area_name", "status", "event_hash"} <= event_columns
+    assert fk_check == []
+
+    command.downgrade(config, "20260904_0047")
+    with sqlite3.connect(db_path) as connection:
+        tables = {row[0] for row in connection.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+        shipment_columns = {row[1] for row in connection.execute("PRAGMA table_info(sales_shipments)")}
+        integrity = connection.execute("PRAGMA integrity_check").fetchone()
+    assert "shipment_tracking_events" not in tables
+    assert "tracking_status" not in shipment_columns
+    assert integrity == ("ok",)
+
+    command.upgrade(config, "head")
+    with sqlite3.connect(db_path) as connection:
+        revision = connection.execute("SELECT version_num FROM alembic_version").fetchone()
+        tables = {row[0] for row in connection.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+    assert revision == (HEAD_REVISION,)
+    assert "shipment_tracking_events" in tables
 
 
 def test_0038_sales_order_tables_are_empty_and_repeat_safe(tmp_path, monkeypatch):
