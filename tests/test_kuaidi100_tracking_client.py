@@ -14,7 +14,7 @@ def test_ischeck_1_is_delivered_and_terminal_regardless_of_state():
     body = {"message": "ok", "status": "200", "ischeck": "1", "state": "3", "com": "zhongtong", "data": [
         {"time": "2026-08-28 20:53:03", "context": "已签收", "areaCode": "CN420100000000", "areaName": "湖北,武汉市", "status": "签收"},
     ]}
-    result = parse_tracking_response(body, tracking_no="79028271571578", carrier="zhongtong")
+    result = parse_tracking_response(body, tracking_no="70000000000001", carrier="zhongtong")
     assert result.tracking_status == "delivered"
     assert result.terminal is True
     assert len(result.events) == 1
@@ -84,7 +84,7 @@ def test_missing_tracking_no_raises_before_any_request():
 
 def test_missing_phone_raises_before_any_request():
     with pytest.raises(Kuaidi100ClientError) as excinfo:
-        query_zhongtong_tracking("79028271571578", "")
+        query_zhongtong_tracking("70000000000001", "")
     assert excinfo.value.category == "missing_phone"
 
 
@@ -92,7 +92,7 @@ def test_unconfigured_credentials_raise(monkeypatch):
     monkeypatch.delenv("KUAIDI100_KEY", raising=False)
     monkeypatch.delenv("KUAIDI100_CUSTOMER", raising=False)
     with pytest.raises(Kuaidi100ClientError) as excinfo:
-        query_zhongtong_tracking("79028271571578", "13800000000")
+        query_zhongtong_tracking("70000000000001", "13800000000")
     assert excinfo.value.category == "unconfigured"
 
 
@@ -118,7 +118,7 @@ def test_query_zhongtong_tracking_signs_and_parses_via_injected_client(monkeypat
     monkeypatch.setenv("KUAIDI100_KEY", "test-key")
     monkeypatch.setenv("KUAIDI100_CUSTOMER", "test-customer")
     fake = _FakeClient({"message": "ok", "status": "200", "ischeck": "1", "state": "3", "com": "zhongtong", "data": []})
-    result = query_zhongtong_tracking("79028271571578", "13800000000", client=fake)
+    result = query_zhongtong_tracking("70000000000001", "13800000000", client=fake)
     assert result.terminal is True
     assert len(fake.calls) == 1
     url, data, _timeout = fake.calls[0]
@@ -129,7 +129,7 @@ def test_query_zhongtong_tracking_signs_and_parses_via_injected_client(monkeypat
     import json as _json
     param = _json.loads(data["param"])
     assert param["com"] == "zhongtong"
-    assert param["num"] == "79028271571578"
+    assert param["num"] == "70000000000001"
     assert param["phone"] == "13800000000"
 
 
@@ -143,5 +143,5 @@ def test_network_error_wraps_into_client_error(monkeypatch):
     monkeypatch.setenv("KUAIDI100_KEY", "test-key")
     monkeypatch.setenv("KUAIDI100_CUSTOMER", "test-customer")
     with pytest.raises(Kuaidi100ClientError) as excinfo:
-        query_zhongtong_tracking("79028271571578", "13800000000", client=_RaisingClient())
+        query_zhongtong_tracking("70000000000001", "13800000000", client=_RaisingClient())
     assert excinfo.value.category == "network_error"

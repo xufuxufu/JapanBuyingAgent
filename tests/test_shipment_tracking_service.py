@@ -49,7 +49,7 @@ def _label_bytes() -> bytes:
 
 
 def shipped_shipment(
-    db, *, tracking_no: str | None = "79028271571578", carrier: str = "中通",
+    db, *, tracking_no: str | None = "70000000000001", carrier: str = "中通",
     recipient_phone: str | None = "13800000001", customer_phone: str | None = "13800000000",
 ) -> SalesShipment:
     salesperson = ensure_default_salesperson(db)
@@ -146,7 +146,7 @@ def test_pending_shipment_blocks_query(db_session):
         shipping_address="地址", recipient_phone="13800000002",
     )
     update_sales_order_status(db_session, order.id, "paid")
-    shipment = create_shipment(db_session, order.id, item_quantities=[(order.items[0].id, 1)], tracking_no="79028271571578")
+    shipment = create_shipment(db_session, order.id, item_quantities=[(order.items[0].id, 1)], tracking_no="70000000000001")
     assert tracking_eligibility_error(shipment) == "发货单尚未发货"
 
 
@@ -281,8 +281,8 @@ def test_missing_tracking_no_never_becomes_due(db_session):
 
 
 def test_due_cycle_counts_success_and_continues_past_one_failure(db_session, monkeypatch):
-    good = shipped_shipment(db_session, tracking_no="79028271571578")
-    bad = shipped_shipment(db_session, tracking_no="79028272911557")
+    good = shipped_shipment(db_session, tracking_no="70000000000001")
+    bad = shipped_shipment(db_session, tracking_no="70000000000002")
 
     def fake_query(session, shipment_id, *, client=None, now=None):
         if shipment_id == bad.id:

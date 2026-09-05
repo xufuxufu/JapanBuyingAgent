@@ -32,7 +32,7 @@ def _label_bytes() -> bytes:
     return buffer.getvalue()
 
 
-def shipped_shipment(db, *, tracking_no: str | None = "79028271571578") -> tuple[int, int]:
+def shipped_shipment(db, *, tracking_no: str | None = "70000000000001") -> tuple[int, int]:
     salesperson = ensure_default_salesperson(db)
     buyer = create_customer(db, name="路由测试客户", phone="13800000001", wechat_name="wx_route")
     order = create_sales_order(

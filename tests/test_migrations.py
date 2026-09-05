@@ -168,7 +168,7 @@ def test_0048_domestic_logistics_tracking_upgrade_downgrade_reupgrade(tmp_path, 
             "INSERT INTO sales_shipments "
             "(sales_order_id, shipment_no, status, recipient_name_snapshot, shipping_address_snapshot, "
             "carrier, tracking_no, tracking_terminal, created_at, updated_at) "
-            "VALUES (?, 'SO-TEST-0048-S1', 'shipped', '测试客户', '测试地址', '中通', '79028271571578', 0, datetime('now'), datetime('now'))",
+            "VALUES (?, 'SO-TEST-0048-S1', 'shipped', '测试客户', '测试地址', '中通', '70000000000001', 0, datetime('now'), datetime('now'))",
             (order_id,),
         )
         shipment_id = connection.execute("SELECT id FROM sales_shipments").fetchone()[0]
