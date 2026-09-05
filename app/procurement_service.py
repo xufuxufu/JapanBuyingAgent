@@ -14,7 +14,8 @@ from app.models import (
     QinsiInventorySnapshotLine, Receipt, ReceiptItem, SalesOrder, SalesOrderItem, Store,
 )
 from app.qinsi_inventory import INVENTORY_REGION_CHINA, INVENTORY_REGION_JAPAN, inventory_region_for_location
-from app.store_service import product_store_summaries_bulk
+from app.qinsi_sales_summary import UNKNOWN_SALES_SUMMARY, sales_summary_for_products
+from app.store_service import product_store_summaries_bulk, purchase_facts
 
 
 DEMAND_TYPES = {"sales_confirmed", "channel_shortage", "manual_restock", "investigation", "system_restock"}
@@ -222,6 +223,20 @@ def close_investigation_demand(session: Session, demand_id: int, *, note: str | 
 # ---------------- aggregation ----------------
 
 
+# Labels for the confirmed-demand source breakdown shown on a group's card
+# (e.g. "需采购 ×3（秀销售 ×1 · 丈母娘销售 ×2）"). source_person is a
+# CHECK-constrained enum set programmatically at demand-creation time (never
+# free text, never guessed from a name) -- see ProcurementDemand and the
+# create_*_demand functions above -- so grouping by it is reliable.
+SOURCE_PERSON_SALE_LABELS: dict[str, str] = {
+    "秀": "秀销售", "丈母娘": "丈母娘销售", "老婆": "老婆销售", "系统": "系统补货",
+}
+# Fixed display order for the breakdown, independent of demand creation/sort
+# order -- e.g. always "秀销售 ×1 · 丈母娘销售 ×2", never flipped by which
+# demand happens to be newest.
+SOURCE_PERSON_ORDER = ("秀", "丈母娘", "老婆", "系统")
+
+
 @dataclass(frozen=True, slots=True)
 class DemandGroup:
     kind: str  # "product" | "jan" | "demand"
@@ -237,6 +252,25 @@ class DemandGroup:
     @property
     def group_ref(self) -> str:
         return f"{self.kind}:{self.key}"
+
+    @property
+    def confirmed_breakdown(self) -> list[tuple[str, int]]:
+        """Confirmed quantity per source_person, in a fixed display order."""
+        totals: dict[str, int] = {}
+        for demand in self.confirmed_demands:
+            person = demand.source_person
+            totals[person] = totals.get(person, 0) + (demand.requested_quantity or 0)
+        ordered = [person for person in SOURCE_PERSON_ORDER if person in totals]
+        ordered += [person for person in totals if person not in SOURCE_PERSON_ORDER]
+        return [(person, totals[person]) for person in ordered]
+
+    @property
+    def demand_summary_text(self) -> str:
+        breakdown = self.confirmed_breakdown
+        if len(breakdown) <= 1:
+            return f"需采购 ×{self.confirmed_quantity}"
+        parts = " · ".join(f"{SOURCE_PERSON_SALE_LABELS.get(person, person)} ×{qty}" for person, qty in breakdown)
+        return f"需采购 ×{self.confirmed_quantity}（{parts}）"
 
 
 def _order_still_active(demand: ProcurementDemand) -> bool:
@@ -257,7 +291,7 @@ def _load_demands(session: Session, *, status: str | None) -> list[ProcurementDe
     query = select(ProcurementDemand).options(
         selectinload(ProcurementDemand.product),
         selectinload(ProcurementDemand.sales_order_item).selectinload(SalesOrderItem.sales_order),
-    ).order_by(ProcurementDemand.created_at)
+    ).order_by(ProcurementDemand.created_at.desc(), ProcurementDemand.id.desc())
     if status is not None:
         query = query.where(ProcurementDemand.status == status)
     rows = session.scalars(query).all()
@@ -351,6 +385,16 @@ FRESHNESS_LABELS: dict[str, str] = {
 _FRESH_HOURS = 24
 _STALE_HOURS = 72
 
+# Shorter "最新/较旧" wording for the page-level "库存更新时间" line (shown once
+# near the title) -- FRESHNESS_LABELS above stays as-is since it's already
+# relied on elsewhere for per-card text (blank for "fresh" there is intentional).
+FRESHNESS_HINT_LABELS: dict[str, str] = {
+    FRESHNESS_NO_SNAPSHOT: "暂无快照",
+    FRESHNESS_FRESH: "最新",
+    FRESHNESS_STALE: "较旧",
+    FRESHNESS_EXPIRED: "较旧",
+}
+
 
 def _aware(value: datetime) -> datetime:
     return value if value.tzinfo is not None else value.replace(tzinfo=timezone.utc)
@@ -376,6 +420,19 @@ class ReferenceInventory:
     japan_quantity: int | None
     japan_known: bool
     freshness: str
+
+    @property
+    def total_known(self) -> bool:
+        return self.china_known or self.japan_known
+
+    @property
+    def total_quantity(self) -> int:
+        """China + Japan, treating an unknown side as 0 -- only meaningful when total_known is True."""
+        return (self.china_quantity or 0) + (self.japan_quantity or 0)
+
+    @property
+    def japan_display_quantity(self) -> int:
+        return self.japan_quantity or 0
 
 
 UNKNOWN_REFERENCE_INVENTORY = ReferenceInventory(
@@ -440,6 +497,23 @@ def reference_inventory_for_products(
         )
         for product_id in unique_ids
     }
+
+
+def latest_snapshot_status(session: Session, *, now: datetime | None = None) -> tuple[datetime | None, str]:
+    """The single QinSi inventory snapshot every reference_inventory_for_products call
+    reads from, plus its freshness -- for a page-level "库存更新时间" line shown once
+    near the title, instead of repeating snapshot text on every card."""
+    now = now or utcnow()
+    latest_snapshot = session.scalar(
+        select(QinsiInventorySnapshot).order_by(
+            func.coalesce(QinsiInventorySnapshot.data_at, QinsiInventorySnapshot.imported_at).desc(),
+            QinsiInventorySnapshot.id.desc(),
+        ).limit(1)
+    )
+    if latest_snapshot is None:
+        return None, FRESHNESS_NO_SNAPSHOT
+    snapshot_at = latest_snapshot.data_at or latest_snapshot.imported_at
+    return snapshot_at, _snapshot_freshness(snapshot_at, now)
 
 
 def in_transit_quantity_for_products(session: Session, product_ids: list[int]) -> dict[int, int]:
@@ -521,6 +595,28 @@ def build_group_inventory_contexts(
         product_id = product_id_by_ref.get(group.group_ref)
         inventory = inventories.get(product_id, UNKNOWN_REFERENCE_INVENTORY) if product_id else UNKNOWN_REFERENCE_INVENTORY
         contexts[group.group_ref] = _inventory_context(group.confirmed_quantity, inventory)
+    return contexts
+
+
+def build_group_sales_contexts(session: Session, groups: list[DemandGroup]) -> dict[str, dict]:
+    """7d/30d sales fact for every group's product, keyed by group_ref.
+
+    A group without a resolved product (kind='jan'/'demand') has no sales
+    fact to look up -- it is UNKNOWN, never a guessed/blank zero.
+    """
+    product_id_by_ref = {group.group_ref: group.product.id for group in groups if group.product is not None}
+    product_ids = list(product_id_by_ref.values())
+    sales_7d = sales_summary_for_products(session, product_ids, 7)
+    sales_30d = sales_summary_for_products(session, product_ids, 30)
+    contexts: dict[str, dict] = {}
+    for group in groups:
+        product_id = product_id_by_ref.get(group.group_ref)
+        summary_7d = sales_7d.get(product_id, UNKNOWN_SALES_SUMMARY) if product_id else UNKNOWN_SALES_SUMMARY
+        summary_30d = sales_30d.get(product_id, UNKNOWN_SALES_SUMMARY) if product_id else UNKNOWN_SALES_SUMMARY
+        contexts[group.group_ref] = {
+            "sales_7d": summary_7d.sales_quantity, "sales_7d_known": summary_7d.sales_known,
+            "sales_30d": summary_30d.sales_quantity, "sales_30d_known": summary_30d.sales_known,
+        }
     return contexts
 
 

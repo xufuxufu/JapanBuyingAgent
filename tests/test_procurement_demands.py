@@ -121,6 +121,37 @@ def test_multiple_sources_aggregate_into_one_product_group(db_session):
     assert len(group.confirmed_demands) == 2
 
 
+def test_open_groups_sorted_newest_demand_first(db_session):
+    # Procurement demand center reorg: new demands sort created_at DESC, id
+    # DESC -- the most recently reported need should surface first.
+    prod_a = product(db_session, "21")
+    prod_b = product(db_session, "22")
+    create_channel_shortage_demand(db_session, product_id=prod_a.id, quantity=1)
+    create_channel_shortage_demand(db_session, product_id=prod_b.id, quantity=1)
+    groups = aggregate_open_demand_groups(db_session)
+    keys = [(g.kind, g.key) for g in groups]
+    assert keys.index(("product", str(prod_b.id))) < keys.index(("product", str(prod_a.id)))
+
+
+def test_demand_summary_text_shows_reliable_source_breakdown(db_session):
+    # source_person is a CHECK-constrained enum set programmatically at
+    # creation (see ProcurementDemand) -- sales_confirmed is always "秀",
+    # channel_shortage defaults to "丈母娘" -- so this breakdown never guesses
+    # from any name text.
+    prod = product(db_session, "23")
+    sales_order_with_product(db_session, prod, quantity=1)
+    create_channel_shortage_demand(db_session, product_id=prod.id, quantity=2)
+    group = get_group(db_session, "product", str(prod.id))
+    assert group.demand_summary_text == "需采购 ×3（秀销售 ×1 · 丈母娘销售 ×2）"
+
+
+def test_demand_summary_text_omits_breakdown_for_single_source(db_session):
+    prod = product(db_session, "24")
+    create_channel_shortage_demand(db_session, product_id=prod.id, quantity=5)
+    group = get_group(db_session, "product", str(prod.id))
+    assert group.demand_summary_text == "需采购 ×5"
+
+
 def test_different_products_are_not_merged(db_session):
     prod_a = product(db_session, "8")
     prod_b = product(db_session, "9")

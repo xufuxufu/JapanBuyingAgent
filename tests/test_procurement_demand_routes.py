@@ -94,7 +94,9 @@ def test_aggregated_list_shows_one_card_for_two_sources(client):
     response = test_client.get("/procurement-demands?view=open")
     assert response.status_code == 200
     assert response.text.count(f'data-key="{prod.id}"') == 1
-    assert "明确需求：<strong>5</strong>" in response.text
+    # source is reliably distinguishable (sales_confirmed=秀 ×2, channel_shortage=丈母娘 ×3)
+    # -- see DemandGroup.demand_summary_text -- so the breakdown must be shown, not just the total.
+    assert "需采购 ×5（秀销售 ×2 · 丈母娘销售 ×3）" in response.text
 
 
 def test_checkbox_batch_plan_then_appears_in_planned_view(client):
@@ -125,7 +127,7 @@ def test_checkbox_batch_plan_then_appears_in_planned_view(client):
     assert f'data-key="{prod_b.id}"' not in open_response.text
 
     planned_response = test_client.get("/procurement-demands?view=planned")
-    assert "已安排" in planned_response.text
+    assert "待采购分拣" in planned_response.text
     assert "路由测试商品3" in planned_response.text
     assert "路由测试商品4" in planned_response.text
 
@@ -178,11 +180,23 @@ def test_open_card_shows_china_japan_and_shortage(client):
 
     response = test_client.get("/procurement-demands?view=open")
     assert response.status_code == 200
-    assert "中国参考" in response.text
-    assert "日本参考" in response.text
-    assert "国内明确缺口" in response.text
-    assert "<strong>3</strong>" in response.text  # 5 - 2 = 3
-    assert 'value="3"' in response.text  # default planned quantity follows the shortage
+    assert "总库存 2（日本库存 ×0）" in response.text
+    assert 'value="3"' in response.text  # default planned quantity still follows the domestic shortage (5-2=3)
+
+
+def test_open_card_shows_sales_figures_row(client):
+    # 7d/30d sales are new on the 采购需求(open) card (Phase 9A's
+    # sales_summary_for_products already has its own dedicated snapshot-based
+    # tests in test_qinsi_sales_summary.py); this only checks the new display
+    # line is wired up and degrades to "--" rather than a fabricated zero
+    # when there is no sales snapshot at all.
+    test_client, db, _tmp = client
+    prod = product(db, "15")
+    db.commit()
+    test_client.post("/procurement-demands/report-shortage", data={"product_id": str(prod.id), "quantity": "2"})
+
+    response = test_client.get("/procurement-demands?view=open")
+    assert "7天销量 -- · 30天销量 --" in response.text
 
 
 def test_open_card_shows_unknown_when_no_snapshot(client):

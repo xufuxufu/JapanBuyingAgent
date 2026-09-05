@@ -152,6 +152,25 @@ def test_no_history_is_empty(db_session):
     assert history == []
 
 
+def test_store_display_name_never_shows_placeholder_for_japanese_only_name(db_session):
+    # Regression: a store with only a Japanese name used to render as
+    # "中文名待补｜<name>" -- it must now show just the Japanese name.
+    japan_only = store(db_session, "HANDS心斎橋店")
+    japan_only.name_ja = "HANDSハンズ心斎橋店"
+    japan_only.name_cn = None
+    db_session.commit()
+    assert japan_only.display_name == "HANDSハンズ心斎橋店"
+    assert "待补" not in japan_only.display_name
+
+
+def test_store_display_name_shows_both_names_when_present(db_session):
+    both = store(db_session, "松本清")
+    both.name_cn = "松本清"
+    both.name_ja = "マツモトキヨシ"
+    db_session.commit()
+    assert both.display_name == "松本清｜マツモトキヨシ"
+
+
 def test_different_products_not_mixed(db_session):
     prod_a = product(db_session, "7")
     prod_b = product(db_session, "8")

@@ -324,10 +324,13 @@ def test_plan_edit_route_enforces_purchased_floor(client):
 # ==================== 采购需求中心 7 个导航 tab ====================
 
 
-def test_all_seven_tabs_present(client):
+def test_all_five_tabs_present(client):
+    # Reorganized tab bar: 采购需求(open) / 找货需求 / 待采购分拣(planned, with an
+    # internal 待采购|分拣 toggle) / 已采购 / 全部 -- the old separate "采购" and
+    # "分拣" top-level tabs are gone (merged into 待采购分拣).
     http, db, _tmp = client
     response = http.get("/procurement-demands")
-    for label in ("待采购", "找货需求", "待采购商品", "分拣", "采购", "已采购", "全部"):
+    for label in ("采购需求", "找货需求", "待采购分拣", "已采购", "全部"):
         assert label in response.text
 
 
@@ -376,10 +379,18 @@ def test_sorting_tab_is_planned_store_view(client):
     assert "分拣测试店" in response.text
 
 
-def test_purchase_tab_link_points_to_purchase_page(client):
+def test_purchase_page_reachable_via_sorting_subtab(client):
+    # The old top-level "采购" tab is gone, but its execution-recording page
+    # must still be reachable -- now only via the "开始采购" link inside the
+    # 待采购分拣 tab's 分拣(group_by=store) sub-view.
     http, db, _tmp = client
-    response = http.get("/procurement-demands")
-    assert 'href="/procurement-demands/purchase"' in response.text
+    item = product(db, "21")
+    db.commit()
+    create_channel_shortage_demand(db, product_id=item.id, quantity=2)
+    create_plans(db, [PlanSelectionInput(kind="product", key=str(item.id), planned_quantity=2)])
+    response = http.get("/procurement-demands?view=planned&group_by=store")
+    assert response.status_code == 200
+    assert "/procurement-demands/purchase" in response.text
 
 
 # ==================== QinSi Snapshot 分页 ====================

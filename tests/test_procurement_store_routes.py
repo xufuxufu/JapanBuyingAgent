@@ -158,7 +158,7 @@ def test_switch_between_product_and_store_grouping(client):
 
     product_view = test_client.get("/procurement-demands?view=planned&group_by=product")
     assert product_view.status_code == 200
-    assert "按商品" in product_view.text and "按店铺" in product_view.text
+    assert "待采购" in product_view.text and "分拣" in product_view.text
 
     store_view = test_client.get("/procurement-demands?view=planned&group_by=store")
     assert store_view.status_code == 200

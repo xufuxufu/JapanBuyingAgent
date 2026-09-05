@@ -428,8 +428,13 @@ class Store(Base):
 
     @property
     def display_name(self) -> str:
-        cn = self.name_cn or (self.name if not self.name_ja else None) or "中文名待补"
-        return f"{cn}｜{self.name_ja or '日文名待补'}"
+        # Never show a "中文名待补"/"日文名待补" placeholder: fall back to
+        # whichever side actually has a name instead of fabricating one.
+        cn = self.name_cn or (self.name if not self.name_ja else None)
+        ja = self.name_ja
+        if cn and ja:
+            return f"{cn}｜{ja}"
+        return cn or ja or self.name
 
 
 class StoreAlias(Base):

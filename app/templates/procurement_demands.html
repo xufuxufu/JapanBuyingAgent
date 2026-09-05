@@ -2,6 +2,9 @@
 {% block title %}采购需求{% endblock %}
 {% block content %}
 <div class="section-head"><div><h1>采购需求中心</h1><p class="muted">秀的客户需求、丈母娘的补货需求，按商品自动汇总；先勾选，再决定采购多少。</p></div><a class="button secondary" href="/procurement-demands/report-shortage">补货需求</a></div>
+{% if view != 'investigation' %}
+<p class="muted pd-inventory-updated">库存更新时间：{{ inventory_snapshot_at|tokyo_datetime(seconds=True) if inventory_snapshot_at else '暂无快照' }}{% if freshness_hint_labels.get(inventory_freshness) %} · {{ freshness_hint_labels[inventory_freshness] }}{% endif %}</p>
+{% endif %}
 {% if error %}<div class="warning"><strong>操作失败：</strong>{{ error }}</div>{% endif %}
 
 <nav class="so-tabs" aria-label="采购需求分类">
@@ -26,25 +29,12 @@
         </div>
         <div class="pd-card-info">
           <h2 class="procurement-card-name">{{ group.display_name }}</h2>
-          <p class="muted">{{ group.jan or 'JAN 未填写' }}</p>
-          <p class="pd-confirmed">明确需求：<strong>{{ group.confirmed_quantity }}</strong></p>
-          <div class="pd-sources">
-            {% for demand in group.confirmed_demands[:3] %}
-            <span class="pd-source-line">{{ demand.source_person }} {{ demand_type_labels.get(demand.demand_type, demand.demand_type) }} {{ '×' ~ demand.requested_quantity if demand.requested_quantity else '数量未填' }}</span>
-            {% endfor %}
-            {% if group.confirmed_demands|length > 3 %}<span class="muted">还有 {{ group.confirmed_demands|length - 3 }} 条来源…</span>{% endif %}
-          </div>
-          <p class="muted">调查：{{ group.investigation_demands|length ~ ' 条' if group.investigation_demands else '无' }}</p>
+          <p class="pd-confirmed">{{ group.demand_summary_text }}</p>
+          <p class="muted pd-inventory-line">{% if ctx and ctx.inventory.total_known %}总库存 {{ ctx.inventory.total_quantity }}（日本库存 ×{{ ctx.inventory.japan_display_quantity }}）{% else %}总库存未知{% endif %}</p>
+          {% set sales = group_sales.get(group.group_ref) %}
+          <p class="muted pd-sales-row">7天销量 {{ sales.sales_7d if sales and sales.sales_7d_known else '--' }} · 30天销量 {{ sales.sales_30d if sales and sales.sales_30d_known else '--' }}</p>
         </div>
       </div>
-      {% if ctx %}
-      <div class="pd-inventory">
-        <p class="pd-inv-row"><span>中国参考：<strong>{{ ctx.inventory.china_quantity if ctx.inventory.china_known else '未知' }}</strong></span><span>日本参考：<strong>{{ ctx.inventory.japan_quantity if ctx.inventory.japan_known else '未知' }}</strong></span></p>
-        <p class="muted">快照：{{ ctx.inventory.snapshot_at|tokyo_datetime if ctx.inventory.snapshot_at else '暂无快照' }}{% if freshness_labels.get(ctx.inventory.freshness) %} · {{ freshness_labels[ctx.inventory.freshness] }}{% endif %}</p>
-        <p class="pd-shortage">{% if ctx.domestic_shortage_known %}国内明确缺口：<strong>{{ '参考库存可覆盖' if ctx.domestic_shortage == 0 else ctx.domestic_shortage }}</strong>{% else %}国内明确缺口：<strong>库存未知，请人工确认</strong>{% endif %}</p>
-        {% if ctx.inventory.japan_known and ctx.inventory.japan_quantity > 0 %}<p class="muted">日本有 {{ ctx.inventory.japan_quantity }} 件参考库存，可考虑调拨/避免重复采购。</p>{% endif %}
-      </div>
-      {% endif %}
       {% if view == 'open' %}
       <div class="pd-card-actions">
         <label class="pd-select"><input type="checkbox" class="pd-checkbox"> 采购</label>
@@ -96,9 +86,9 @@
 
 {% if view in ('planned', 'purchased') %}
 {% if view == 'planned' %}
-<nav class="so-tabs pd-subtabs" aria-label="已安排采购分组方式">
-  <a class="so-tab{% if group_by == 'product' %} active{% endif %}" href="/procurement-demands?view=planned&group_by=product">待采购商品</a>
-  <a class="so-tab{% if group_by == 'store' %} active{% endif %}" href="/procurement-demands?view=planned&group_by=store">分拣（按店铺）</a>
+<nav class="so-tabs pd-subtabs" aria-label="待采购分拣分组方式">
+  <a class="so-tab{% if group_by == 'product' %} active{% endif %}" href="/procurement-demands?view=planned&group_by=product">待采购</a>
+  <a class="so-tab{% if group_by == 'store' %} active{% endif %}" href="/procurement-demands?view=planned&group_by=store">分拣</a>
 </nav>
 {% endif %}
 

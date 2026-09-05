@@ -159,15 +159,15 @@ from app.shipment_tracking_service import (
     tracking_eligibility_error, tracking_status_counts,
 )
 from app.procurement_service import (
-    CONFIDENCE_LABELS, DEMAND_TYPE_LABELS, EXECUTION_STATUS_LABELS, FRESHNESS_LABELS, SOURCE_TYPE_LABELS,
+    CONFIDENCE_LABELS, DEMAND_TYPE_LABELS, EXECUTION_STATUS_LABELS, FRESHNESS_HINT_LABELS, FRESHNESS_LABELS, SOURCE_TYPE_LABELS,
     STATUS_LABELS as PROCUREMENT_STATUS_LABELS, UNASSIGNED_STORE_GROUP_NAME,
     ExecutionInput, ExecutionMatchInput, PlanSelectionInput, aggregate_all_demand_groups, aggregate_open_demand_groups,
-    build_group_inventory_contexts, build_plan_execution_summaries, build_plan_executions,
+    build_group_inventory_contexts, build_group_sales_contexts, build_plan_execution_summaries, build_plan_executions,
     build_plan_inventory_contexts, build_plan_reconciliation_summaries, build_plan_store_overview,
     build_store_purchase_entries, cancel_purchase_execution, close_investigation_demand,
     create_channel_shortage_demand, create_investigation_demand, create_plans, default_planned_quantity_for_group,
     find_execution_candidates_for_receipt_items, get_group, group_plans_by_selected_store,
-    list_investigation_demands, list_plans, list_plans_for_store_purchase,
+    latest_snapshot_status, list_investigation_demands, list_plans, list_plans_for_store_purchase,
     in_transit_quantity_for_products, record_purchase_executions_bulk, reference_inventory_for_products,
     set_plan_selected_store, set_plans_selected_store_bulk, update_demand_plan,
 )
@@ -3790,21 +3790,22 @@ PROCUREMENT_DEMAND_VIEWS = ("open", "investigation", "planned", "purchased", "al
 
 PROCUREMENT_PLAN_GROUP_BY = ("product", "store")
 
-# Business-facing tab bar (Phase 8): these are navigation views over the
-# existing demand/plan/execution status machines, not new DB states. Mapping:
-#   待采购    -> view=open          (confirmed demands not yet turned into a plan)
-#   找货需求  -> view=investigation (调查看货 demands)
-#   待采购商品 -> view=planned&group_by=product, filtered to remaining_quantity>0
-#   分拣      -> view=planned&group_by=store,   filtered to remaining_quantity>0
-#   采购      -> links out to /procurement-demands/purchase (unchanged page)
-#   已采购    -> view=purchased      (planned-status plans with purchased_quantity>0)
-#   全部      -> view=all
+# Business-facing tab bar (Phase 8, reorganized in the 采购需求中心 UI pass):
+# these are navigation views over the existing demand/plan/execution status
+# machines, not new DB states. Mapping:
+#   采购需求    -> view=open          (confirmed demands not yet turned into a plan)
+#   找货需求    -> view=investigation (调查看货 demands)
+#   待采购分拣  -> view=planned, with an internal 待采购(group_by=product)|分拣(group_by=store)
+#                 toggle -- the old separate "采购" (execution-recording) tab is
+#                 gone from the top bar; it's still reached via the "开始采购"/
+#                 "去采购" links inside this tab (route unchanged, see
+#                 /procurement-demands/purchase below).
+#   已采购      -> view=purchased      (planned-status plans with purchased_quantity>0)
+#   全部        -> view=all
 PROCUREMENT_DEMAND_TABS = (
-    ("open", "待采购", "/procurement-demands?view=open"),
+    ("open", "采购需求", "/procurement-demands?view=open"),
     ("investigation", "找货需求", "/procurement-demands?view=investigation"),
-    ("planned", "待采购商品", "/procurement-demands?view=planned&group_by=product"),
-    ("sorting", "分拣", "/procurement-demands?view=planned&group_by=store"),
-    ("purchase", "采购", "/procurement-demands/purchase"),
+    ("planned", "待采购分拣", "/procurement-demands?view=planned&group_by=product"),
     ("purchased", "已采购", "/procurement-demands?view=purchased"),
     ("all", "全部", "/procurement-demands?view=all"),
 )
@@ -3819,13 +3820,12 @@ def procurement_demands_page(
         view = "open"
     if group_by not in PROCUREMENT_PLAN_GROUP_BY:
         group_by = "product"
-    # "分拣" (sorting-by-store) is the same view=planned&group_by=store URL,
-    # but the tab bar needs its own active-tab key distinct from "待采购商品".
-    active_tab = "sorting" if (view == "planned" and group_by == "store") else view
+    active_tab = view
     groups: list = []
     investigations: list = []
     plans: list = []
     inventory_contexts: dict = {}
+    group_sales: dict = {}
     plan_inventories: dict = {}
     plan_store_contexts: dict = {}
     store_coverage: list = []
@@ -3836,16 +3836,21 @@ def procurement_demands_page(
     store_purchase_entries: list = []
     reconciliation_summaries: dict = {}
     plan_sales: dict = {}
+    inventory_snapshot_at = None
+    inventory_freshness = None
     if view == "open":
         groups = [g for g in aggregate_open_demand_groups(db) if g.confirmed_demands]
         inventory_contexts = build_group_inventory_contexts(db, groups)
+        group_sales = build_group_sales_contexts(db, groups)
+        inventory_snapshot_at, inventory_freshness = latest_snapshot_status(db)
     elif view == "investigation":
         investigations = list_investigation_demands(db, status="open")
     elif view in ("planned", "purchased"):
         all_plans = list_plans(db, status="planned")
         execution_summaries = build_plan_execution_summaries(db, all_plans)
         if view == "planned":
-            # 待采购商品 / 分拣: only plans that still need buying.
+            # 待采购分拣: only plans that still need buying, with an internal
+            # 待采购(group_by=product) | 分拣(group_by=store) toggle.
             plans = [plan for plan in all_plans if execution_summaries[plan.id].remaining_quantity > 0]
         else:
             # 已采购: plans with at least one real purchase recorded so far
@@ -3875,21 +3880,28 @@ def procurement_demands_page(
         if group_by == "store":
             store_groups = group_plans_by_selected_store(plans)
             store_purchase_entries = build_store_purchase_entries(store_groups, execution_summaries)
+        inventory_snapshot_at, inventory_freshness = latest_snapshot_status(db)
     else:
         groups = aggregate_all_demand_groups(db)
+        inventory_contexts = build_group_inventory_contexts(db, groups)
+        group_sales = build_group_sales_contexts(db, groups)
+        inventory_snapshot_at, inventory_freshness = latest_snapshot_status(db)
     return templates.TemplateResponse(request, "procurement_demands.html", {
         "view": view, "active_tab": active_tab, "tabs": PROCUREMENT_DEMAND_TABS,
         "group_by": group_by, "groups": groups, "investigations": investigations, "plans": plans,
         "demand_type_labels": DEMAND_TYPE_LABELS, "source_type_labels": SOURCE_TYPE_LABELS,
         "status_labels": PROCUREMENT_STATUS_LABELS, "default_qty": default_planned_quantity_for_group,
-        "inventory_contexts": inventory_contexts, "plan_inventories": plan_inventories, "plan_sales": plan_sales,
+        "inventory_contexts": inventory_contexts, "group_sales": group_sales,
+        "plan_inventories": plan_inventories, "plan_sales": plan_sales,
         "plan_store_contexts": plan_store_contexts, "store_coverage": store_coverage,
         "store_groups": store_groups, "active_stores": active_stores,
         "execution_summaries": execution_summaries, "plan_executions": plan_executions,
         "store_purchase_entries": store_purchase_entries, "execution_status_labels": EXECUTION_STATUS_LABELS,
         "reconciliation_summaries": reconciliation_summaries,
         "unassigned_group_name": UNASSIGNED_STORE_GROUP_NAME,
-        "freshness_labels": FRESHNESS_LABELS, "error": request.query_params.get("error"),
+        "inventory_snapshot_at": inventory_snapshot_at, "inventory_freshness": inventory_freshness,
+        "freshness_labels": FRESHNESS_LABELS, "freshness_hint_labels": FRESHNESS_HINT_LABELS,
+        "error": request.query_params.get("error"),
     })
 
 
