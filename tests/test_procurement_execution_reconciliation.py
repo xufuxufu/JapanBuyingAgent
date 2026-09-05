@@ -19,7 +19,7 @@ from app.procurement_service import (
 from app.services import confirm_receipt
 
 
-NOW = datetime(2026, 8, 28, 6, 0, tzinfo=timezone.utc)
+NOW = datetime.now(timezone.utc)  # dynamic: a hardcoded past date eventually drifts past RECONCILE_DATE_WINDOW
 
 
 def product(db, suffix: str) -> Product:

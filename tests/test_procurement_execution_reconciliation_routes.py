@@ -12,7 +12,7 @@ from app.models import (
 from app.procurement_service import PlanSelectionInput, create_channel_shortage_demand, create_plans, record_purchase_execution, set_plan_selected_store
 
 
-NOW = datetime(2026, 8, 28, 6, 0, tzinfo=timezone.utc)
+NOW = datetime.now(timezone.utc)  # dynamic: a hardcoded past date eventually drifts past RECONCILE_DATE_WINDOW
 
 
 def product(db, suffix: str) -> Product:
