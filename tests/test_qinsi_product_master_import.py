@@ -211,6 +211,119 @@ def test_qinsi_master_goods_no_match_corrects_old_jan_instead_of_conflict(db_ses
     assert existing.jan == "4901234567894"
 
 
+def test_qinsi_master_jan_bound_to_different_goods_no_is_conflict_not_crash(db_session):
+    """Regression test for the P0 where a row's JAN hit exactly one existing
+    Product, but that Product was already bound to a DIFFERENT qinsi goods_no.
+    _prepare_rows used to silently fall through to "new" instead of flagging a
+    conflict, so confirm crashed with a products.jan UNIQUE constraint
+    violation when it tried to insert a second Product with the same JAN."""
+    existing = Product(jan="4525636345630", qinsi_product_code="71100223", name_cn="既有商品-货号A")
+    db_session.add(existing)
+    db_session.commit()
+
+    batch = create_qinsi_master_preview(db_session, [master_file([{
+        "商品名称": "另一个货号命中同一JAN",
+        "货号": "71100999",
+        "单品条码": "4525636345630",
+        "状态": "启用",
+    }])])
+    assert batch.conflict_count == 1
+    assert batch.new_count == 0
+    row = db_session.scalar(select(QinsiGoodsImportRow).where(QinsiGoodsImportRow.import_batch_id == batch.id))
+    assert "判定JAN命中的本地Product已绑定不同的秦丝货号" in row.conflict_json
+
+    confirm_qinsi_master_import(db_session, batch)  # must not raise
+    db_session.refresh(existing)
+    assert existing.qinsi_product_code == "71100223"
+    assert existing.jan == "4525636345630"
+    assert db_session.scalar(select(func.count()).select_from(Product).where(Product.jan == "4525636345630")) == 1
+
+
+def test_qinsi_master_confirm_succeeds_when_batch_mixes_safe_rows_with_jan_collision(client):
+    """End-to-end HTTP regression for the same P0: a batch containing both a
+    genuinely-new row and a row whose JAN collides with an already-bound
+    Product must confirm successfully (303), never 500."""
+    http, db, _ = client
+    existing = Product(jan="4525636345630", qinsi_product_code="71100223", name_cn="既有商品-货号A", status="qinsi_product_imported")
+    db.add(existing)
+    db.commit()
+
+    response = http.post(
+        "/products/qinsi-master-import/preview",
+        files=[
+            ("files", ("master.xlsx", workbook_bytes([
+                {"商品名称": "正常新商品", "货号": "NEW-0001", "单品条码": "4901234567894", "状态": "启用"},
+                {"商品名称": "另一个货号命中同一JAN", "货号": "71100999", "单品条码": "4525636345630", "状态": "启用"},
+            ]), "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")),
+        ],
+        follow_redirects=False,
+    )
+    assert response.status_code == 303
+    batch = db.scalar(select(QinsiImportBatch).order_by(QinsiImportBatch.id.desc()))
+    assert batch.new_count == 1
+    assert batch.conflict_count == 1
+
+    confirm = http.post(f"/products/qinsi-master-import/{batch.id}/confirm", follow_redirects=False)
+    assert confirm.status_code == 303
+    db.refresh(batch)
+    assert batch.status == "completed_with_issues"
+    assert db.scalar(select(func.count()).select_from(Product).where(Product.qinsi_product_code == "NEW-0001")) == 1
+    assert db.scalar(select(func.count()).select_from(Product).where(Product.jan == "4525636345630")) == 1
+
+
+def test_qinsi_master_confirm_rolls_back_everything_on_unexpected_error(db_session, monkeypatch):
+    """Confirm must be all-or-nothing: an unexpected mid-loop exception (not
+    just a caught ValueError) must leave zero rows created/updated and the
+    batch untouched, never a half-imported state."""
+    batch = create_qinsi_master_preview(db_session, [master_file([
+        {"商品名称": "行A", "货号": "ROWA-0001", "单品条码": "4571609352419", "状态": "启用"},
+        {"商品名称": "行B", "货号": "ROWB-0002", "单品条码": "4901234567894", "状态": "启用"},
+    ])])
+    assert batch.new_count == 2
+
+    import app.qinsi_product_master_import as mod
+    original = mod._apply_product_fields
+    call_count = {"n": 0}
+
+    def boom(session, target, mapped, now):
+        call_count["n"] += 1
+        if call_count["n"] == 2:
+            raise RuntimeError("simulated mid-loop failure")
+        return original(session, target, mapped, now)
+
+    monkeypatch.setattr(mod, "_apply_product_fields", boom)
+
+    with pytest.raises(RuntimeError):
+        confirm_qinsi_master_import(db_session, batch)
+
+    db_session.rollback()
+    db_session.refresh(batch)
+    assert batch.status == "previewed"
+    assert batch.confirmed_at is None
+    assert db_session.scalar(
+        select(func.count()).select_from(Product).where(Product.qinsi_product_code.in_(["ROWA-0001", "ROWB-0002"]))
+    ) == 0
+
+
+def test_qinsi_master_confirm_dedupes_identical_product_and_unit_barcode(db_session):
+    """Second regression found while fixing the P0: a row whose 商品条码
+    (product_barcode) and 单品条码(unit_barcode) are the identical value used
+    to queue two pending ProductBarcode inserts for the same (product_id,
+    barcode) pair -- the session runs autoflush=False, so the second insert's
+    existence check couldn't see the first, still-unflushed one, and confirm
+    crashed with a UNIQUE constraint violation."""
+    batch = create_qinsi_master_preview(db_session, [master_file([
+        qrow(name="条码重复商品", goods_no="DUP-BARCODE-0001", unit_barcode="4901234567894", product_barcode="4901234567894"),
+    ])])
+    assert batch.new_count == 1
+    confirm_qinsi_master_import(db_session, batch)  # must not raise
+    product = db_session.scalar(select(Product).where(Product.qinsi_product_code == "DUP-BARCODE-0001"))
+    assert product is not None
+    barcodes = list(db_session.scalars(select(ProductBarcode).where(ProductBarcode.product_id == product.id)))
+    assert len(barcodes) == 1
+    assert barcodes[0].barcode == "4901234567894"
+
+
 def test_qinsi_master_duplicate_valid_jan_in_excel_is_conflict(client):
     http, db, _ = client
     response = http.post(
@@ -314,6 +427,9 @@ def test_qinsi_true_duplicate_requires_primary_product_choice(db_session):
     row = db_session.scalar(select(QinsiGoodsImportRow).where(QinsiGoodsImportRow.import_batch_id == batch.id))
     with pytest.raises(ValueError):
         resolve_qinsi_master_conflict(db_session, batch, row.id, resolution_type="true_duplicate")
+    # must be zero even though a QinsiConflictResolution row is normally
+    # flushed before the merge step -- the missing-primary_product_id check
+    # has to run before that flush, not after
     assert db_session.scalar(select(func.count()).select_from(QinsiConflictResolution)) == 0
 
 

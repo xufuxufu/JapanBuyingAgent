@@ -583,13 +583,20 @@ def _apply_product_fields(session: Session, product: Product, mapped: dict, now:
 
 
 def _sync_product_barcodes(session: Session, product: Product, mapped: dict) -> None:
+    # The session is autoflush=False, so a DB existence check can't see a
+    # sibling barcode field added moments earlier in this same call -- a row
+    # whose qinsi_product_barcode and qinsi_unit_barcode hold the identical
+    # value would otherwise queue two pending inserts for the same
+    # (product_id, barcode) pair and violate the unique constraint on flush.
+    seen: set[str] = set()
     for barcode, source in (
         (mapped.get("qinsi_product_barcode"), "qinsi_product_barcode"),
         (mapped.get("qinsi_unit_barcode"), "qinsi_unit_barcode"),
         (mapped.get("qinsi_shared_barcode"), "qinsi_shared_barcode"),
     ):
-        if not barcode or not is_valid_jan(barcode):
+        if not barcode or not is_valid_jan(barcode) or barcode in seen:
             continue
+        seen.add(barcode)
         exists = session.scalar(select(ProductBarcode).where(
             ProductBarcode.product_id == product.id,
             ProductBarcode.barcode == barcode,
@@ -692,6 +699,13 @@ def _prepare_rows(session: Session, rows: list[dict]) -> tuple[list[tuple[dict, 
                     target = candidate
                 elif candidate.qinsi_product_code == mapped.get("qinsi_goods_no"):
                     target = candidate
+                else:
+                    conflicts.append({
+                        "field": "判定JAN",
+                        "excel_value": mapped["jan"],
+                        "existing_value": [_product_summary(candidate)],
+                        "message": "判定JAN命中的本地Product已绑定不同的秦丝货号，无法自动判断对应秦丝商品",
+                    })
             elif len(jan_products) > 1 and unclaimed:
                 conflicts.append({
                     "field": "判定JAN",
@@ -860,6 +874,14 @@ def resolve_qinsi_master_conflict(
     if selected.validation_status != "conflict" and not conflicts:
         raise ValueError("该行当前不是待处理冲突")
 
+    primary: Product | None = None
+    if resolution_type == "true_duplicate":
+        if primary_product_id is None:
+            raise ValueError("同一商品重复登记需要先选择主商品")
+        primary = session.get(Product, primary_product_id)
+        if primary is None:
+            raise ValueError("主商品不存在")
+
     qinsi_codes = _qinsi_codes_for_barcode_group(mapped_rows, selected_mapped.get("jan")) or [selected_mapped.get("qinsi_goods_no")]
     conflict_key = qinsi_conflict_key(
         barcode=selected_mapped.get("jan"),
@@ -892,11 +914,6 @@ def resolve_qinsi_master_conflict(
         resolution.auto_apply = auto_apply
         resolution.updated_at = now
     if resolution_type == "true_duplicate":
-        if primary_product_id is None:
-            raise ValueError("同一商品重复登记需要先选择主商品")
-        primary = session.get(Product, primary_product_id)
-        if primary is None:
-            raise ValueError("主商品不存在")
         if selected_mapped.get("jan"):
             merge_duplicate_jan_group(
                 session,
@@ -1133,6 +1150,7 @@ def _audit_conflict_type(conflicts: list[dict]) -> str:
         "货号映射商品与最终JAN命中商品不同" in messages
         or "最终JAN未命中同一商品" in messages
         or "货号命中商品已有不同JAN" in messages
+        or "判定JAN命中的本地Product已绑定不同的秦丝货号" in messages
     ):
         return "秦丝行与现有Product身份明显不一致"
     return "其他"
