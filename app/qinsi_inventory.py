@@ -457,31 +457,20 @@ class MultiFileCompletenessReport:
         return bool(self.gaps) or bool(self.overlaps) or self.header_mismatch
 
 
-def analyze_multi_file_completeness(files: list[tuple[str, bytes]]) -> MultiFileCompletenessReport:
-    """Filename-range sanity check for a multi-file snapshot upload.
+def range_completeness_from_file_infos(
+    infos: list[FileRangeInfo], *, header_mismatch: bool,
+) -> MultiFileCompletenessReport:
+    """Pure range/gap/overlap math over already-computed per-file info.
 
-    Filenames are a hint, never the source of truth for row counts -- the
-    caller still parses every file's actual rows regardless of what this
-    reports. An unparseable filename just can't be range-checked; it is
-    never treated as a gap/overlap/error on its own.
+    Shared by every multi-file upload flow (inventory snapshot, sales
+    summary, ...) -- callers parse their own format and build FileRangeInfo
+    via _parse_filename_range()/their own row count, then hand the list
+    here. Filenames are a hint, never the source of truth for row counts;
+    an unparseable filename just can't be range-checked, never treated as a
+    gap/overlap/error on its own.
     """
-    infos: list[FileRangeInfo] = []
-    headers_seen: set[tuple[str, ...]] = set()
-    ranges: list[tuple[int, int]] = []
-    for filename, content in files:
-        parsed = parse_qinsi_workbook(content)
-        # The legacy qinsi_goods_template format's last header cell holds the
-        # sheet's single warehouse NAME (a data value), not a real column
-        # header -- comparing it across files would flag every legitimate
-        # multi-warehouse merge of that format as a header mismatch.
-        comparable_headers = parsed.headers[:-1] if parsed.source_format == "qinsi_goods_template" else parsed.headers
-        headers_seen.add(comparable_headers)
-        row_range = _parse_filename_range(filename)
-        infos.append(FileRangeInfo(filename=Path(filename).name, range=row_range, row_count=len(parsed.rows)))
-        if row_range:
-            ranges.append(row_range)
-
-    all_ranges_parsed = bool(files) and len(ranges) == len(files)
+    ranges = [info.range for info in infos if info.range]
+    all_ranges_parsed = bool(infos) and len(ranges) == len(infos)
     ranges_sorted = sorted(ranges)
     overlaps: list[tuple[int, int, int, int]] = []
     for i in range(len(ranges_sorted)):
@@ -506,8 +495,29 @@ def analyze_multi_file_completeness(files: list[tuple[str, bytes]]) -> MultiFile
         actual_total_rows=sum(info.row_count for info in infos),
         gaps=tuple(gaps),
         overlaps=tuple(overlaps),
-        header_mismatch=len(headers_seen) > 1,
+        header_mismatch=header_mismatch,
     )
+
+
+def analyze_multi_file_completeness(files: list[tuple[str, bytes]]) -> MultiFileCompletenessReport:
+    """Filename-range sanity check for a multi-file INVENTORY snapshot upload
+    (qinsi_goods_import's format). See range_completeness_from_file_infos()
+    for the format-agnostic core this delegates to.
+    """
+    infos: list[FileRangeInfo] = []
+    headers_seen: set[tuple[str, ...]] = set()
+    for filename, content in files:
+        parsed = parse_qinsi_workbook(content)
+        # The legacy qinsi_goods_template format's last header cell holds the
+        # sheet's single warehouse NAME (a data value), not a real column
+        # header -- comparing it across files would flag every legitimate
+        # multi-warehouse merge of that format as a header mismatch.
+        comparable_headers = parsed.headers[:-1] if parsed.source_format == "qinsi_goods_template" else parsed.headers
+        headers_seen.add(comparable_headers)
+        row_range = _parse_filename_range(filename)
+        infos.append(FileRangeInfo(filename=Path(filename).name, range=row_range, row_count=len(parsed.rows)))
+
+    return range_completeness_from_file_infos(infos, header_mismatch=len(headers_seen) > 1)
 
 
 def _validate_upload_files(files: list[tuple[str, bytes]], settings: InventorySettings) -> None:

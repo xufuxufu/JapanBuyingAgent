@@ -1,0 +1,15 @@
+{% extends "base.html" %}
+{% block title %}导入秦丝进销存汇总{% endblock %}
+{% block content %}
+<div class="section-head"><div><h1>导入秦丝进销存汇总</h1><p class="muted">来自秦丝"报表 → 进销存汇总"导出。可一次选择多个分段Excel（例如"商品汇总列表导出(1-500).xlsx"...(5501-5699).xlsx），合并为同一个统计周期的快照。Excel本身不含统计日期，请手工填写。</p></div><a class="button secondary" href="/qinsi-sales-summary">返回列表</a></div>
+{% if error %}<div class="warning"><strong>解析失败：</strong>{{ error }}</div>{% endif %}
+<section class="card">
+  <form class="form-grid" method="post" enctype="multipart/form-data">
+    <label class="full">秦丝 Excel（可多选）<input type="file" name="files" accept=".xlsx" multiple required></label>
+    <label>统计开始日期<input type="date" name="period_start" required></label>
+    <label>统计结束日期<input type="date" name="period_end" required></label>
+    <button class="full" type="submit">解析并预览</button>
+  </form>
+  <p class="muted">这一步只解析预览，不会写入任何数据；确认无误后才会创建正式快照。同一批文件+统计周期只需要来自秦丝网页查询条件设置的开始/结束日期，不要根据文件名猜测。</p>
+</section>
+{% endblock %}

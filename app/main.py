@@ -121,6 +121,14 @@ from app.qinsi_inventory import (
     map_line_warehouse, preview_inventory_snapshot_files, purchase_assistance, retry_snapshot_matching,
     update_product_low_stock_threshold, watched_inventory_status_distribution,
 )
+from app.qinsi_sales_summary import (
+    DEFAULT_SALES_SUMMARY_LINE_PAGE_SIZE, SALES_SUMMARY_LINE_PAGE_SIZES,
+    PreviewTokenError, SalesSummaryImportError,
+    analyze_sales_summary_completeness, create_preview_token, create_sales_summary_snapshot_from_files,
+    discard_preview_token, get_sales_summary_lines_page, get_sales_summary_snapshot_summary,
+    list_sales_summary_snapshots, load_preview_token,
+    preview_sales_summary_files, product_replenishment_signals, sales_summary_for_products,
+)
 from app.schemas import LocationOutput, PriceLookupInput, ProductCreateInput, ProductOutput, ProductUpdateInput, PurchaseBatchOutput, PurchaseConfirmationInput, QinsiExportConfirmationInput, ReceiptDraftInput, ReceiptItemDraftInput, StoreBrandCreateInput, StoreCreateInput
 from app.store_service import confirm_receipt_store, create_store, create_store_brand, product_store_summaries, product_trend_points, purchase_facts, store_monthly_trend_points, store_overview_summaries, store_product_summaries
 from app.restock_service import (
@@ -3144,8 +3152,11 @@ def api_sales_order_product_search(q: str = Query(""), db: Session = Depends(get
 
 def _procurement_product_search_payload(
     product: Product, *, inventory_by_id: dict[int, object], in_transit_by_id: dict[int, int],
+    sales_7d_by_id: dict[int, object], sales_30d_by_id: dict[int, object],
 ) -> dict:
     inventory = inventory_by_id.get(product.id)
+    sales_7d = sales_7d_by_id.get(product.id)
+    sales_30d = sales_30d_by_id.get(product.id)
     return {
         "id": product.id,
         "display_name": product.display_name or product.name_cn or product.name_ja or product.internal_sku,
@@ -3155,9 +3166,16 @@ def _procurement_product_search_payload(
         "china_quantity": inventory.china_quantity if inventory else None,
         "japan_quantity": inventory.japan_quantity if inventory else None,
         "in_transit_quantity": in_transit_by_id.get(product.id, 0),
-        # No official 30-day-sales or reorder-quantity data source exists yet
-        # (audited this round) -- deliberately NOT sent as fabricated numbers;
-        # the page shows a static "--" for these two instead of a fake field.
+        # Phase 9A: real 秦丝进销存汇总 facts. known=False must render as "--",
+        # never as 0 -- a Product simply outside the latest snapshot's coverage
+        # (or not yet imported) is unknown, not "sold zero".
+        "sales_7d": sales_7d.sales_quantity if sales_7d and sales_7d.sales_known else None,
+        "sales_7d_known": bool(sales_7d.sales_known) if sales_7d else False,
+        "sales_30d": sales_30d.sales_quantity if sales_30d and sales_30d.sales_known else None,
+        "sales_30d_known": bool(sales_30d.sales_known) if sales_30d else False,
+        # No official reorder-quantity formula exists yet (Phase 9B) --
+        # deliberately NOT sent as a fabricated number; the page shows a
+        # static "--" for it instead of a fake field.
     }
 
 
@@ -3170,8 +3188,13 @@ def api_procurement_product_search(q: str = Query(""), db: Session = Depends(get
     product_ids = [product.id for product in products]
     inventory_by_id = reference_inventory_for_products(db, product_ids)
     in_transit_by_id = in_transit_quantity_for_products(db, product_ids)
+    sales_7d_by_id = sales_summary_for_products(db, product_ids, 7)
+    sales_30d_by_id = sales_summary_for_products(db, product_ids, 30)
     return [
-        _procurement_product_search_payload(product, inventory_by_id=inventory_by_id, in_transit_by_id=in_transit_by_id)
+        _procurement_product_search_payload(
+            product, inventory_by_id=inventory_by_id, in_transit_by_id=in_transit_by_id,
+            sales_7d_by_id=sales_7d_by_id, sales_30d_by_id=sales_30d_by_id,
+        )
         for product in products
     ]
 
@@ -3708,6 +3731,7 @@ def procurement_demands_page(
     plan_executions: dict = {}
     store_purchase_entries: list = []
     reconciliation_summaries: dict = {}
+    plan_sales: dict = {}
     if view == "open":
         groups = [g for g in aggregate_open_demand_groups(db) if g.confirmed_demands]
         inventory_contexts = build_group_inventory_contexts(db, groups)
@@ -3726,6 +3750,18 @@ def procurement_demands_page(
             plans = [plan for plan in all_plans if execution_summaries[plan.id].purchased_quantity > 0]
             group_by = "product"
         plan_inventories = build_plan_inventory_contexts(db, plans)
+        plan_product_ids = [plan.product_id for plan in plans if plan.product_id]
+        sales_7d_by_product = sales_summary_for_products(db, plan_product_ids, 7)
+        sales_30d_by_product = sales_summary_for_products(db, plan_product_ids, 30)
+        plan_sales = {
+            plan.id: {
+                "sales_7d": sales_7d_by_product[plan.product_id].sales_quantity,
+                "sales_7d_known": sales_7d_by_product[plan.product_id].sales_known,
+                "sales_30d": sales_30d_by_product[plan.product_id].sales_quantity,
+                "sales_30d_known": sales_30d_by_product[plan.product_id].sales_known,
+            }
+            for plan in plans if plan.product_id
+        }
         plan_store_contexts, store_coverage = build_plan_store_overview(db, plans)
         plan_executions = build_plan_executions(db, plans)
         reconciliation_summaries = build_plan_reconciliation_summaries(db, plans)
@@ -3742,7 +3778,7 @@ def procurement_demands_page(
         "group_by": group_by, "groups": groups, "investigations": investigations, "plans": plans,
         "demand_type_labels": DEMAND_TYPE_LABELS, "source_type_labels": SOURCE_TYPE_LABELS,
         "status_labels": PROCUREMENT_STATUS_LABELS, "default_qty": default_planned_quantity_for_group,
-        "inventory_contexts": inventory_contexts, "plan_inventories": plan_inventories,
+        "inventory_contexts": inventory_contexts, "plan_inventories": plan_inventories, "plan_sales": plan_sales,
         "plan_store_contexts": plan_store_contexts, "store_coverage": store_coverage,
         "store_groups": store_groups, "active_stores": active_stores,
         "execution_summaries": execution_summaries, "plan_executions": plan_executions,
@@ -3933,9 +3969,26 @@ def procurement_purchase_page(request: Request, store_id: str = Query(""), db: S
     active_stores = list(db.scalars(
         select(Store).where(Store.is_active.is_(True)).order_by(Store.name_cn, Store.name_ja, Store.id)
     ))
+    plan_product_ids = [plan.product_id for plan in plans if plan.product_id]
+    inventory_by_product = reference_inventory_for_products(db, plan_product_ids)
+    sales_7d_by_product = sales_summary_for_products(db, plan_product_ids, 7)
+    sales_30d_by_product = sales_summary_for_products(db, plan_product_ids, 30)
+    plan_sales = {
+        plan.id: {
+            "china_quantity": inventory_by_product[plan.product_id].china_quantity,
+            "china_known": inventory_by_product[plan.product_id].china_known,
+            "japan_quantity": inventory_by_product[plan.product_id].japan_quantity,
+            "japan_known": inventory_by_product[plan.product_id].japan_known,
+            "sales_7d": sales_7d_by_product[plan.product_id].sales_quantity,
+            "sales_7d_known": sales_7d_by_product[plan.product_id].sales_known,
+            "sales_30d": sales_30d_by_product[plan.product_id].sales_quantity,
+            "sales_30d_known": sales_30d_by_product[plan.product_id].sales_known,
+        }
+        for plan in plans if plan.product_id
+    }
     return templates.TemplateResponse(request, "procurement_purchase.html", {
         "store": store, "store_id_param": store_id, "plans": plans, "summaries": summaries,
-        "active_stores": active_stores, "error": request.query_params.get("error"),
+        "active_stores": active_stores, "plan_sales": plan_sales, "error": request.query_params.get("error"),
     })
 
 
@@ -4386,6 +4439,125 @@ async def qinsi_inventory_snapshot_confirm_batch(
         }, status_code=422)
     message = "重复文件组合，已返回原快照" if reused else f"库存快照导入完成（合并{len(file_payload)}个文件）"
     return RedirectResponse(f"/qinsi-inventory-snapshots/{snapshot.id}?message={quote(message)}", status_code=303)
+
+
+def _parsed_period_date(value: str, *, label: str) -> datetime:
+    value = (value or "").strip()
+    if not value:
+        raise SalesSummaryImportError(f"请填写{label}")
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError as exc:
+        raise SalesSummaryImportError(f"{label}格式不正确") from exc
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed
+
+
+@app.get("/qinsi-sales-summary/upload", response_class=HTMLResponse)
+def qinsi_sales_summary_upload_page(request: Request):
+    return templates.TemplateResponse(request, "qinsi_sales_summary_upload.html", {"error": None})
+
+
+@app.post("/qinsi-sales-summary/upload", response_class=HTMLResponse)
+async def qinsi_sales_summary_upload(
+    request: Request,
+    files: list[UploadFile] = File(...),
+    period_start: str = Form(""),
+    period_end: str = Form(""),
+    db: Session = Depends(get_db),
+):
+    """Reads the real uploaded files (large, streamed -- not subject to
+    Starlette's 1MB per-FIELD cap) and stages them server-side under a
+    random token. The browser only ever carries that token forward to
+    confirm -- never the file bytes themselves. See create_preview_token's
+    docstring for why."""
+    file_payload = [(file.filename or "unnamed.xlsx", await file.read()) for file in files]
+    try:
+        start = _parsed_period_date(period_start, label="统计开始日期")
+        end = _parsed_period_date(period_end, label="统计结束日期")
+        preview = preview_sales_summary_files(db, file_payload, period_start=start, period_end=end)
+    except (ValueError, SalesSummaryImportError) as exc:
+        return templates.TemplateResponse(request, "qinsi_sales_summary_upload.html", {
+            "error": str(exc),
+        }, status_code=422)
+    token = create_preview_token(
+        file_payload, period_start=start, period_end=end,
+        preview_summary={
+            "total_rows": preview.total_rows, "matched_count": preview.matched_count,
+            "unmatched_count": preview.unmatched_count, "conflict_count": preview.conflict_count,
+        },
+    )
+    return templates.TemplateResponse(request, "qinsi_sales_summary_preview.html", {
+        "preview": preview, "preview_token": token, "error": None,
+    })
+
+
+@app.post("/qinsi-sales-summary/confirm", response_class=HTMLResponse)
+async def qinsi_sales_summary_confirm(request: Request, db: Session = Depends(get_db)):
+    form = await request.form()
+    token = str(form.get("preview_token") or "")
+    override_completeness_warning = str(form.get("override_completeness_warning") or "").strip().lower() in {"true", "1", "on", "yes"}
+    try:
+        token_data = load_preview_token(token)
+    except PreviewTokenError as exc:
+        return templates.TemplateResponse(request, "qinsi_sales_summary_upload.html", {
+            "error": str(exc),
+        }, status_code=422)
+
+    file_payload = list(token_data.files)
+    try:
+        completeness = analyze_sales_summary_completeness(file_payload)
+        if completeness.has_blocking_issue and not override_completeness_warning:
+            raise SalesSummaryImportError("分段范围存在缺段/重叠/表头不一致，请先勾选“仍要继续”后再确认")
+        snapshot, reused = create_sales_summary_snapshot_from_files(
+            db, file_payload, period_start=token_data.period_start, period_end=token_data.period_end,
+        )
+    except (ValueError, SalesSummaryImportError) as exc:
+        # Business validation failed (not the token itself) -- the staged
+        # files are still on disk and still valid for a retry, so re-render
+        # the SAME preview/token rather than discarding it.
+        preview = preview_sales_summary_files(
+            db, file_payload, period_start=token_data.period_start, period_end=token_data.period_end,
+        )
+        return templates.TemplateResponse(request, "qinsi_sales_summary_preview.html", {
+            "preview": preview, "preview_token": token, "error": str(exc),
+        }, status_code=422)
+    discard_preview_token(token)
+    message = "重复文件组合，已返回原快照" if reused else f"进销存汇总导入完成（合并{len(file_payload)}个文件）"
+    return RedirectResponse(f"/qinsi-sales-summary/{snapshot.id}?message={quote(message)}", status_code=303)
+
+
+@app.get("/qinsi-sales-summary", response_class=HTMLResponse)
+def qinsi_sales_summary_list(request: Request, db: Session = Depends(get_db)):
+    return templates.TemplateResponse(request, "qinsi_sales_summary_snapshots.html", {
+        "snapshots": list_sales_summary_snapshots(db),
+    })
+
+
+@app.get("/qinsi-sales-summary/{snapshot_id}", response_class=HTMLResponse)
+def qinsi_sales_summary_detail(
+    snapshot_id: int, request: Request,
+    match_status: str = Query("all"), q: str = Query(""),
+    page: int = Query(1, ge=1), page_size: int = Query(DEFAULT_SALES_SUMMARY_LINE_PAGE_SIZE),
+    db: Session = Depends(get_db),
+):
+    snapshot = get_sales_summary_snapshot_summary(db, snapshot_id)
+    if snapshot is None:
+        raise HTTPException(404, "进销存汇总快照不存在")
+    if match_status not in ("all", "matched", "unmatched", "conflict"):
+        match_status = "all"
+    if page_size not in SALES_SUMMARY_LINE_PAGE_SIZES:
+        page_size = DEFAULT_SALES_SUMMARY_LINE_PAGE_SIZE
+    lines_page = get_sales_summary_lines_page(
+        db, snapshot_id, match_status=match_status, search_query=q.strip() or None,
+        page=page, page_size=page_size,
+    )
+    return templates.TemplateResponse(request, "qinsi_sales_summary_detail.html", {
+        "snapshot": snapshot, "lines_page": lines_page, "match_status": match_status, "q": q,
+        "page_sizes": SALES_SUMMARY_LINE_PAGE_SIZES, "match_method_labels": MATCH_METHOD_LABELS,
+        "message": request.query_params.get("message"),
+    })
 
 
 def _qinsi_inventory_snapshot_or_404(db: Session, snapshot_id: int):

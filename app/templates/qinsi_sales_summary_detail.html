@@ -1,0 +1,77 @@
+{% extends "base.html" %}
+{% block title %}进销存汇总 {{ snapshot.snapshot_no }}{% endblock %}
+{% block content %}
+<div class="section-head"><div><h1>{{ snapshot.snapshot_no }}</h1><p class="muted">统计周期 {{ snapshot.period_start.strftime('%Y-%m-%d') }} ~ {{ snapshot.period_end.strftime('%Y-%m-%d') }}（{{ snapshot.period_days }}天）· 导入于 {{ snapshot.imported_at|tokyo_datetime }}</p></div><a class="button secondary" href="/qinsi-sales-summary">返回列表</a></div>
+{% if message %}<div class="success message">{{ message }}</div>{% endif %}
+
+<section class="card">
+  <div class="summary-grid">
+    <span><strong>{{ snapshot.total_rows }}</strong>总行数</span>
+    <span><strong>{{ snapshot.matched_rows }}</strong>已匹配</span>
+    <span><strong>{{ snapshot.unmatched_rows }}</strong>未匹配</span>
+    <span><strong>{{ snapshot.conflict_rows }}</strong>冲突</span>
+  </div>
+</section>
+
+<section class="card">
+  <h2>明细</h2>
+  <form method="get" class="so-filter">
+    <div class="form-grid">
+      <label>匹配状态<select name="match_status">
+        <option value="all"{% if match_status == 'all' %} selected{% endif %}>全部</option>
+        <option value="matched"{% if match_status == 'matched' %} selected{% endif %}>已匹配</option>
+        <option value="unmatched"{% if match_status == 'unmatched' %} selected{% endif %}>未匹配</option>
+        <option value="conflict"{% if match_status == 'conflict' %} selected{% endif %}>冲突</option>
+      </select></label>
+      <label>搜索（商品名/货号/JAN）<input type="search" name="q" value="{{ q }}" placeholder="输入关键词"></label>
+    </div>
+    <input type="hidden" name="page" value="1">
+    <input type="hidden" name="page_size" value="{{ lines_page.page_size }}">
+    <button type="submit" class="compact">应用筛选</button>
+  </form>
+  {% if snapshot.unmatched_rows > 0 %}<p class="muted"><a href="?match_status=unmatched&q=&page=1&page_size={{ lines_page.page_size }}">一键查看全部 {{ snapshot.unmatched_rows }} 条未匹配</a>{% if snapshot.conflict_rows > 0 %} · <a href="?match_status=conflict&q=&page=1&page_size={{ lines_page.page_size }}">查看全部 {{ snapshot.conflict_rows }} 条冲突</a>{% endif %}</p>{% endif %}
+
+  {% set qs = {'match_status': match_status, 'q': q} %}
+  {% set base_qs = qs|urlencode %}
+  <div class="pagination-bar">
+    <span class="pagination-summary">共 {{ lines_page.total_count }} 行 · 第 {{ lines_page.page }} / {{ lines_page.total_pages }} 页</span>
+    <div class="pagination-controls">
+      <a class="{{ 'disabled' if lines_page.page <= 1 }}" href="?{{ base_qs }}&page={{ lines_page.page - 1 }}&page_size={{ lines_page.page_size }}">‹ 上一页</a>
+      <span class="active">{{ lines_page.page }}</span>
+      <a class="{{ 'disabled' if lines_page.page >= lines_page.total_pages }}" href="?{{ base_qs }}&page={{ lines_page.page + 1 }}&page_size={{ lines_page.page_size }}">下一页 ›</a>
+    </div>
+    <form method="get" class="page-size-select">
+      {% for key, value in qs.items() %}<input type="hidden" name="{{ key }}" value="{{ value }}">{% endfor %}
+      <input type="hidden" name="page" value="1">
+      <label>每页<select name="page_size" onchange="this.form.submit()">
+        {% for size in page_sizes %}<option value="{{ size }}"{% if lines_page.page_size == size %} selected{% endif %}>{{ size }}</option>{% endfor %}
+      </select></label>
+    </form>
+  </div>
+
+  <div class="table-wrap"><table><thead><tr>
+    <th>原始行</th><th>秦丝原始（商品名/货号/JAN）</th><th>匹配状态</th><th>匹配方式</th><th>匹配到JBA商品</th>
+    <th>销售量</th><th>销售金额</th><th>采购量</th><th>购买客户数</th>
+  </tr></thead><tbody>
+  {% for line in lines_page.lines %}<tr>
+    <td>{{ line.original_row_no }}</td>
+    <td>{{ line.product_name_snapshot or '—' }}<br><small class="muted">货号：{{ line.qinsi_product_code or '—' }} · JAN：{{ line.jan_candidate or '—' }}</small></td>
+    <td>{{ '已匹配' if line.match_status == 'matched' else ('冲突' if line.match_status == 'conflict' else '未匹配') }}</td>
+    <td>{{ match_method_labels.get(line.matching_method, line.matching_method or '—') }}</td>
+    <td>{% if line.product %}<a href="/products/{{ line.product.id }}">{{ line.product.display_name or line.product.name_cn or line.product.name_ja or line.product.internal_sku }}</a><br><small class="muted">{{ line.product.internal_sku }} · id={{ line.product.id }}</small>{% else %}—{% endif %}</td>
+    <td>{{ line.sales_quantity if line.sales_quantity is not none else '—' }}</td>
+    <td>{{ line.sales_amount if line.sales_amount is not none else '—' }}</td>
+    <td>{{ line.purchase_quantity if line.purchase_quantity is not none else '—' }}</td>
+    <td>{{ line.customer_count if line.customer_count is not none else '—' }}</td>
+  </tr>{% else %}<tr><td colspan="9">没有符合筛选条件的明细。</td></tr>{% endfor %}
+  </tbody></table></div>
+
+  <div class="pagination-bar">
+    <span class="pagination-summary">共 {{ lines_page.total_count }} 行 · 第 {{ lines_page.page }} / {{ lines_page.total_pages }} 页</span>
+    <div class="pagination-controls">
+      <a class="{{ 'disabled' if lines_page.page <= 1 }}" href="?{{ base_qs }}&page={{ lines_page.page - 1 }}&page_size={{ lines_page.page_size }}">‹ 上一页</a>
+      <a class="{{ 'disabled' if lines_page.page >= lines_page.total_pages }}" href="?{{ base_qs }}&page={{ lines_page.page + 1 }}&page_size={{ lines_page.page_size }}">下一页 ›</a>
+    </div>
+  </div>
+</section>
+{% endblock %}

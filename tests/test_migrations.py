@@ -28,6 +28,7 @@ def test_migration_from_empty_and_repeat_safe(tmp_path, monkeypatch):
     assert {"receipt_batches", "receipt_images", "receipts", "receipt_items", "ai_recognition_runs", "products", "product_aliases", "store_brands", "stores", "store_aliases", "locations", "purchase_batches", "purchase_batch_items", "inventory_transactions", "import_jobs", "import_rows", "product_match_logs", "qinsi_export_jobs", "qinsi_export_lines", "qinsi_export_line_sources", "qinsi_purchase_export_jobs", "qinsi_purchase_export_lines", "qinsi_purchase_export_line_sources", "marketplaces", "price_search_runs", "product_offers", "price_provider_attempts", "price_lookup_histories", "price_watch_rules", "price_alerts", "product_watch_configs", "product_watch_recommendations", "duplicate_detection_logs", "zip_package_jobs", "zip_package_items"} <= tables
     assert {"product_watch_snapshots", "product_watch_notifications", "monitor_scheduler_states"} <= tables
     assert {"qinsi_inventory_snapshots", "qinsi_inventory_snapshot_lines", "qinsi_product_mappings"} <= tables
+    assert {"qinsi_sales_summary_snapshots", "qinsi_sales_summary_lines"} <= tables
     assert {
         "qinsi_import_batches", "qinsi_goods_import_rows", "qinsi_master_values", "product_barcodes",
         "qinsi_conflict_resolutions",
@@ -88,6 +89,59 @@ def test_0046_procurement_demand_manual_image_columns_upgrade_and_downgrade(tmp_
         "manual_image_relative_path", "manual_image_original_filename",
         "manual_image_content_type", "manual_image_file_size",
     } <= columns_final
+
+
+def test_0047_qinsi_sales_summary_upgrade_downgrade_reupgrade(tmp_path, monkeypatch):
+    db_path = tmp_path / "sales-summary.sqlite3"
+    monkeypatch.setenv("JBA_DATABASE_URL", f"sqlite:///{db_path.as_posix()}")
+    config = Config(str(Path(__file__).resolve().parents[1] / "alembic.ini"))
+    command.upgrade(config, "head")
+    command.upgrade(config, "head")
+    with sqlite3.connect(db_path) as connection:
+        snapshot_columns = {row[1] for row in connection.execute("PRAGMA table_info(qinsi_sales_summary_snapshots)")}
+        line_columns = {row[1] for row in connection.execute("PRAGMA table_info(qinsi_sales_summary_lines)")}
+        connection.execute(
+            "INSERT INTO qinsi_sales_summary_snapshots "
+            "(snapshot_no, period_start, period_end, period_days, imported_at, original_filename, "
+            "file_hash, file_content, total_rows, matched_rows, unmatched_rows, conflict_rows, status, created_at) "
+            "VALUES ('QSS-TEST-1', '2026-08-01', '2026-08-30', 30, datetime('now'), 't.zip', 'h1', x'00', "
+            "1, 1, 0, 0, 'completed', datetime('now'))"
+        )
+        snapshot_id = connection.execute("SELECT id FROM qinsi_sales_summary_snapshots").fetchone()[0]
+        connection.execute(
+            "INSERT INTO qinsi_sales_summary_lines "
+            "(snapshot_id, original_row_no, product_name_snapshot, qinsi_product_code, jan_candidate, "
+            "match_status, sales_quantity, sales_amount, raw_row_json, created_at) "
+            "VALUES (?, 1, '测试商品', '000123', '4900000000001', 'matched', 5, '1234.50', '{}', datetime('now'))",
+            (snapshot_id,),
+        )
+        connection.commit()
+        fk_check = connection.execute("PRAGMA foreign_key_check").fetchall()
+    assert {
+        "snapshot_no", "period_start", "period_end", "period_days", "total_rows",
+        "matched_rows", "unmatched_rows", "conflict_rows", "status",
+    } <= snapshot_columns
+    assert {
+        "product_id", "match_status", "purchase_quantity", "purchase_amount",
+        "sales_quantity", "sales_amount", "customer_count",
+        "reported_current_inventory", "reported_support_sales_days",
+    } <= line_columns
+    assert fk_check == []
+
+    command.downgrade(config, "20260901_0046")
+    with sqlite3.connect(db_path) as connection:
+        tables = {row[0] for row in connection.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+        integrity = connection.execute("PRAGMA integrity_check").fetchone()
+    assert "qinsi_sales_summary_snapshots" not in tables
+    assert "qinsi_sales_summary_lines" not in tables
+    assert integrity == ("ok",)
+
+    command.upgrade(config, "head")
+    with sqlite3.connect(db_path) as connection:
+        revision = connection.execute("SELECT version_num FROM alembic_version").fetchone()
+        tables = {row[0] for row in connection.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+    assert revision == (HEAD_REVISION,)
+    assert {"qinsi_sales_summary_snapshots", "qinsi_sales_summary_lines"} <= tables
 
 
 def test_0038_sales_order_tables_are_empty_and_repeat_safe(tmp_path, monkeypatch):

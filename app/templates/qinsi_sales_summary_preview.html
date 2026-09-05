@@ -1,0 +1,67 @@
+{% extends "base.html" %}
+{% block title %}进销存汇总预览{% endblock %}
+{% block content %}
+<div class="section-head"><div><h1>进销存汇总预览</h1><p class="muted">尚未写入任何数据。确认无误后点击底部按钮，{{ preview.completeness.files|length }}个文件会合并生成唯一一个统计周期为{{ preview.period_days }}天的快照。此预览1小时内有效，过期请重新上传。</p></div><a class="button secondary" href="/qinsi-sales-summary/upload">重新选择文件</a></div>
+{% if error %}<div class="warning"><strong>确认失败：</strong>{{ error }}</div>{% endif %}
+
+<section class="card table-wrap">
+  <h2>统计周期</h2>
+  <div class="summary-grid">
+    <span><strong>{{ preview.period_start.strftime('%Y-%m-%d') }}</strong>开始日期</span>
+    <span><strong>{{ preview.period_end.strftime('%Y-%m-%d') }}</strong>结束日期</span>
+    <span><strong>{{ preview.period_days }}</strong>统计天数</span>
+  </div>
+</section>
+
+<section class="card table-wrap">
+  <h2>文件分段完整性</h2>
+  <div class="summary-grid">
+    <span><strong>{{ preview.completeness.files|length }}</strong>文件数</span>
+    <span><strong>{{ preview.completeness.expected_min if preview.completeness.expected_min is not none else '—' }}-{{ preview.completeness.expected_max if preview.completeness.expected_max is not none else '—' }}</strong>文件名范围</span>
+    <span><strong>{{ preview.total_rows }}</strong>有效数据行</span>
+  </div>
+  {% if not preview.completeness.all_ranges_parsed %}<p class="warning">部分文件名无法解析出范围，无法验证分段完整性（不影响导入，仍以文件实际数据为准）。</p>{% endif %}
+  {% if preview.completeness.gaps %}<p class="warning">发现缺段：{% for a,b in preview.completeness.gaps %}{{ a }}-{{ b }}{% if not loop.last %}、{% endif %}{% endfor %}</p>{% endif %}
+  {% if preview.completeness.overlaps %}<p class="warning">发现范围重叠：{% for a,b,c,d in preview.completeness.overlaps %}({{ a }}-{{ b }}) 与 ({{ c }}-{{ d }}){% if not loop.last %}、{% endif %}{% endfor %}</p>{% endif %}
+  {% if preview.completeness.header_mismatch %}<p class="warning">文件表头不一致，请确认这些文件确实来自同一次导出。</p>{% endif %}
+  <table><thead><tr><th>文件名</th><th>文件名范围</th><th>Excel行数</th></tr></thead><tbody>
+  {% for info in preview.completeness.files %}<tr><td>{{ info.filename }}</td><td>{{ '%d-%d'|format(info.range[0], info.range[1]) if info.range else '无法解析' }}</td><td>{{ info.row_count }}</td></tr>{% endfor %}
+  </tbody></table>
+</section>
+
+<section class="card">
+  <h2>匹配统计</h2>
+  <div class="summary-grid">
+    <span><strong>{{ preview.matched_count }}</strong>已匹配</span>
+    <span><strong>{{ preview.unmatched_count }}</strong>未匹配</span>
+    <span><strong>{{ preview.conflict_count }}</strong>冲突</span>
+  </div>
+</section>
+
+<section class="card">
+  <h2>销售/采购统计</h2>
+  <div class="summary-grid">
+    <span><strong>{{ preview.sales_positive_sku_count }}</strong>有销量商品数</span>
+    <span><strong>{{ preview.sales_quantity_total }}</strong>销售量合计</span>
+    <span><strong>{{ preview.sales_amount_total }}</strong>销售金额合计</span>
+    <span><strong>{{ preview.purchase_quantity_total }}</strong>采购量合计</span>
+  </div>
+</section>
+
+{% if preview.duplicate_qinsi_codes %}
+<section class="card table-wrap">
+  <h2>同一货号出现多次（未自动合并，请检查文件范围是否重叠）</h2>
+  <table><thead><tr><th>货号</th><th>出现位置</th></tr></thead><tbody>
+  {% for dup in preview.duplicate_qinsi_codes %}<tr><td>{{ dup.qinsi_product_code }}</td><td>{% for file, row_no in dup.occurrences %}{{ file }}第{{ row_no }}行{% if not loop.last %}、{% endif %}{% endfor %}</td></tr>{% endfor %}
+  </tbody></table>
+</section>
+{% endif %}
+
+<section class="card">
+  <form method="post" action="/qinsi-sales-summary/confirm" class="stack">
+    <input type="hidden" name="preview_token" value="{{ preview_token }}">
+    {% if preview.completeness.has_blocking_issue %}<label class="checkbox"><input type="checkbox" name="override_completeness_warning" value="true" required>我已确认上方缺段/重叠/表头不一致的提示，仍要继续导入</label>{% endif %}
+    <button class="full" type="submit">确认创建进销存汇总快照（合并{{ preview.completeness.files|length }}个文件）</button>
+  </form>
+</section>
+{% endblock %}

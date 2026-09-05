@@ -61,7 +61,7 @@
       product.qinsi_product_code ? `秦丝货号：${product.qinsi_product_code}` : null,
       `中国 ${inventoryText(product.china_quantity)} · 日本 ${inventoryText(product.japan_quantity)}`,
       `采购中 ${product.in_transit_quantity ?? 0}`,
-      "近30天销量 --",
+      `7天 ${inventoryText(product.sales_7d)} · 30天 ${inventoryText(product.sales_30d)}`,
       "参考订货量 --",
     ];
     pickedMeta.textContent = metaBits.filter(Boolean).join(" · ");
@@ -113,7 +113,7 @@
     const lines = [
       [product.jan, product.qinsi_product_code].filter(Boolean).join(" · "),
       `中国 ${inventoryText(product.china_quantity)} · 日本 ${inventoryText(product.japan_quantity)} · 采购中 ${product.in_transit_quantity ?? 0}`,
-      "近30天销量 -- · 参考订货量 --",
+      `7天 ${inventoryText(product.sales_7d)} · 30天 ${inventoryText(product.sales_30d)} · 参考订货量 --`,
     ];
     lines.filter(Boolean).forEach((text) => {
       const small = document.createElement("small");

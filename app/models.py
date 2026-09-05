@@ -309,6 +309,7 @@ class Product(Base):
     watch_snapshots: Mapped[list[ProductWatchSnapshot]] = relationship(back_populates="product")
     watch_notifications: Mapped[list[ProductWatchNotification]] = relationship(back_populates="product")
     qinsi_inventory_lines: Mapped[list[QinsiInventorySnapshotLine]] = relationship(back_populates="product")
+    qinsi_sales_summary_lines: Mapped[list[QinsiSalesSummaryLine]] = relationship(back_populates="product")
     qinsi_product_mappings: Mapped[list[QinsiProductMapping]] = relationship(back_populates="product")
     barcodes: Mapped[list[ProductBarcode]] = relationship(back_populates="product", cascade="all, delete-orphan")
     restock_list_items: Mapped[list[RestockListItem]] = relationship(back_populates="product")
@@ -766,6 +767,80 @@ class QinsiInventorySnapshotLine(Base):
     snapshot: Mapped[QinsiInventorySnapshot] = relationship(back_populates="lines")
     product: Mapped[Product | None] = relationship(back_populates="qinsi_inventory_lines")
     warehouse: Mapped[Location | None] = relationship(back_populates="qinsi_inventory_lines")
+
+
+class QinsiSalesSummarySnapshot(Base):
+    """秦丝报表 -> 进销存汇总 export, for a single user-declared date range.
+
+    Deliberately NOT the inventory authority (QinsiInventorySnapshot stays
+    that) -- this only carries sales/purchase FACTS as QinSi reported them
+    for one period. One table serves any period length (1/7/30/自定义 days);
+    period_days is derived from the user-entered dates, never guessed from a
+    filename."""
+    __tablename__ = "qinsi_sales_summary_snapshots"
+    __table_args__ = (
+        CheckConstraint(
+            "status IN ('completed','completed_with_issues','failed')",
+            name="ck_qinsi_sales_summary_snapshots_status",
+        ),
+        CheckConstraint("period_end >= period_start", name="ck_qinsi_sales_summary_snapshots_period_order"),
+        Index("uq_qinsi_sales_summary_snapshots_file_hash", "file_hash", unique=True),
+        Index("ix_qinsi_sales_summary_snapshots_period", "period_start", "period_end"),
+    )
+    id: Mapped[int] = mapped_column(primary_key=True)
+    snapshot_no: Mapped[str] = mapped_column(String(64), unique=True, nullable=False)
+    period_start: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    period_end: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    period_days: Mapped[int] = mapped_column(Integer, nullable=False)
+    imported_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
+    original_filename: Mapped[str] = mapped_column(String(255), nullable=False)
+    file_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    file_content: Mapped[bytes] = mapped_column(LargeBinary, nullable=False)
+    total_rows: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    matched_rows: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    unmatched_rows: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    conflict_rows: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    status: Mapped[str] = mapped_column(String(30), nullable=False)
+    error_summary: Mapped[str | None] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
+    lines: Mapped[list[QinsiSalesSummaryLine]] = relationship(
+        back_populates="snapshot", cascade="all, delete-orphan", order_by="QinsiSalesSummaryLine.id",
+    )
+
+
+class QinsiSalesSummaryLine(Base):
+    __tablename__ = "qinsi_sales_summary_lines"
+    __table_args__ = (
+        CheckConstraint(
+            "match_status IN ('matched','unmatched','conflict')",
+            name="ck_qinsi_sales_summary_lines_match_status",
+        ),
+        Index("ix_qinsi_sales_summary_lines_product_snapshot", "product_id", "snapshot_id"),
+        Index("ix_qinsi_sales_summary_lines_status", "snapshot_id", "match_status"),
+    )
+    id: Mapped[int] = mapped_column(primary_key=True)
+    snapshot_id: Mapped[int] = mapped_column(
+        ForeignKey("qinsi_sales_summary_snapshots.id", ondelete="CASCADE"), nullable=False,
+    )
+    original_row_no: Mapped[int] = mapped_column(Integer, nullable=False)
+    product_name_snapshot: Mapped[str | None] = mapped_column(String(255))
+    qinsi_product_code: Mapped[str | None] = mapped_column(String(100))
+    jan_candidate: Mapped[str | None] = mapped_column(String(32))
+    product_id: Mapped[int | None] = mapped_column(ForeignKey("products.id", ondelete="SET NULL"))
+    match_status: Mapped[str] = mapped_column(String(20), nullable=False, index=True)
+    matching_method: Mapped[str | None] = mapped_column(String(40))
+    purchase_quantity: Mapped[int | None] = mapped_column(Integer)
+    purchase_amount: Mapped[Decimal | None] = mapped_column(Numeric(18, 2))
+    sales_quantity: Mapped[int | None] = mapped_column(Integer)
+    sales_amount: Mapped[Decimal | None] = mapped_column(Numeric(18, 2))
+    customer_count: Mapped[int | None] = mapped_column(Integer)
+    reported_current_inventory: Mapped[int | None] = mapped_column(Integer)
+    reported_support_sales_days: Mapped[int | None] = mapped_column(Integer)
+    raw_row_json: Mapped[str] = mapped_column(Text, nullable=False)
+    error_message: Mapped[str | None] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
+    snapshot: Mapped[QinsiSalesSummarySnapshot] = relationship(back_populates="lines")
+    product: Mapped[Product | None] = relationship(back_populates="qinsi_sales_summary_lines")
 
 
 class QinsiProductMapping(Base):

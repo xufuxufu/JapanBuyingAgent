@@ -50,6 +50,7 @@ data/sales-orders/shipping-labels/*
 data/image-search/*
 !data/image-search/models/
 data/image-search/models/*
+data/tmp/*
 !data/db/.gitkeep
 !data/uploads/original/.gitkeep
 !data/uploads/preview/.gitkeep
@@ -57,3 +58,4 @@ data/image-search/models/*
 !data/sales-orders/shipping-labels/.gitkeep
 !data/image-search/.gitkeep
 !data/image-search/models/.gitkeep
+!data/tmp/.gitkeep

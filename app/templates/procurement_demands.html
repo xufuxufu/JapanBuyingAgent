@@ -145,7 +145,8 @@
           {% if image %}<img class="product-thumb zoomable" data-zoom-src="{{ image }}" src="{{ image }}" alt="商品主图" loading="lazy" referrerpolicy="no-referrer" onerror="this.parentElement.classList.add('image-load-failed')"><span class="zoom-hint">+</span>{% endif %}
           <div class="product-image-empty">无图</div>
         </div>
-        <span class="procurement-card-name">{{ plan.product_name_snapshot }} × {{ plan.planned_quantity }}{% if summary %}<br><small class="muted">已买 {{ summary.purchased_quantity }} · 剩余 {{ summary.remaining_quantity }}</small>{% endif %}</span>
+        {% set sales = plan_sales.get(plan.id) %}
+        <span class="procurement-card-name">{{ plan.product_name_snapshot }} × {{ plan.planned_quantity }}{% if summary %}<br><small class="muted">已买 {{ summary.purchased_quantity }} · 剩余 {{ summary.remaining_quantity }}</small>{% endif %}{% if sales %}<br><small class="muted">7天 {{ sales.sales_7d if sales.sales_7d_known else '--' }} · 30天 {{ sales.sales_30d if sales.sales_30d_known else '--' }}</small>{% endif %}</span>
         {{ store_select(plan, active_stores, group_by) }}
       </div>
       {% endfor %}
@@ -211,6 +212,10 @@
       <p class="pd-inv-row"><span>中国参考：<strong>{{ inv.china_quantity if inv.china_known else '未知' }}</strong></span><span>日本参考：<strong>{{ inv.japan_quantity if inv.japan_known else '未知' }}</strong></span></p>
       <p class="muted">当前参考库存快照：{{ inv.snapshot_at|tokyo_datetime if inv.snapshot_at else '暂无快照' }}{% if freshness_labels.get(inv.freshness) %} · {{ freshness_labels[inv.freshness] }}{% endif %}（计划采购数量不会因新快照自动变化）</p>
     </div>
+    {% endif %}
+    {% set sales = plan_sales.get(plan.id) %}
+    {% if sales %}
+    <p class="muted pd-sales-row">7天销量：<strong>{{ sales.sales_7d if sales.sales_7d_known else '--' }}</strong> · 30天销量：<strong>{{ sales.sales_30d if sales.sales_30d_known else '--' }}</strong></p>
     {% endif %}
     <div class="pd-history">
       <p class="muted">历史采购来源{% if psc and psc.recommended_store_name %} · 推荐：<strong>{{ psc.recommended_store_name }}</strong>{% endif %}</p>

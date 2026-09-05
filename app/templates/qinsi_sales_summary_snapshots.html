@@ -1,0 +1,20 @@
+{% extends "base.html" %}
+{% block title %}秦丝进销存汇总{% endblock %}
+{% block content %}
+<div class="section-head"><div><h1>秦丝进销存汇总</h1><p class="muted">销售/采购事实快照，不是库存权威（库存请看"秦丝库存快照"）。</p></div><a class="button" href="/qinsi-sales-summary/upload">导入新快照</a></div>
+<section class="card table-wrap">
+  <table><thead><tr><th>快照编号</th><th>统计周期</th><th>天数</th><th>导入时间</th><th>状态</th><th>总行数</th><th>已匹配</th><th>未匹配</th><th>冲突</th></tr></thead><tbody>
+  {% for snapshot in snapshots %}<tr>
+    <td><a href="/qinsi-sales-summary/{{ snapshot.id }}">{{ snapshot.snapshot_no }}</a></td>
+    <td>{{ snapshot.period_start.strftime('%Y-%m-%d') }} ~ {{ snapshot.period_end.strftime('%Y-%m-%d') }}</td>
+    <td>{{ snapshot.period_days }}</td>
+    <td>{{ snapshot.imported_at|tokyo_datetime }}</td>
+    <td>{{ '完成' if snapshot.status == 'completed' else ('有问题' if snapshot.status == 'completed_with_issues' else '失败') }}</td>
+    <td>{{ snapshot.total_rows }}</td>
+    <td>{{ snapshot.matched_rows }}</td>
+    <td>{{ snapshot.unmatched_rows }}</td>
+    <td>{{ snapshot.conflict_rows }}</td>
+  </tr>{% else %}<tr><td colspan="9">暂无快照。</td></tr>{% endfor %}
+  </tbody></table>
+</section>
+{% endblock %}

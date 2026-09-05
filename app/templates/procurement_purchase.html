@@ -22,6 +22,10 @@
           <h2 class="procurement-card-name">{{ plan.product_name_snapshot }}</h2>
           <p class="muted">{{ plan.jan_snapshot or 'JAN 未填写' }}</p>
           <p class="pd-purchase-qty-grid"><span>计划：<strong>{{ summary.planned_quantity }}</strong></span><span>已买：<strong>{{ summary.purchased_quantity }}</strong></span><span>剩余：<strong>{{ summary.remaining_quantity }}</strong></span></p>
+          {% set sales = plan_sales.get(plan.id) %}
+          {% if sales %}
+          <p class="muted pd-sales-row">中国 <strong>{{ sales.china_quantity if sales.china_known else '未知' }}</strong> · 日本 <strong>{{ sales.japan_quantity if sales.japan_known else '未知' }}</strong> · 7天销量 <strong>{{ sales.sales_7d if sales.sales_7d_known else '--' }}</strong> · 30天销量 <strong>{{ sales.sales_30d if sales.sales_30d_known else '--' }}</strong></p>
+          {% endif %}
         </div>
       </div>
       <div class="pd-purchase-actions">
