@@ -148,7 +148,7 @@ from app.sales_order_service import (
     get_shipping_label,
     last_sale_price_for_product, list_customer_addresses, list_sales_orders,
     list_salespersons, mark_shipment_shipped, remove_shipping_label, search_customers,
-    search_products as search_sales_order_products,
+    search_products as search_sales_order_products, suggest_order_no,
     status_counts as sales_order_status_counts, update_customer_address, update_sales_order,
     update_sales_order_address, update_sales_order_status, update_shipment_tracking,
 )
@@ -3420,9 +3420,12 @@ def sales_orders_page(
 def sales_order_new_page(request: Request, db: Session = Depends(get_db)):
     default_salesperson = ensure_default_salesperson(db)
     salespersons = list_salespersons(db)
+    now_tokyo = datetime.now(timezone.utc).astimezone(TOKYO)
     return templates.TemplateResponse(request, "sales_order_new.html", {
         "default_salesperson": default_salesperson, "salespersons": salespersons,
         "error": request.query_params.get("error"), "order": None,
+        "suggested_order_no": suggest_order_no(db),
+        "suggested_order_datetime_local": now_tokyo.strftime("%Y-%m-%dT%H:%M"),
     })
 
 
@@ -3469,16 +3472,31 @@ async def sales_order_create(request: Request, db: Session = Depends(get_db)):
     salesperson_id = str(form.get("salesperson_id") or "")
     note = str(form.get("note") or "")
     customer_address_id_raw = str(form.get("customer_address_id") or "")
+    order_no_raw = str(form.get("order_no") or "").strip()
+    order_datetime_local_raw = str(form.get("order_datetime_local") or "").strip()
+    historical_backfill = str(form.get("historical_backfill") or "").strip().lower() in {"1", "true", "on", "yes"}
     try:
         if not customer_id.isdigit() or not salesperson_id.isdigit():
             raise ValueError("请先选择客户")
         items = await _parse_order_items_from_form(form)
+        resolved_order_date = None
+        if order_datetime_local_raw:
+            try:
+                # <input type="datetime-local"> has no timezone of its own --
+                # this app's convention is to interpret every user-facing
+                # date/time as Tokyo local time, then convert to UTC for storage.
+                naive = datetime.strptime(order_datetime_local_raw, "%Y-%m-%dT%H:%M")
+            except ValueError as exc:
+                raise ValueError("订单时间格式不正确") from exc
+            resolved_order_date = naive.replace(tzinfo=TOKYO).astimezone(timezone.utc)
         order = create_sales_order(
             db, customer_id=int(customer_id), salesperson_id=int(salesperson_id), items=items, note=note,
             recipient_name=str(form.get("recipient_name") or ""),
             recipient_phone=str(form.get("recipient_phone") or ""),
             shipping_address=str(form.get("shipping_address") or ""),
             customer_address_id=int(customer_address_id_raw) if customer_address_id_raw.isdigit() else None,
+            order_no=order_no_raw or None, order_date=resolved_order_date,
+            historical_backfill=historical_backfill,
         )
     except (LookupError, ValueError) as exc:
         db.rollback()

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import io
 import json
+import urllib.parse
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 
@@ -9,8 +10,11 @@ import pytest
 from PIL import Image
 from sqlalchemy import select
 
-from app.models import Customer, CustomerAddress, Product, SalesOrder, SalesOrderShippingLabel, SalesShipment, Salesperson
+from app.models import (
+    Customer, CustomerAddress, ProcurementDemand, Product, SalesOrder, SalesOrderShippingLabel, SalesShipment, Salesperson,
+)
 from app.sales_order_service import (
+    ORDER_NO_DAILY_SEQUENCE_MAX,
     TOKYO,
     ADDRESS_EDITABLE_STATUSES, ALLOWED_TRANSITIONS, DEFAULT_SALESPERSON_NAME, ITEM_EDITABLE_STATUSES,
     ITEM_LOCKED_MESSAGE, SHIPPING_LABEL_DELETABLE_STATUSES, SHIPPING_LABEL_UPLOADABLE_STATUSES,
@@ -20,6 +24,7 @@ from app.sales_order_service import (
     get_shipping_label, last_sale_price_for_product, list_customer_addresses, list_sales_orders,
     mark_shipment_shipped, remove_shipping_label, status_counts, update_customer_address, update_sales_order,
     update_sales_order_address, update_sales_order_status, update_shipment_tracking,
+    suggest_order_no,
 )
 from app.sales_order_shipping import resolve_shipping_label_path
 
@@ -676,7 +681,9 @@ def test_order_no_auto_generated_and_unique(db_session):
         items=[SalesOrderItemInput(product_id=item.id, manual_name=None, jan=None, quantity=1, unit_sale_price=Decimal("900"))],
     )
     assert first.order_no != second.order_no
-    assert first.order_no.startswith("SO-")
+    # YYMMDDNN: 8 digits, day-prefix shared, sequence increments.
+    assert len(first.order_no) == 8 and first.order_no.isdigit()
+    assert first.order_no[:6] == second.order_no[:6]
     assert first.status == "submitted"
 
 
@@ -1670,3 +1677,187 @@ def test_create_order_route_actually_saves_a_real_uploaded_manual_image(client):
     order_id = int(response.headers["location"].rstrip("/").rsplit("/", 1)[-1])
     order = get_sales_order(db, order_id)
     assert order.items[0].manual_image_relative_path is not None
+
+
+# ==================== order_no (YYMMDDNN) / order_date / historical backfill ====================
+
+
+def _new_order(
+    db, *, customer_row=None, order_no=None, order_date=None, historical_backfill=False, name_suffix="on",
+):
+    salesperson = ensure_default_salesperson(db)
+    buyer = customer_row or customer(db, f"订单号测试客户{name_suffix}")
+    return create_sales_order(
+        db, customer_id=buyer.id, salesperson_id=salesperson.id,
+        items=[SalesOrderItemInput(
+            product_id=None, manual_name=f"订单号测试商品{name_suffix}", jan=None,
+            quantity=1, unit_sale_price=Decimal("10"),
+        )],
+        shipping_address="测试地址", order_no=order_no, order_date=order_date,
+        historical_backfill=historical_backfill,
+    )
+
+
+def test_order_no_suggests_01_when_no_orders_exist_for_the_day(db_session):
+    now = datetime(2026, 9, 5, 3, 0, tzinfo=timezone.utc)  # 2026-09-05 12:00 JST
+    assert suggest_order_no(db_session, now=now) == "26090501"
+
+
+def test_order_no_suggests_next_free_sequence(db_session):
+    now = datetime(2026, 9, 5, 3, 0, tzinfo=timezone.utc)
+    _new_order(db_session, order_no="26090501", name_suffix="seq1")
+    _new_order(db_session, order_no="26090502", name_suffix="seq2")
+    assert suggest_order_no(db_session, now=now) == "26090503"
+
+
+def test_order_no_resets_to_01_on_a_new_day(db_session):
+    day2 = datetime(2026, 9, 6, 3, 0, tzinfo=timezone.utc)  # 2026-09-06 12:00 JST
+    _new_order(db_session, order_no="26090501", name_suffix="reset1")
+    assert suggest_order_no(db_session, now=day2) == "26090601"
+
+
+def test_order_no_ignores_legacy_so_format(db_session):
+    # Simulate a pre-existing row in the old "SO-YYYYMMDD-NNNN" shape (as if
+    # migrated from historical data) by passing it as a manual override --
+    # it must never be counted toward today's YYMMDDNN sequence.
+    now = datetime(2026, 9, 5, 3, 0, tzinfo=timezone.utc)
+    legacy_order = _new_order(db_session, order_no="SO-20260905-0001", name_suffix="legacy-order-no")
+    assert legacy_order.order_no == "SO-20260905-0001"
+    assert suggest_order_no(db_session, now=now) == "26090501"
+
+
+def test_order_no_manual_override_succeeds(db_session):
+    order = _new_order(db_session, order_no="26082701", name_suffix="manual")
+    assert order.order_no == "26082701"
+
+
+def test_order_no_manual_duplicate_raises_friendly_error(db_session):
+    _new_order(db_session, order_no="26082701", name_suffix="dup1")
+    with pytest.raises(ValueError, match="已存在"):
+        _new_order(db_session, order_no="26082701", name_suffix="dup2")
+
+
+def test_order_no_daily_cap_raises_friendly_error_not_500(db_session):
+    now = datetime(2026, 9, 5, 3, 0, tzinfo=timezone.utc)
+    for seq in range(1, ORDER_NO_DAILY_SEQUENCE_MAX + 1):
+        _new_order(db_session, order_no=f"260905{seq:02d}", name_suffix=f"cap{seq}")
+    with pytest.raises(ValueError, match="已用满"):
+        suggest_order_no(db_session, now=now)
+
+
+def test_order_no_uses_tokyo_calendar_day_not_utc_date(db_session):
+    just_before_midnight_jst = datetime(2026, 9, 5, 14, 59, tzinfo=timezone.utc)  # 2026-09-05 23:59 JST
+    just_after_midnight_jst = datetime(2026, 9, 5, 15, 1, tzinfo=timezone.utc)  # 2026-09-06 00:01 JST
+    assert suggest_order_no(db_session, now=just_before_midnight_jst) == "26090501"
+    assert suggest_order_no(db_session, now=just_after_midnight_jst) == "26090601"
+
+
+def test_order_date_defaults_to_now_when_not_given(db_session):
+    before = datetime.now(timezone.utc)
+    order = _new_order(db_session, name_suffix="default-date")
+    after = datetime.now(timezone.utc)
+    assert before <= order.order_date <= after
+    assert before <= order.created_at <= after
+
+
+def test_order_date_manual_historical_value_differs_from_created_at(db_session):
+    historical = datetime(2026, 8, 27, 5, 0, tzinfo=timezone.utc)
+    before_created = datetime.now(timezone.utc)
+    order = _new_order(db_session, order_no="26082701", order_date=historical, name_suffix="historical-date")
+    after_created = datetime.now(timezone.utc)
+    assert order.order_date == historical
+    assert before_created <= order.created_at <= after_created
+    assert order.order_date != order.created_at
+
+
+def test_normal_order_generates_procurement_demand(db_session):
+    order = _new_order(db_session, name_suffix="demand-on")
+    item_ids = [item.id for item in order.items]
+    count = db_session.query(ProcurementDemand).filter(ProcurementDemand.sales_order_item_id.in_(item_ids)).count()
+    assert count == len(order.items) > 0
+
+
+def test_historical_backfill_skips_procurement_demand(db_session):
+    order = _new_order(
+        db_session, order_no="26082701", order_date=datetime(2026, 8, 27, 5, 0, tzinfo=timezone.utc),
+        historical_backfill=True, name_suffix="demand-off",
+    )
+    assert len(order.items) == 1
+    item_ids = [item.id for item in order.items]
+    count = db_session.query(ProcurementDemand).filter(ProcurementDemand.sales_order_item_id.in_(item_ids)).count()
+    assert count == 0
+    assert order.order_no == "26082701"
+
+
+def test_route_parses_order_datetime_local_as_tokyo_time(client):
+    http, db, _ = client
+    buyer = create_customer(db, name="路由日期测试客户", address="地址")
+    salesperson = ensure_default_salesperson(db)
+    items_payload = [{
+        "product_id": None, "manual_name": "路由日期测试商品", "jan": None, "quantity": 1,
+        "unit_sale_price": "10", "note": None, "client_id": "c1",
+    }]
+    form = {
+        "customer_id": str(buyer.id), "salesperson_id": str(salesperson.id),
+        "items_json": json.dumps(items_payload),
+        "order_no": "26082701", "order_datetime_local": "2026-08-27T14:00",
+        "shipping_address": "地址",
+    }
+    response = http.post("/sales-orders", data=form, follow_redirects=False)
+    assert response.status_code == 303
+    order_id = int(response.headers["location"].rstrip("/").rsplit("/", 1)[-1])
+    order = get_sales_order(db, order_id)
+    assert order.order_date == datetime(2026, 8, 27, 5, 0, tzinfo=timezone.utc)
+
+
+def test_route_historical_backfill_checkbox_skips_procurement_demand(client):
+    http, db, _ = client
+    buyer = create_customer(db, name="路由历史订单客户", address="地址")
+    salesperson = ensure_default_salesperson(db)
+    items_payload = [{
+        "product_id": None, "manual_name": "路由历史订单商品", "jan": None, "quantity": 1,
+        "unit_sale_price": "10", "note": None, "client_id": "c1",
+    }]
+    form = {
+        "customer_id": str(buyer.id), "salesperson_id": str(salesperson.id),
+        "items_json": json.dumps(items_payload),
+        "order_no": "26082702", "order_datetime_local": "2026-08-27T14:00",
+        "historical_backfill": "1", "shipping_address": "地址",
+    }
+    response = http.post("/sales-orders", data=form, follow_redirects=False)
+    assert response.status_code == 303
+    order_id = int(response.headers["location"].rstrip("/").rsplit("/", 1)[-1])
+    order = get_sales_order(db, order_id)
+    item_ids = [item.id for item in order.items]
+    count = db.query(ProcurementDemand).filter(ProcurementDemand.sales_order_item_id.in_(item_ids)).count()
+    assert count == 0
+
+
+def test_route_shows_friendly_error_for_duplicate_order_no(client):
+    http, db, _ = client
+    buyer = create_customer(db, name="重复订单号客户", address="地址")
+    salesperson = ensure_default_salesperson(db)
+    _new_order(db, order_no="26082701", name_suffix="route-dup")
+    items_payload = [{
+        "product_id": None, "manual_name": "重复订单号商品", "jan": None, "quantity": 1,
+        "unit_sale_price": "10", "note": None, "client_id": "c1",
+    }]
+    form = {
+        "customer_id": str(buyer.id), "salesperson_id": str(salesperson.id),
+        "items_json": json.dumps(items_payload),
+        "order_no": "26082701", "shipping_address": "地址",
+    }
+    response = http.post("/sales-orders", data=form, follow_redirects=False)
+    assert response.status_code == 303
+    assert "error=" in response.headers["location"]
+    assert "已存在" in urllib.parse.unquote(response.headers["location"])
+
+
+def test_new_order_page_prefills_suggested_order_no_and_datetime(client):
+    http, _db, _ = client
+    response = http.get("/sales-orders/new")
+    assert response.status_code == 200
+    assert 'name="order_no"' in response.text
+    assert 'name="order_datetime_local"' in response.text
+    assert 'name="historical_backfill"' in response.text
+    assert "历史订单补录" in response.text

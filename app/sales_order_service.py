@@ -5,6 +5,7 @@ from datetime import date, datetime, time, timedelta, timezone
 from decimal import Decimal
 
 from sqlalchemy import func, or_, select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, selectinload
 
 from app.models import (
@@ -282,15 +283,38 @@ def search_products(session: Session, q: str, *, limit: int = 20) -> list[Produc
     return list(session.scalars(query.order_by(Product.updated_at.desc()).limit(limit)))
 
 
+ORDER_NO_DAILY_SEQUENCE_MAX = 99
+
+
 def _generate_order_no(session: Session, *, now: datetime | None = None) -> str:
-    now = now or utcnow()
-    prefix = f"SO-{now:%Y%m%d}-"
-    seq = 1
-    while True:
-        candidate = f"{prefix}{seq:04d}"
-        if not session.scalar(select(SalesOrder.id).where(SalesOrder.order_no == candidate)):
-            return candidate
-        seq += 1
+    """YYMMDD + 2-digit daily sequence (e.g. "26090503"), bucketed by TOKYO
+    calendar day to match this app's universal date convention. Only rows
+    already in this exact 8-char all-digit shape count toward the day's
+    sequence -- the legacy "SO-YYYYMMDD-NNNN" format is a different length
+    and can never match the LIKE pattern below, so old and new rows never
+    interfere with each other's numbering.
+    """
+    tokyo_now = (now or utcnow()).astimezone(TOKYO)
+    prefix = f"{tokyo_now:%y%m%d}"
+    existing_today = session.scalars(
+        select(SalesOrder.order_no).where(
+            SalesOrder.order_no.like(f"{prefix}__"),
+            func.length(SalesOrder.order_no) == 8,
+        )
+    ).all()
+    used_sequences = {int(order_no[6:8]) for order_no in existing_today if order_no[6:8].isdigit()}
+    for seq in range(1, ORDER_NO_DAILY_SEQUENCE_MAX + 1):
+        if seq not in used_sequences:
+            return f"{prefix}{seq:02d}"
+    raise ValueError(f"{prefix} 当天订单号已用满{ORDER_NO_DAILY_SEQUENCE_MAX}个，请手工指定订单号")
+
+
+def suggest_order_no(session: Session, *, now: datetime | None = None) -> str:
+    """Read-only preview of what _generate_order_no would produce right now
+    -- used to pre-fill the new-order form. Not reserved; a real race
+    between two concurrent submissions is still caught at commit time in
+    create_sales_order (see the IntegrityError handling there)."""
+    return _generate_order_no(session, now=now)
 
 
 @dataclass(frozen=True, slots=True)
@@ -364,7 +388,15 @@ def create_sales_order(
     items: list[SalesOrderItemInput], note: str | None = None,
     recipient_name: str | None = None, recipient_phone: str | None = None,
     shipping_address: str | None = None, customer_address_id: int | None = None,
+    order_no: str | None = None, order_date: datetime | None = None,
+    historical_backfill: bool = False,
 ) -> SalesOrder:
+    """`order_no`/`order_date` are optional manual overrides for backfilling
+    historical orders -- left blank, both default to "generate for right
+    now" exactly as before. `historical_backfill=True` skips
+    sync_demands_for_sales_order() so re-entering an old, already-fulfilled
+    order never spawns a live procurement demand; it must be an explicit
+    caller choice, never inferred from order_date being in the past."""
     customer = session.get(Customer, customer_id)
     if customer is None:
         raise LookupError("客户不存在")
@@ -373,6 +405,13 @@ def create_sales_order(
         raise LookupError("销售员不存在")
     if not items:
         raise ValueError("请至少添加一个商品")
+    resolved_order_no = (order_no or "").strip()[:40]
+    if resolved_order_no:
+        if session.scalar(select(SalesOrder.id).where(SalesOrder.order_no == resolved_order_no)):
+            raise ValueError(f"订单号「{resolved_order_no}」已存在")
+    else:
+        resolved_order_no = _generate_order_no(session)
+    resolved_order_date = order_date if order_date is not None else utcnow()
     # Recipient/address are snapshotted at order time so later edits to the
     # customer record never rewrite historical orders. Priority: an explicit
     # one-off override > a chosen saved CustomerAddress > the customer's own
@@ -390,8 +429,8 @@ def create_sales_order(
     recipient_phone_snapshot = (recipient_phone or "").strip()[:50] or (chosen_address.phone if chosen_address else None) or customer.phone
     shipping_address_snapshot = (shipping_address or "").strip() or (chosen_address.address if chosen_address else None) or customer.address
     order = SalesOrder(
-        order_no=_generate_order_no(session), customer_id=customer.id, salesperson_id=salesperson.id,
-        status="submitted", order_date=utcnow(), note=(note or "").strip() or None,
+        order_no=resolved_order_no, customer_id=customer.id, salesperson_id=salesperson.id,
+        status="submitted", order_date=resolved_order_date, note=(note or "").strip() or None,
         recipient_name_snapshot=recipient_name_snapshot,
         recipient_phone_snapshot=recipient_phone_snapshot,
         shipping_address_snapshot=shipping_address_snapshot,
@@ -401,10 +440,16 @@ def create_sales_order(
     for entry in items:
         order.items.append(_build_order_item(session, order, entry))
     session.flush()
-    # Every confirmed order line is a procurement demand from the moment it's
-    # placed; the demand center is what surfaces it, not this function.
-    sync_demands_for_sales_order(session, order, commit=False)
-    session.commit()
+    if not historical_backfill:
+        # Every confirmed order line is a procurement demand from the moment
+        # it's placed; the demand center is what surfaces it, not this
+        # function. Historical backfill explicitly opts out (see docstring).
+        sync_demands_for_sales_order(session, order, commit=False)
+    try:
+        session.commit()
+    except IntegrityError as exc:
+        session.rollback()
+        raise ValueError(f"订单号「{resolved_order_no}」已存在") from exc
     return get_sales_order(session, order.id)
 
 

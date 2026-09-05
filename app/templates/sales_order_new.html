@@ -30,6 +30,18 @@
   {% if not order %}<input type="hidden" name="salesperson_id" value="{{ default_salesperson.id }}">{% endif %}
   <input type="hidden" name="items_json" id="itemsJsonInput">
 
+  {% if not order %}
+  <section class="card">
+    <h2>订单号 / 订单时间</h2>
+    <div class="form-grid">
+      <label>订单号（留空使用建议值）<input name="order_no" id="orderNoInput" value="{{ suggested_order_no }}" maxlength="40" placeholder="{{ suggested_order_no }}"></label>
+      <label>订单时间<input type="datetime-local" name="order_datetime_local" id="orderDatetimeInput" value="{{ suggested_order_datetime_local }}"></label>
+    </div>
+    <label class="inline-check"><input type="checkbox" name="historical_backfill" id="historicalBackfillInput" value="1"> 历史订单补录</label>
+    <p class="muted">补录旧订单时使用，不生成新的采购需求。</p>
+  </section>
+  {% endif %}
+
   <section class="card">
     <h2>客户</h2>
     <div id="customerPicked"{% if not order %} hidden{% endif %}><p><strong id="customerPickedName">{{ order.customer.name if order else '' }}</strong> <button type="button" class="link-button" id="customerChange">更换</button></p><p class="muted" id="customerPickedMeta"></p>
