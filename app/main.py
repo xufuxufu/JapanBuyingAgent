@@ -3282,7 +3282,11 @@ class CustomerAddressUpdateInput(BaseModel):
 
 @app.get("/api/products/search")
 def api_sales_order_product_search(q: str = Query(""), db: Session = Depends(get_db)):
-    products = search_sales_order_products(db, q, limit=20)
+    # Wider than the old 20 -- with a broad keyword (see search_products'
+    # relevance ranking), the real product catalog can have 90+ substring
+    # matches all tied at the same rank tier; a slightly larger cap gives a
+    # genuinely-matching product more room to still appear in the dropdown.
+    products = search_sales_order_products(db, q, limit=30)
     inventory_by_id = reference_inventory_for_products(db, [product.id for product in products])
     return [
         _product_search_payload(

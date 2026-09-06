@@ -4,7 +4,7 @@ from dataclasses import dataclass
 from datetime import date, datetime, time, timedelta, timezone
 from decimal import Decimal
 
-from sqlalchemy import func, or_, select
+from sqlalchemy import case, func, or_, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, selectinload
 
@@ -276,18 +276,35 @@ def delete_customer_address(session: Session, address_id: int) -> None:
 
 
 def search_products(session: Session, q: str, *, limit: int = 20) -> list[Product]:
+    """Substring search across code/name fields, ranked by relevance BEFORE
+    the limit is applied -- a wide keyword (e.g. "精华") can legitimately
+    match far more than `limit` products, and sorting only by recency (as
+    this used to do) could push an obviously-matching product entirely off
+    the first page while unrelated, more-recently-touched products filled
+    it. Rank, highest priority first:
+      0. exact JAN / qinsi_product_code match
+      1. exact name_cn / name_ja match
+      2. name_cn / name_ja prefix match
+      3. name_cn / name_ja / display_name contains the keyword
+      4. only internal_sku / qinsi_product_code contains it (substring, not exact)
+    Ties within a rank fall back to the previous recency ordering.
+    """
     value = (q or "").strip()
     if not value:
         return []
     like = f"%{value}%"
-    query = select(Product).where(
-        Product.status != "archived",
-        or_(
-            Product.internal_sku.like(like), Product.jan.like(like), Product.qinsi_product_code.like(like),
-            Product.name_cn.like(like), Product.name_ja.like(like), Product.display_name.like(like),
-        ),
+    prefix = f"{value}%"
+    name_contains = or_(Product.name_cn.like(like), Product.name_ja.like(like), Product.display_name.like(like))
+    code_contains = or_(Product.internal_sku.like(like), Product.jan.like(like), Product.qinsi_product_code.like(like))
+    query = select(Product).where(Product.status != "archived", or_(name_contains, code_contains))
+    rank = case(
+        (or_(Product.jan == value, Product.qinsi_product_code == value), 0),
+        (or_(Product.name_cn == value, Product.name_ja == value), 1),
+        (or_(Product.name_cn.like(prefix), Product.name_ja.like(prefix)), 2),
+        (name_contains, 3),
+        else_=4,
     )
-    return list(session.scalars(query.order_by(Product.updated_at.desc()).limit(limit)))
+    return list(session.scalars(query.order_by(rank, Product.updated_at.desc()).limit(limit)))
 
 
 ORDER_NO_DAILY_SEQUENCE_MAX = 99

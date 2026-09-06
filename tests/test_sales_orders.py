@@ -23,7 +23,7 @@ from app.sales_order_service import (
     create_customer, create_sales_order, create_shipment, delete_customer_address,
     ensure_default_salesperson, find_duplicate_customer_address, get_sales_order,
     get_shipping_label, last_sale_price_for_product, list_customer_addresses, list_sales_orders,
-    maybe_complete_order_from_tracking, mark_shipment_shipped, remove_shipping_label,
+    maybe_complete_order_from_tracking, mark_shipment_shipped, remove_shipping_label, search_products,
     status_counts, update_customer_address, update_sales_order,
     update_sales_order_address, update_sales_order_status, update_shipment_tracking,
     suggest_order_no,
@@ -299,6 +299,53 @@ def test_maybe_complete_succeeds_once_every_shipment_is_tracked_and_terminal(db_
     reloaded.shipments[1].tracking_terminal = True  # now both are terminal
     assert maybe_complete_order_from_tracking(reloaded) is True
     assert reloaded.status == "completed"
+
+
+# ---------------- product search relevance (wide keyword must still surface a clear substring match) ----------------
+
+
+def test_wide_keyword_search_still_surfaces_a_clear_substring_match(db_session):
+    # Regression: searching "精华" used to be able to bury a product whose
+    # NAME obviously contains "精华" under a pile of more-recently-touched
+    # products that only matched through a much weaker field (e.g. an
+    # internal code happening to contain the same characters) -- the old
+    # query had no relevance ranking at all, just `ORDER BY updated_at DESC
+    # LIMIT n`, so recency alone decided who made the cut. Ranking must
+    # happen before the limit, and a real name match must outrank a
+    # code-only match regardless of which one was touched more recently.
+    target = product(db_session, "serum1", sale_price=100)
+    target.name_cn = "乡村与溪流 天然滚珠眼部精华 15ml"
+    target.name_ja = None
+    db_session.flush()
+    # More products than `limit` below, all created/updated AFTER the
+    # target and all matching "精华" -- but only through internal_sku, never
+    # through a name field. Pre-fix, these would all rank above the target
+    # (pure recency) and push it off the first page.
+    for i in range(25):
+        decoy = product(db_session, f"weak{i}", sale_price=100)
+        decoy.internal_sku = f"精华-CODE-{i:03d}"
+        decoy.name_cn = f"不含关键词的商品{i}"
+        db_session.flush()
+
+    results = search_products(db_session, "精华", limit=20)
+    assert any(p.id == target.id for p in results)
+
+
+def test_narrow_keyword_search_still_matches_the_full_phrase(db_session):
+    target = product(db_session, "serum2", sale_price=100)
+    target.name_cn = "乡村与溪流 天然滚珠眼部精华 15ml"
+    db_session.flush()
+    results = search_products(db_session, "眼部精华", limit=20)
+    assert any(p.id == target.id for p in results)
+
+
+def test_exact_jan_match_ranks_above_partial_name_match(db_session):
+    exact = product(db_session, "serum3", sale_price=100)
+    decoy = product(db_session, "serum4", sale_price=100)
+    decoy.name_cn = f"商品名里包含{exact.jan}这个编码"
+    db_session.flush()
+    results = search_products(db_session, exact.jan, limit=20)
+    assert results[0].id == exact.id
 
 
 def test_partially_shipped_and_shipped_status_and_backwards_transitions_never_human_settable(db_session):
