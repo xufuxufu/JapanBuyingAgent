@@ -1,5 +1,6 @@
 {% extends "base.html" %}
 {% block title %}{{ order.order_no }} · 订单详情{% endblock %}
+{% block body_class %}so-order-detail-body{% endblock %}
 {% block content %}
 <div class="so-detail-page">
 <div class="section-head"><div><h1>{{ order.order_no }}</h1><p class="muted"><span class="badge state-{{ order.status }}">{{ status_labels.get(order.status, order.status) }}</span> · 下单 {{ order.order_date|tokyo_datetime }} · 销售员 {{ order.salesperson.name }}</p></div><a class="button secondary compact" href="/sales-orders">返回列表</a></div>

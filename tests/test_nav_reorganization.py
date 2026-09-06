@@ -67,3 +67,46 @@ def test_frequently_used_section_keeps_daily_operational_pages(client):
         "/watched-products", "/restock-lists", "/receipts", "/notifications", "/purchase-analytics",
     ):
         assert f'href="{expected_href}"' in frequent_section, f"{expected_href} missing from 常用功能"
+
+
+def test_domestic_logistics_removed_from_primary_and_bottom_nav(client):
+    # 国内物流 moved out of the primary nav (home quick entries / mobile
+    # bottom nav) into /more and a link on the 微信订单 list page -- the
+    # route itself is unchanged and still fully functional (see below).
+    http, _db, _ = client
+    home = http.get("/")
+    assert home.status_code == 200
+    bottom_nav_start = home.text.index('class="mobile-bottom-nav"')
+    bottom_nav = home.text[bottom_nav_start:bottom_nav_start + 800]
+    assert "国内物流" not in bottom_nav
+    sidebar_quick_start = home.text.index('class="sidebar-nav"')
+    sidebar_quick_end = home.text.index("</nav>", sidebar_quick_start)
+    sidebar_quick = home.text[sidebar_quick_start:sidebar_quick_end]
+    assert "国内物流" not in sidebar_quick
+
+
+def test_domestic_logistics_still_reachable_from_more_and_sales_orders_page(client):
+    http, _db, _ = client
+    more_page = http.get("/more")
+    assert 'href="/domestic-logistics"' in more_page.text
+
+    sales_orders_page = http.get("/sales-orders")
+    assert sales_orders_page.status_code == 200
+    assert 'href="/domestic-logistics"' in sales_orders_page.text
+
+    # Route itself is untouched.
+    route = http.get("/domestic-logistics")
+    assert route.status_code == 200
+
+
+def test_mobile_bottom_nav_is_a_single_row_of_four_plus_more(client):
+    http, _db, _ = client
+    home = http.get("/")
+    bottom_nav_start = home.text.index('class="mobile-bottom-nav"')
+    nav_end = home.text.index("</nav>", bottom_nav_start)
+    bottom_nav = home.text[bottom_nav_start:nav_end]
+    # Exactly the 4 HOME_QUICK_ENTRIES plus the always-present "更多" link --
+    # matches the CSS's repeat(5,1fr) grid, keeping it a single row.
+    assert bottom_nav.count("<a ") == 5
+    for label in ("扫码查价", "微信订单", "补货需求", "采购", "更多"):
+        assert label in bottom_nav

@@ -90,6 +90,7 @@
   .mobile-header a{color:#fff;text-decoration:none;font-weight:800;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.mobile-back{min-width:42px;height:44px;padding:0;background:transparent;font-size:2rem}
   .mobile-context{display:grid;justify-items:end;gap:2px;font-size:.68rem}.mobile-context span{max-width:150px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
   .price-check-page #currentBatchBadge{display:none}
+  .so-order-detail-body .mobile-context{display:none}
   .mobile-bottom-nav{position:fixed;left:0;right:0;bottom:0;z-index:100;display:grid;grid-template-columns:repeat(5,1fr);min-height:68px;background:#fff;border-top:1px solid #dce5e2;box-shadow:0 -5px 20px #071d1815;padding-bottom:env(safe-area-inset-bottom)}
   .mobile-bottom-nav a{display:flex;flex-direction:column;align-items:center;justify-content:center;gap:2px;min-width:0;color:#243d36;text-decoration:none;font-size:.76rem;font-weight:750}.mobile-bottom-nav span{font-size:1.15rem}
   .app-shell>main{padding:12px 10px 92px}.field-hero{align-items:start;display:grid;padding:16px}.field-batch-chip{min-width:0}
@@ -148,7 +149,7 @@ body{font-size:calc(1rem * var(--jba-font-scale))}
 
 .search-results{display:grid;gap:6px;max-height:280px;overflow-y:auto;margin:8px 0;border:1px solid #e0e8e5;border-radius:10px;padding:4px}.search-result-item{width:100%;text-align:left;color:#17202a;font-weight:400;cursor:pointer}.search-result-item strong{display:block}.search-result-item small{display:block;color:#63716f;margin-top:2px}.item-card{margin:0}.order-total{font-size:1.2rem;font-weight:800;color:#075843;margin:10px 0}.state-cancelled{background:#ffebe9;color:#8f1d15}
 
-.so-page-header{display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:nowrap;margin-top:14px}.so-page-header h1{margin:0;font-size:1.5rem;overflow-wrap:anywhere}
+.so-page-header{display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:nowrap;margin-top:14px}.so-page-header h1{margin:0;font-size:1.5rem;overflow-wrap:anywhere}.so-page-header-actions{display:flex;gap:8px;flex:0 0 auto}
 .so-page-sub{margin:4px 0 12px;font-size:.92rem}
 .so-tabs{display:flex;flex-wrap:nowrap;gap:8px;overflow-x:auto;padding:4px 0 10px;margin-bottom:4px}.so-tab{display:inline-flex;align-items:center;gap:6px;flex:0 0 auto;padding:9px 14px;border-radius:99px;background:#fff;border:1px solid #e0e8e5;color:#17202a;text-decoration:none;font-weight:700;white-space:nowrap}.so-tab .badge{background:#f1f6f4}.so-tab.active{background:#0b5d4b;color:#fff;border-color:#0b5d4b}.so-tab.active .badge{background:#ffffff30;color:#fff}
 .so-tab-danger{background:#fdecec;color:#a3241f;border-color:#f2b8b5}.so-tab-danger .badge{background:#f8d7d5;color:#a3241f}.so-tab-danger.active{background:#c62828;color:#fff;border-color:#c62828}.so-tab-danger.active .badge{background:#ffffff30;color:#fff}
@@ -174,6 +175,28 @@ body{font-size:calc(1rem * var(--jba-font-scale))}
 .product-thumb-slot.image-load-failed .product-thumb{display:none}.product-thumb-slot.image-load-failed .product-image-empty{display:flex}
 .state-ready_to_ship{background:#e6f0ff;color:#174a84}.state-shipped{background:#fff3cd;color:#6b5300}.state-completed{background:#e4f6ec;color:#17643a}
 @media(min-width:801px){.so-filter-date-group{grid-template-columns:1fr 1fr;gap:0 24px}.so-filter-date-group .so-filter-more{margin-top:10px}.so-card{grid-template-columns:1fr 1.7fr 1fr;grid-template-areas:"head items side";align-items:start}.so-head{grid-area:head}.so-items{grid-area:items}.so-side{grid-area:side;border-left:1px solid #e5e8e9;padding-left:14px}}
+
+/* -- mobile density pass (real-world use: 375x812 + large system font) --
+   Principle: shrink margin/padding/row-height, not font-size -- large system
+   fonts must stay legible. */
+@media(max-width:480px){
+  .so-page-header{margin-top:8px;flex-wrap:wrap}.so-page-header h1{font-size:1.25rem}
+  .so-page-header-actions{flex:1 1 100%;justify-content:flex-end}.so-page-header-actions .button{padding:7px 10px;font-size:.85rem}
+  .so-page-sub{display:none}
+  .so-tab{padding:7px 11px}
+  .so-filter-card{padding:8px 10px}
+  .so-filter-quick-row{gap:6px}
+  .so-filter-date-group{display:flex;flex-wrap:wrap;gap:6px 10px}
+  .so-filter-more{flex:1 1 auto;margin-top:0;border-top:0;padding-top:0}
+  .so-filter-more summary{font-size:.85rem}
+  .so-list{gap:8px}.so-card{padding:10px;gap:8px}
+  .so-head h2{font-size:1rem}.so-head p{margin:2px 0}
+  .so-item-row{gap:.5rem}.so-item-row .product-thumb-slot{width:44px;height:44px}
+  .so-side{gap:4px}.so-shipping-hint{font-size:.85rem}.so-actions{gap:6px}
+  .so-detail-page .card{margin:8px 0}.so-detail-page .card:first-of-type{margin-top:10px}
+  .so-detail-card{padding:10px 12px}.so-detail-card h2{font-size:.98rem}
+  .so-detail-line{font-size:1rem}
+}
 
 .shipping-label-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(140px,1fr));gap:12px;margin:12px 0}.shipping-label-card{border:1px solid #e0e8e5;border-radius:10px;padding:8px;display:grid;gap:6px}.shipping-label-thumb{display:block;width:100%;aspect-ratio:1;object-fit:cover;border-radius:8px;background:#f1f5f4}
 .shipping-label-upload-form{display:grid;gap:10px;margin-top:12px}.so-shipping-hint{margin:0}
@@ -255,7 +278,16 @@ body{font-size:calc(1rem * var(--jba-font-scale))}
 .tracking-scan-candidates{display:grid;gap:8px}
 .tracking-scan-candidate-list{display:grid;gap:8px}
 .tracking-scan-candidate{width:100%;justify-content:space-between;font-family:ui-monospace,Consolas,monospace;background:#e5f3ef;color:#075843}
-@media(max-width:800px){.search-result-item{grid-template-columns:44px minmax(0,1fr)}.search-result-thumb,.search-result-thumb-empty{width:44px;height:44px}.item-selected-card{grid-template-columns:44px minmax(0,1fr)}.item-selected-image{width:44px;height:44px}.shipment-item-row{grid-template-columns:auto minmax(0,1fr);grid-template-areas:"check info" "stepper stepper"}.shipment-item-row input[type="checkbox"]{grid-area:check}.shipment-item-info{grid-area:info}.shipment-item-stepper{grid-area:stepper;justify-content:flex-end}}
+@media(max-width:800px){.search-result-item{grid-template-columns:44px minmax(0,1fr)}.search-result-thumb,.search-result-thumb-empty{width:44px;height:44px}.item-selected-card{grid-template-columns:44px minmax(0,1fr)}.item-selected-image{width:44px;height:44px}.shipment-item-row{grid-template-columns:auto minmax(0,1fr);grid-template-areas:"check info" "stepper stepper"}.shipment-item-row input[type="checkbox"]{grid-area:check}.shipment-item-info{grid-area:info}.shipment-item-stepper{grid-area:stepper;justify-content:flex-end}
+/* Regression fix: on a narrow viewport the 3rd (auto-width, nowrap) price
+   column of .item-detail-row could claim most of the row's width, squeezing
+   the middle minmax(0,1fr) name column down to a sliver -- CJK text with
+   overflow-wrap:anywhere then wraps one character per line. Moving the price
+   to its own full-width row below removes that squeeze entirely. */
+.item-detail-row{grid-template-columns:44px minmax(0,1fr);grid-template-areas:"thumb body" "price price";row-gap:4px;align-items:start}
+.item-detail-row .product-thumb-slot{grid-area:thumb;width:44px;height:44px}
+.item-detail-row .item-detail-body{grid-area:body}
+.item-detail-row .item-detail-price{grid-area:price;white-space:normal;justify-self:start}}
 
 /* -- customer list/detail + address management (Phase 7) -- */
 .customer-list-row{display:flex;justify-content:space-between;align-items:center;gap:.75rem}

@@ -316,10 +316,13 @@ def _nav_can(section: str) -> bool:
 
 templates.env.globals["nav_can"] = _nav_can
 
+# Exactly 4 entries -- the mobile bottom nav is a `repeat(5,1fr)` grid (these
+# 4 plus the always-present "更多" link) and must stay a single row. 国内物流
+# moved out of primary nav into /more and a link on the 微信订单 list page
+# (see sales_orders.html) -- its route (/domestic-logistics) is unchanged.
 HOME_QUICK_ENTRIES = (
     {"href": "/price-check", "icon": "▦", "label": "扫码查价"},
     {"href": "/sales-orders", "icon": "訂", "label": "微信订单"},
-    {"href": "/domestic-logistics", "icon": "递", "label": "国内物流"},
     {"href": "/procurement-demands/report-shortage", "icon": "補", "label": "补货需求"},
     {"href": "/procurement-demands", "icon": "購", "label": "采购"},
 )

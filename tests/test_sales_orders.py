@@ -1545,6 +1545,18 @@ def test_detail_page_has_tracking_scan_dom_for_shipped_shipment_fixup(client):
     assert f'id="trackingNoInputFix-{shipment.id}"' in detail.text
 
 
+def test_order_detail_hides_mobile_header_context_via_body_class(client):
+    # FP-xxx / 已同步 (mobile-header's #currentBatchBadge/#pendingSyncBadge)
+    # is hidden on this page on mobile via a scoped body class + CSS, not
+    # removed from the shared header markup itself (desktop keeps it).
+    http, db, _ = client
+    order = simple_order(db, name_suffix="mobile-header-hide")
+    detail = http.get(f"/sales-orders/{order.id}")
+    assert detail.status_code == 200
+    assert "so-order-detail-body" in detail.text
+    assert 'id="currentBatchBadge"' in detail.text  # markup still present, CSS-hidden on mobile only
+
+
 def test_workbench_shows_paid_order_awaiting_shipment(client):
     http, db, _ = client
     order, shipment = paid_order_with_shipment(db, name_suffix="label-route-6")
