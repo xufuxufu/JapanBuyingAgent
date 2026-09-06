@@ -58,6 +58,30 @@ def test_domestic_logistics_list_page_loads(client):
     assert "路由测试客户" in response.text
 
 
+def test_domestic_logistics_page_shows_scheduler_status_off_by_default(client):
+    http, db, _tmp = client
+    response = http.get("/domestic-logistics")
+    assert response.status_code == 200
+    assert "自动物流更新：未开启" in response.text
+    assert "最近后台检查" not in response.text  # nothing to show before any cycle has run
+
+
+def test_domestic_logistics_page_shows_scheduler_running_when_active(client, monkeypatch):
+    import datetime as datetime_module
+    http, db, _tmp = client
+    monkeypatch.setattr(main_module, "shipment_tracking_scheduler_running", lambda: True)
+    monkeypatch.setattr(
+        main_module, "shipment_tracking_last_cycle_at",
+        lambda: datetime_module.datetime(2026, 9, 6, 3, 0, tzinfo=datetime_module.timezone.utc),
+    )
+
+    response = http.get("/domestic-logistics")
+
+    assert response.status_code == 200
+    assert "自动物流更新：运行中" in response.text
+    assert "最近后台检查" in response.text
+
+
 def test_domestic_logistics_filter_pill_narrows_results(client):
     http, db, _tmp = client
     shipped_shipment(db)

@@ -1,9 +1,12 @@
-"""Domestic (中通-only) shipment tracking -- Phase 10A.
+"""Domestic (中通-only) shipment tracking -- Phase 10A/10B.
 
 Owns the "立即查询" flow and the due-shipment batch cycle. Mirrors the
 existing price-monitor pattern (app/monitor_service.py: next_check_at column
 + due query + non-blocking cycle lock) rather than introducing a new
-scheduling mechanism.
+scheduling mechanism. Phase 10B (app/shipment_tracking_scheduler.py) wires
+run_due_shipment_tracking_cycle_standalone() into an optional background
+loop, gated behind JBA_SHIPMENT_TRACKING_AUTO_ENABLED -- nothing in this
+module changed to support that; it only needed a `limit` kwarg.
 
 Business dispatch status (SalesShipment.status: pending/shipped) and carrier
 tracking status (tracking_status/tracking_terminal) are intentionally kept
@@ -164,14 +167,17 @@ def run_due_shipment_tracking_cycle(
     return success, failure
 
 
-def run_due_shipment_tracking_cycle_standalone() -> tuple[int, int]:
-    """Manually-triggerable entry point using its own session -- NOT wired
-    into any automatic scheduler this phase (see Phase 10A report)."""
+def run_due_shipment_tracking_cycle_standalone(limit: int | None = None) -> tuple[int, int]:
+    """Manually-triggerable entry point using its own session. Also the one
+    entry point app/shipment_tracking_scheduler.py calls from its background
+    loop (Phase 10B) -- the non-blocking _cycle_lock below is what makes a
+    scheduler tick and a human's manual trigger safe to overlap without
+    double-querying the same shipment."""
     if not _cycle_lock.acquire(blocking=False):
         return 0, 0
     try:
         with SessionLocal() as session:
-            return run_due_shipment_tracking_cycle(session)
+            return run_due_shipment_tracking_cycle(session, limit=limit)
     finally:
         _cycle_lock.release()
 

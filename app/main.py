@@ -81,6 +81,12 @@ from app.image_localization_worker import (
     wake_image_localization_worker,
 )
 from app.monitor_scheduler import scheduler_running, start_monitor_scheduler, stop_monitor_scheduler
+from app.shipment_tracking_scheduler import (
+    last_cycle_at as shipment_tracking_last_cycle_at,
+    scheduler_running as shipment_tracking_scheduler_running,
+    start_shipment_tracking_scheduler,
+    stop_shipment_tracking_scheduler,
+)
 from app.monitor_service import (
     NOTIFICATION_TYPE_LABELS, archive_read_notifications, bulk_mark_notifications_read,
     list_notifications, mark_notification_read, monitor_dashboard, run_due_monitor_cycle,
@@ -353,6 +359,7 @@ async def start_price_monitor() -> None:
     )
     start_image_localization_worker(engine)
     start_monitor_scheduler()
+    start_shipment_tracking_scheduler()
 
 
 @app.on_event("shutdown")
@@ -360,6 +367,7 @@ async def stop_price_monitor() -> None:
     if not is_testing():
         await asyncio.to_thread(stop_image_localization_worker)
         await stop_monitor_scheduler()
+        await stop_shipment_tracking_scheduler()
 
 
 @app.middleware("http")
@@ -3854,6 +3862,8 @@ def domestic_logistics_page(request: Request, status: str = Query("all"), db: Se
         "counts": counts, "total_count": sum(counts.values()),
         "status_labels": TRACKING_STATUS_LABELS,
         "throttle_seconds": TRACKING_THROTTLE_SECONDS,
+        "shipment_tracking_scheduler_running": shipment_tracking_scheduler_running(),
+        "shipment_tracking_last_cycle_at": shipment_tracking_last_cycle_at(),
         "message": request.query_params.get("message"), "error": request.query_params.get("error"),
     })
 

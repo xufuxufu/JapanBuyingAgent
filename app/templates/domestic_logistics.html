@@ -3,6 +3,7 @@
 {% block content %}
 <div class="so-page-header"><h1>国内物流</h1></div>
 <p class="muted so-page-sub">中通发货单的物流状态；点击"立即查询"手动刷新，已签收的单不再自动查询。</p>
+<p class="muted so-page-sub dl-scheduler-status">自动物流更新：{{ '运行中' if shipment_tracking_scheduler_running else '未开启' }}{% if shipment_tracking_last_cycle_at %} · 最近后台检查：{{ shipment_tracking_last_cycle_at|beijing_datetime(seconds=true) }}{% endif %}</p>
 {% if message %}<div class="success message">{{ message }}</div>{% endif %}
 {% if error %}<div class="error message">{{ error }}</div>{% endif %}
 
