@@ -624,6 +624,32 @@ def test_provider_processing_failure_is_isolated_and_does_not_500(db_session, mo
     assert view.online_min_price == 600
 
 
+def test_rakuten_offer_still_participates_when_another_provider_fails(db_session):
+    # Rakuten stays a price source even though its images are deprioritized
+    # elsewhere (product_enrichment's image ranking) -- those are separate
+    # concerns, and a query must not drop or special-case Rakuten's price data.
+    providers = [
+        FakeProvider("rakuten", ProviderResponse("success", (offer(800),))),
+        FakeProvider("yahoo_shopping", error=RuntimeError("yahoo down")),
+    ]
+    view = query_prices(db_session, PriceLookupInput(jan=VALID_JAN), providers)
+    statuses = {item.provider_code: item.status for item in view.attempts}
+    assert statuses == {"rakuten": "success", "yahoo_shopping": "error"}
+    assert view.providers_partial_failed is True
+    assert any(offer_.marketplace.code == "rakuten" for offer_ in view.trusted_offers)
+    assert view.online_min_price == 800
+
+
+def test_each_configured_provider_is_called_exactly_once_per_query(db_session):
+    providers = [
+        FakeProvider("prov_a", ProviderResponse("success", (offer(500),))),
+        FakeProvider("prov_b", ProviderResponse("empty")),
+        FakeProvider("prov_c", error=RuntimeError("boom")),
+    ]
+    query_prices(db_session, PriceLookupInput(jan=VALID_JAN), providers)
+    assert [provider.calls for provider in providers] == [1, 1, 1]
+
+
 def test_refresh_product_online_price_requires_jan(db_session):
     from app.price_service import refresh_product_online_price
 
@@ -651,6 +677,24 @@ def test_refresh_product_online_price_reuses_query_prices(db_session, monkeypatc
     assert fake.calls == 1
     assert view.online_min_price == 1234
     assert view.product.id == product.id
+
+
+def test_product_detail_refresh_price_route_calls_unified_service(client, monkeypatch):
+    import app.price_service as price_service_module
+
+    http, db, _ = client
+    product = Product(jan=VALID_JAN, name_cn="详情页重新查价")
+    db.add(product)
+    db.commit()
+    fake = FakeProvider("rakuten", ProviderResponse("success", (offer(2000),)))
+    monkeypatch.setattr(price_service_module, "get_default_price_providers", lambda: [fake])
+
+    response = http.post(f"/products/{product.id}/refresh-price", follow_redirects=True)
+
+    assert response.status_code == 200
+    assert fake.calls == 1
+    saved = db.scalar(select(ProductOffer).where(ProductOffer.product_id == product.id))
+    assert saved is not None and saved.item_price == 2000
 
 
 def test_watched_products_refresh_price_route_calls_unified_service(client, monkeypatch):

@@ -5304,6 +5304,18 @@ def product_restore_auto_image(product_id: int, db: Session = Depends(get_db)):
     )
 
 
+@app.post("/products/{product_id}/refresh-price")
+def product_refresh_price(product_id: int, background_tasks: BackgroundTasks, db: Session = Depends(get_db)):
+    product = db.get(Product, product_id)
+    if not product:
+        raise HTTPException(404, "商品不存在")
+    if not (product.jan or "").strip():
+        return RedirectResponse(f"/products/{product_id}?error={quote('商品缺少JAN，无法查询线上价格')}", status_code=303)
+    database_url = db.get_bind().url.render_as_string(hide_password=False)
+    background_tasks.add_task(refresh_product_online_price_task, database_url, product_id)
+    return RedirectResponse(f"/products/{product_id}?message={quote('已提交线上查价，请稍后刷新查看结果')}", status_code=303)
+
+
 @app.post("/products/{product_id}/archive")
 def product_archive_page(
     product_id: int,
