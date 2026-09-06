@@ -10,8 +10,8 @@ from app.location_service import initialize_default_locations
 from app.models import Location, Product, PurchaseBatch, PurchaseBatchItem, Receipt, ReceiptBatch, ReceiptItem, Store
 from app.procurement_service import (
     PlanSelectionInput, build_plan_store_contexts, build_store_coverage, create_channel_shortage_demand,
-    create_plans, get_purchase_source_history, group_plans_by_selected_store, recommended_store_entry,
-    set_plan_selected_store, set_plans_selected_store_bulk, UNASSIGNED_STORE_GROUP_NAME,
+    create_plans, full_purchase_history_for_products, get_purchase_source_history, group_plans_by_selected_store,
+    recommended_store_entry, set_plan_selected_store, set_plans_selected_store_bulk, UNASSIGNED_STORE_GROUP_NAME,
 )
 
 
@@ -150,6 +150,29 @@ def test_no_history_is_empty(db_session):
     prod = product(db_session, "6")
     history = get_purchase_source_history(db_session, [prod.id])[prod.id]
     assert history == []
+
+
+# ---------------- full (non-aggregated) purchase history, for the "历史采购" card + "更多" modal ----------------
+
+
+def test_full_purchase_history_sorted_newest_first(db_session):
+    prod = product(db_session, "31")
+    matsumoto = store(db_session, "松本清")
+    don = store(db_session, "唐吉诃德")
+    add_purchase(db_session, prod, matsumoto, price=680, days_ago=5)
+    add_purchase(db_session, prod, matsumoto, price=650, days_ago=20)
+    add_purchase(db_session, prod, don, price=598, days_ago=10)
+    records = full_purchase_history_for_products(db_session, [prod.id])[prod.id]
+    assert [r.unit_price for r in records] == [680, 598, 650]
+    assert records[0].store_name == matsumoto.display_name
+    # Every past purchase is its own record -- never aggregated per store like
+    # get_purchase_source_history above.
+    assert len(records) == 3
+
+
+def test_full_purchase_history_empty_when_no_purchases(db_session):
+    prod = product(db_session, "32")
+    assert full_purchase_history_for_products(db_session, [prod.id])[prod.id] == []
 
 
 def test_store_display_name_never_shows_placeholder_for_japanese_only_name(db_session):

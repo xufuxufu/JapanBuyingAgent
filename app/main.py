@@ -166,7 +166,8 @@ from app.procurement_service import (
     build_plan_inventory_contexts, build_plan_reconciliation_summaries, build_plan_store_overview,
     build_store_purchase_entries, cancel_purchase_execution, close_investigation_demand,
     create_channel_shortage_demand, create_investigation_demand, create_plans, default_planned_quantity_for_group,
-    find_execution_candidates_for_receipt_items, get_group, group_plans_by_selected_store,
+    find_execution_candidates_for_receipt_items, full_purchase_history_for_products, get_group,
+    group_plans_by_selected_store,
     latest_snapshot_status, list_investigation_demands, list_plans, list_plans_for_store_purchase,
     in_transit_quantity_for_products, record_purchase_executions_bulk, reference_inventory_for_products,
     set_plan_selected_store, set_plans_selected_store_bulk, update_demand_plan,
@@ -3836,6 +3837,7 @@ def procurement_demands_page(
     store_purchase_entries: list = []
     reconciliation_summaries: dict = {}
     plan_sales: dict = {}
+    plan_purchase_history: dict = {}
     inventory_snapshot_at = None
     inventory_freshness = None
     if view == "open":
@@ -3874,6 +3876,10 @@ def procurement_demands_page(
         plan_store_contexts, store_coverage = build_plan_store_overview(db, plans)
         plan_executions = build_plan_executions(db, plans)
         reconciliation_summaries = build_plan_reconciliation_summaries(db, plans)
+        full_history_by_product = full_purchase_history_for_products(db, plan_product_ids)
+        plan_purchase_history = {
+            plan.id: full_history_by_product.get(plan.product_id, []) for plan in plans if plan.product_id
+        }
         active_stores = list(db.scalars(
             select(Store).where(Store.is_active.is_(True)).order_by(Store.name_cn, Store.name_ja, Store.id)
         ))
@@ -3892,7 +3898,7 @@ def procurement_demands_page(
         "demand_type_labels": DEMAND_TYPE_LABELS, "source_type_labels": SOURCE_TYPE_LABELS,
         "status_labels": PROCUREMENT_STATUS_LABELS, "default_qty": default_planned_quantity_for_group,
         "inventory_contexts": inventory_contexts, "group_sales": group_sales,
-        "plan_inventories": plan_inventories, "plan_sales": plan_sales,
+        "plan_inventories": plan_inventories, "plan_sales": plan_sales, "plan_purchase_history": plan_purchase_history,
         "plan_store_contexts": plan_store_contexts, "store_coverage": store_coverage,
         "store_groups": store_groups, "active_stores": active_stores,
         "execution_summaries": execution_summaries, "plan_executions": plan_executions,
@@ -4091,10 +4097,9 @@ def procurement_purchase_page(request: Request, store_id: str = Query(""), db: S
     sales_30d_by_product = sales_summary_for_products(db, plan_product_ids, 30)
     plan_sales = {
         plan.id: {
-            "china_quantity": inventory_by_product[plan.product_id].china_quantity,
-            "china_known": inventory_by_product[plan.product_id].china_known,
-            "japan_quantity": inventory_by_product[plan.product_id].japan_quantity,
-            "japan_known": inventory_by_product[plan.product_id].japan_known,
+            "total_quantity": inventory_by_product[plan.product_id].total_quantity,
+            "total_known": inventory_by_product[plan.product_id].total_known,
+            "japan_quantity": inventory_by_product[plan.product_id].japan_display_quantity,
             "sales_7d": sales_7d_by_product[plan.product_id].sales_quantity,
             "sales_7d_known": sales_7d_by_product[plan.product_id].sales_known,
             "sales_30d": sales_30d_by_product[plan.product_id].sales_quantity,
@@ -4102,9 +4107,12 @@ def procurement_purchase_page(request: Request, store_id: str = Query(""), db: S
         }
         for plan in plans if plan.product_id
     }
+    inventory_snapshot_at, inventory_freshness = latest_snapshot_status(db)
     return templates.TemplateResponse(request, "procurement_purchase.html", {
         "store": store, "store_id_param": store_id, "plans": plans, "summaries": summaries,
         "active_stores": active_stores, "plan_sales": plan_sales, "error": request.query_params.get("error"),
+        "inventory_snapshot_at": inventory_snapshot_at, "inventory_freshness": inventory_freshness,
+        "freshness_labels": FRESHNESS_LABELS, "freshness_hint_labels": FRESHNESS_HINT_LABELS,
     })
 
 

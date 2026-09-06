@@ -723,6 +723,35 @@ def get_purchase_source_history(session: Session, product_ids: list[int]) -> dic
     }
 
 
+@dataclass(frozen=True, slots=True)
+class PurchaseHistoryRecord:
+    """One real, individual past purchase -- date/store/price only, newest first."""
+
+    purchased_at: datetime | None
+    store_name: str
+    unit_price: Decimal | None
+
+
+def full_purchase_history_for_products(session: Session, product_ids: list[int]) -> dict[int, list[PurchaseHistoryRecord]]:
+    """Every individual past purchase event for each product (not aggregated
+    per store like get_purchase_source_history), newest first -- for the
+    "历史采购" card line plus its "更多" full-history view."""
+    unique_ids = list(dict.fromkeys(product_ids))
+    if not unique_ids:
+        return {}
+    by_product: dict[int, list[PurchaseHistoryRecord]] = {product_id: [] for product_id in unique_ids}
+    for fact in purchase_facts(session, product_ids=unique_ids):
+        by_product.setdefault(fact.item.product_id, []).append(PurchaseHistoryRecord(
+            purchased_at=fact.batch.purchased_at or fact.batch.confirmed_at,
+            store_name=fact.store.display_name if fact.store else "未记录门店",
+            unit_price=fact.reference_unit_price,
+        ))
+    epoch = datetime.min.replace(tzinfo=timezone.utc)
+    for records in by_product.values():
+        records.sort(key=lambda record: _aware(record.purchased_at) if record.purchased_at else epoch, reverse=True)
+    return by_product
+
+
 def recommended_store_entry(entries: list[StoreHistoryEntry]) -> StoreHistoryEntry | None:
     """The single best-guess store for one product's own history: most recent, then most frequent, then cheapest.
 

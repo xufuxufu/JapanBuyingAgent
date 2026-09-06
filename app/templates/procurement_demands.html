@@ -101,12 +101,16 @@
 </section>
 {% endif %}
 
-{% macro store_select(plan, active_stores, group_by) %}
+{% macro store_select(plan, active_stores, group_by, recommended_store_id=none) %}
 <form method="post" action="/procurement-demands/plans/{{ plan.id }}/store" class="pd-store-select-form">
   <input type="hidden" name="group_by" value="{{ group_by }}">
-  <label>采购来源<select class="pd-store-select" name="store_id">
-    <option value="">未确定</option>
-    {% for s in active_stores %}<option value="{{ s.id }}"{% if plan.selected_store_id == s.id %} selected{% endif %}>{{ s.display_name }}</option>{% endfor %}
+  <label>分拣<select class="pd-store-select" name="store_id">
+    <option value=""{% if plan.selected_store_id is none and not recommended_store_id %} selected{% endif %}>未确定</option>
+    {% set recommended = (active_stores|selectattr('id', 'equalto', recommended_store_id)|first) if recommended_store_id else none %}
+    {% if recommended %}
+    <option value="{{ recommended.id }}"{% if plan.selected_store_id == recommended.id or plan.selected_store_id is none %} selected{% endif %}>{{ recommended.display_name }}（推荐）</option>
+    {% endif %}
+    {% for s in active_stores if s.id != recommended_store_id %}<option value="{{ s.id }}"{% if plan.selected_store_id == s.id %} selected{% endif %}>{{ s.display_name }}</option>{% endfor %}
   </select></label>
 </form>
 {% endmacro %}
@@ -130,14 +134,20 @@
       {% set summary = execution_summaries.get(plan.id) %}
       {% set manual_demand = plan.sources|map(attribute='demand')|selectattr('manual_image_relative_path')|first %}
       {% set image = product_image_url(plan.product) if plan.product else (('/procurement-demands/item-images/' ~ manual_demand.id) if manual_demand else none) %}
+      {% set inv = plan_inventories.get(plan.id) %}
+      {% set sales = plan_sales.get(plan.id) %}
+      {% set psc = plan_store_contexts.get(plan.id) %}
       <div class="pd-store-group-item">
         <div class="product-thumb-slot{% if not image %} image-load-failed{% endif %}">
           {% if image %}<img class="product-thumb zoomable" data-zoom-src="{{ image }}" src="{{ image }}" alt="商品主图" loading="lazy" referrerpolicy="no-referrer" onerror="this.parentElement.classList.add('image-load-failed')"><span class="zoom-hint">+</span>{% endif %}
           <div class="product-image-empty">无图</div>
         </div>
-        {% set sales = plan_sales.get(plan.id) %}
-        <span class="procurement-card-name">{{ plan.product_name_snapshot }} × {{ plan.planned_quantity }}{% if summary %}<br><small class="muted">已买 {{ summary.purchased_quantity }} · 剩余 {{ summary.remaining_quantity }}</small>{% endif %}{% if sales %}<br><small class="muted">7天 {{ sales.sales_7d if sales.sales_7d_known else '--' }} · 30天 {{ sales.sales_30d if sales.sales_30d_known else '--' }}</small>{% endif %}</span>
-        {{ store_select(plan, active_stores, group_by) }}
+        <div class="pd-store-group-item-info">
+          <span class="procurement-card-name">{{ plan.product_name_snapshot }} × {{ plan.planned_quantity }}</span>
+          {% if summary %}<small class="muted">已买 {{ summary.purchased_quantity }} · 还需要 {{ summary.remaining_quantity }}</small>{% endif %}
+          <small class="muted">{% if inv and inv.total_known %}总库存 {{ inv.total_quantity }}（日本库存 ×{{ inv.japan_display_quantity }}）{% else %}总库存未知{% endif %} · 7天销量 {{ sales.sales_7d if sales and sales.sales_7d_known else '--' }} · 30天销量 {{ sales.sales_30d if sales and sales.sales_30d_known else '--' }}</small>
+        </div>
+        {{ store_select(plan, active_stores, group_by, psc.recommended_store_id if psc else none) }}
       </div>
       {% endfor %}
     </div>
@@ -165,17 +175,11 @@
         {% set summary = execution_summaries.get(plan.id) %}
         {% set reconciliation = reconciliation_summaries.get(plan.id) %}
         {% if summary %}
-        <p class="pd-purchase-status">已买：<strong>{{ summary.purchased_quantity }}</strong> · 剩余：<strong>{{ summary.remaining_quantity }}</strong>
+        <p class="pd-purchase-status">已买：<strong>{{ summary.purchased_quantity }}</strong> · 还需要：<strong>{{ summary.remaining_quantity }}</strong>
         {%- if reconciliation and reconciliation.purchased_quantity > 0 %} · 已对账：<strong>{{ reconciliation.reconciled_quantity }}</strong> · 待小票：<strong>{{ reconciliation.pending_receipt_quantity }}</strong>{% endif -%}
         {% if reconciliation and reconciliation.fully_reconciled %} <span class="badge state-completed">已对账</span>{% elif summary.fully_purchased %} <span class="badge state-completed">计划已买齐（待小票）</span>{% endif %}</p>
         {% endif %}
-        <div class="pd-sources">
-          <p class="muted">为什么买：</p>
-          {% for source in plan.sources %}
-          <span class="pd-source-line">{{ source.demand.source_person }} {{ demand_type_labels.get(source.demand.demand_type, source.demand.demand_type) }} {{ '×' ~ source.quantity_snapshot if source.quantity_snapshot else '' }}</span>
-          {% endfor %}
-        </div>
-        <button type="button" class="link-button plan-edit-toggle">编辑计划</button>
+        <button type="button" class="link-button plan-edit-toggle">改计划</button>
         <form method="post" action="/procurement-demands/plans/{{ plan.id }}/edit" class="plan-edit-form form-grid" hidden>
           <input type="hidden" name="group_by" value="{{ group_by }}">
           <label>计划采购数量（不得低于已采购 {{ summary.purchased_quantity if summary else 0 }}）
@@ -197,28 +201,26 @@
         </form>
       </div>
     </div>
-    {% if inv %}
-    <div class="pd-inventory">
-      <p class="pd-inv-row"><span>中国参考：<strong>{{ inv.china_quantity if inv.china_known else '未知' }}</strong></span><span>日本参考：<strong>{{ inv.japan_quantity if inv.japan_known else '未知' }}</strong></span></p>
-      <p class="muted">当前参考库存快照：{{ inv.snapshot_at|tokyo_datetime if inv.snapshot_at else '暂无快照' }}{% if freshness_labels.get(inv.freshness) %} · {{ freshness_labels[inv.freshness] }}{% endif %}（计划采购数量不会因新快照自动变化）</p>
-    </div>
-    {% endif %}
     {% set sales = plan_sales.get(plan.id) %}
-    {% if sales %}
-    <p class="muted pd-sales-row">7天销量：<strong>{{ sales.sales_7d if sales.sales_7d_known else '--' }}</strong> · 30天销量：<strong>{{ sales.sales_30d if sales.sales_30d_known else '--' }}</strong></p>
-    {% endif %}
+    <p class="muted pd-sales-row">{% if inv and inv.total_known %}总库存 {{ inv.total_quantity }}（日本库存 ×{{ inv.japan_display_quantity }}）{% else %}总库存未知{% endif %} · 7天销量 {{ sales.sales_7d if sales and sales.sales_7d_known else '--' }} · 30天销量 {{ sales.sales_30d if sales and sales.sales_30d_known else '--' }}</p>
+    {% set history = plan_purchase_history.get(plan.id, []) %}
     <div class="pd-history">
-      <p class="muted">历史采购来源{% if psc and psc.recommended_store_name %} · 推荐：<strong>{{ psc.recommended_store_name }}</strong>{% endif %}</p>
-      {% if psc and psc.history %}
-      {% for entry in psc.history[:2] %}
-      <p class="pd-source-line">{{ entry.store_name }} · 历史采购{{ entry.purchase_count }}次{% if entry.last_purchase_at %} · 最近{{ entry.last_purchase_at|tokyo_datetime }}{% endif %}{% if entry.last_unit_price is not none %} · 历史价格¥{{ entry.last_unit_price }}{% endif %}</p>
-      {% endfor %}
-      {% if psc.history|length > 2 %}
-      <details><summary>还有 {{ psc.history|length - 2 }} 个历史来源</summary>
-        {% for entry in psc.history[2:] %}<p class="pd-source-line">{{ entry.store_name }} · 历史采购{{ entry.purchase_count }}次{% if entry.min_unit_price is not none %} · 历史最低¥{{ entry.min_unit_price }}{% endif %}</p>{% endfor %}
-      </details>
+      <div class="pd-history-head"><p class="muted">历史采购{% if psc and psc.recommended_store_name %} · 推荐：<strong>{{ psc.recommended_store_name }}</strong>{% endif %}</p>{% if history|length > 1 %}<button type="button" class="link-button pd-history-more-toggle" data-dialog="pd-history-dialog-{{ plan.id }}">更多</button>{% endif %}</div>
+      {% if history %}
+      {% set latest = history[0] %}
+      <p class="pd-source-line">{{ latest.purchased_at|tokyo_datetime if latest.purchased_at else '日期未知' }} {{ latest.store_name }} {{ ('¥' ~ latest.unit_price) if latest.unit_price is not none else '价格未知' }}</p>
+      {% else %}<p class="muted">无历史采购记录</p>{% endif %}
+      {% if history|length > 1 %}
+      <dialog class="field-tag-dialog pd-history-dialog" id="pd-history-dialog-{{ plan.id }}">
+        <button type="button" class="pd-history-dialog-close" aria-label="关闭">×</button>
+        <h3>{{ plan.product_name_snapshot }} · 历史采购</h3>
+        <div class="pd-history-table">
+          {% for record in history %}
+          <p class="pd-source-line">{{ record.purchased_at|tokyo_datetime if record.purchased_at else '日期未知' }} · {{ record.store_name }} · {{ ('¥' ~ record.unit_price) if record.unit_price is not none else '价格未知' }}</p>
+          {% endfor %}
+        </div>
+      </dialog>
       {% endif %}
-      {% else %}<p class="muted">无历史采购来源</p>{% endif %}
     </div>
     {% set executions = plan_executions.get(plan.id) %}
     {% if executions %}
@@ -238,7 +240,7 @@
     </div>
     {% endif %}
     <div class="pd-card-actions">
-      {{ store_select(plan, active_stores, group_by) }}
+      {{ store_select(plan, active_stores, group_by, psc.recommended_store_id if psc else none) }}
       <label class="pd-select"><input type="checkbox" class="pd-plan-checkbox" name="plan_ids" value="{{ plan.id }}" form="planStoreBulkForm"> 批量选择</label>
       {% if summary and summary.remaining_quantity > 0 %}
       <a class="link-button" href="/procurement-demands/purchase?store_id={{ plan.selected_store_id or '' }}">去采购</a>

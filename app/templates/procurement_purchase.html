@@ -2,6 +2,7 @@
 {% block title %}{{ store.display_name if store else '未确定来源' }}采购清单{% endblock %}
 {% block content %}
 <div class="section-head"><div><h1>{{ store.display_name if store else '未确定来源' }}采购清单</h1><p class="muted">只勾选实际买到的商品；没买到的会继续留在待采购里。</p></div><a class="button secondary" href="/procurement-demands?view=planned&group_by=store">返回已安排采购</a></div>
+<p class="muted pd-inventory-updated">库存更新时间：{{ inventory_snapshot_at|tokyo_datetime(seconds=True) if inventory_snapshot_at else '暂无快照' }}{% if freshness_hint_labels.get(inventory_freshness) %} · {{ freshness_hint_labels[inventory_freshness] }}{% endif %}</p>
 {% if error %}<div class="warning"><strong>提交失败：</strong>{{ error }}</div>{% endif %}
 
 <form id="purchaseForm" method="post" action="/procurement-demands/purchase">
@@ -21,10 +22,10 @@
         <div class="pd-card-info">
           <h2 class="procurement-card-name">{{ plan.product_name_snapshot }}</h2>
           <p class="muted">{{ plan.jan_snapshot or 'JAN 未填写' }}</p>
-          <p class="pd-purchase-qty-grid"><span>计划：<strong>{{ summary.planned_quantity }}</strong></span><span>已买：<strong>{{ summary.purchased_quantity }}</strong></span><span>剩余：<strong>{{ summary.remaining_quantity }}</strong></span></p>
+          <p class="pd-purchase-qty-grid"><span>计划：<strong>{{ summary.planned_quantity }}</strong></span><span>已买：<strong>{{ summary.purchased_quantity }}</strong></span><span>还需要：<strong>{{ summary.remaining_quantity }}</strong></span></p>
           {% set sales = plan_sales.get(plan.id) %}
           {% if sales %}
-          <p class="muted pd-sales-row">中国 <strong>{{ sales.china_quantity if sales.china_known else '未知' }}</strong> · 日本 <strong>{{ sales.japan_quantity if sales.japan_known else '未知' }}</strong> · 7天销量 <strong>{{ sales.sales_7d if sales.sales_7d_known else '--' }}</strong> · 30天销量 <strong>{{ sales.sales_30d if sales.sales_30d_known else '--' }}</strong></p>
+          <p class="muted pd-sales-row">{% if sales.total_known %}总库存 {{ sales.total_quantity }}（日本库存 ×{{ sales.japan_quantity }}）{% else %}总库存未知{% endif %} · 7天销量 {{ sales.sales_7d if sales.sales_7d_known else '--' }} · 30天销量 {{ sales.sales_30d if sales.sales_30d_known else '--' }}</p>
           {% endif %}
         </div>
       </div>

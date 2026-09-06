@@ -141,3 +141,19 @@
     searchInput.addEventListener("input", (event) => runSearch(event.target.value));
   });
 })();
+
+(() => {
+  // ---- "历史采购" 更多 dialog: server-rendered <dialog> per plan, JS only opens/closes it ----
+  document.querySelectorAll(".pd-history-more-toggle").forEach((toggle) => {
+    const dialog = document.getElementById(toggle.dataset.dialog);
+    if (!dialog) return;
+    toggle.addEventListener("click", () => {
+      if (dialog.showModal) dialog.showModal();
+      else dialog.setAttribute("open", "");
+    });
+    dialog.querySelector(".pd-history-dialog-close")?.addEventListener("click", () => dialog.close());
+    dialog.addEventListener("click", (event) => {
+      if (event.target === dialog) dialog.close();
+    });
+  });
+})();

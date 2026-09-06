@@ -83,10 +83,36 @@ def test_planned_view_shows_history_and_recommendation(client):
 
     response = test_client.get("/procurement-demands?view=planned")
     assert response.status_code == 200
-    assert "历史采购来源" in response.text
+    assert "历史采购" in response.text
     assert "推荐：" in response.text
-    assert "历史价格" in response.text or "历史最低" in response.text
+    assert "¥680" in response.text  # most recent purchase overall (5 days ago), shown inline
+    assert "更多" in response.text  # full history (4 records) needs the "更多" modal
     assert "当前价格" not in response.text
+
+
+def test_history_card_shows_only_latest_outside_the_more_dialog(client):
+    # §11: outside the "更多" modal only the single most recent purchase shows
+    # inline; the full history (all records, newest first) lives inside the
+    # <dialog>.
+    test_client, db, _tmp = client
+    prod = product(db, "13")
+    matsumoto = store(db, "松本清")
+    db.commit()
+    add_purchase(db, prod, matsumoto, price=680, days_ago=5)
+    add_purchase(db, prod, matsumoto, price=650, days_ago=20)
+    add_purchase(db, prod, matsumoto, price=700, days_ago=40)
+    make_plan(test_client, db, prod, quantity=1)
+
+    response = test_client.get("/procurement-demands?view=planned")
+    html = response.text
+    assert "更多" in html
+    dialog_start = html.index("<dialog")
+    before_dialog, inside_dialog = html[:dialog_start], html[dialog_start:]
+    # Only the newest (¥680) purchase is visible outside the dialog.
+    assert "¥680" in before_dialog
+    assert "¥650" not in before_dialog and "¥700" not in before_dialog
+    # All three show inside the dialog, newest first.
+    assert inside_dialog.index("¥680") < inside_dialog.index("¥650") < inside_dialog.index("¥700")
 
 
 def test_no_history_product_shows_no_history_message(client):
@@ -96,7 +122,29 @@ def test_no_history_product_shows_no_history_message(client):
     make_plan(test_client, db, prod, quantity=1)
 
     response = test_client.get("/procurement-demands?view=planned")
-    assert "无历史采购来源" in response.text
+    assert "无历史采购记录" in response.text
+
+
+def test_recommended_store_listed_first_and_preselected_in_sorting_dropdown(client):
+    # §12: rename "采购来源"->"分拣", reuse the existing recommended-store
+    # logic to pre-select/list-first the option -- never redesign the
+    # recommendation algorithm itself (still recommended_store_entry).
+    test_client, db, _tmp = client
+    prod = product(db, "12")
+    matsumoto = store(db, "松本清")
+    don = store(db, "唐吉诃德")
+    db.commit()
+    add_purchase(db, prod, matsumoto, price=680, days_ago=5)
+    add_purchase(db, prod, don, price=598, days_ago=20)
+    make_plan(test_client, db, prod, quantity=1)
+
+    response = test_client.get("/procurement-demands?view=planned")
+    html = response.text
+    assert "分拣<select" in html
+    assert "<label>采购来源<select" not in html  # per-item selector label was renamed to 分拣
+    assert f'<option value="{matsumoto.id}" selected>{matsumoto.display_name}（推荐）</option>' in html
+    # recommended option must be listed before the other store's option
+    assert html.index(f'value="{matsumoto.id}"') < html.index(f'value="{don.id}"')
 
 
 def test_select_store_for_plan_via_route(client):

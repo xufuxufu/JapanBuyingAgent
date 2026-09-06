@@ -275,7 +275,7 @@ def test_plan_planned_purchased_remaining_display(client):
     record_purchase_execution(db, plan.id, 4)
     response = http.get("/procurement-demands?view=planned")
     assert "已买：<strong>4</strong>" in response.text
-    assert "剩余：<strong>6</strong>" in response.text
+    assert "还需要：<strong>6</strong>" in response.text
 
 
 def test_plan_edit_route_shows_product_image(client):
@@ -319,6 +319,31 @@ def test_plan_edit_route_enforces_purchased_floor(client):
     assert "error=" in response.headers["location"]
     db.refresh(plan)
     assert plan.planned_quantity == 10
+
+
+def test_plan_note_round_trips_and_renders_safely(client):
+    # Regression guard for the "改计划" 备注 textarea (the only note-editing UI
+    # on 待采购分拣): a note containing HTML-special characters must round-trip
+    # through the edit route and render escaped, never broken markup.
+    http, db, _tmp = client
+    item = product(db, "22")
+    db.commit()
+    create_channel_shortage_demand(db, product_id=item.id, quantity=2)
+    [plan] = create_plans(db, [PlanSelectionInput(kind="product", key=str(item.id), planned_quantity=2)])
+    tricky_note = '备注 <b>加粗</b> & "引号" 换行\n第二行'
+    response = http.post(
+        f"/procurement-demands/plans/{plan.id}/edit",
+        data={"planned_quantity": "2", "note": tricky_note, "group_by": "product"},
+        follow_redirects=False,
+    )
+    assert response.status_code == 303
+    db.refresh(plan)
+    assert plan.note == tricky_note
+
+    page = http.get("/procurement-demands?view=planned")
+    assert page.status_code == 200
+    assert "<b>加粗</b>" not in page.text  # escaped, not injected as real markup
+    assert "备注 &lt;b&gt;加粗&lt;/b&gt;" in page.text
 
 
 # ==================== 采购需求中心 7 个导航 tab ====================

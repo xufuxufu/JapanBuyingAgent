@@ -222,8 +222,7 @@ def test_planned_view_shows_inventory_without_changing_planned_quantity(client):
 
     response = test_client.get("/procurement-demands?view=planned")
     assert "计划采购数量：<strong>4</strong>" in response.text
-    assert "中国参考" in response.text
-    assert "不会因新快照自动变化" in response.text
+    assert "总库存 1（日本库存 ×0）" in response.text
 
     plan = db.query(ProcurementDemandPlan).filter_by(product_id=prod.id).one()
     assert plan.planned_quantity == 4

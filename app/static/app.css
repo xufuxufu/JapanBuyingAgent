@@ -192,10 +192,13 @@ body{font-size:calc(1rem * var(--jba-font-scale))}
 .pd-subtabs{margin-top:2px}
 .pd-coverage-board{padding:12px 14px}.pd-coverage-list{display:flex;flex-wrap:wrap;gap:8px;margin-top:6px}
 .pd-history{display:grid;gap:2px;border-top:1px solid #eef2f0;padding-top:8px}.pd-history summary{cursor:pointer;color:#0b5d4b;font-weight:600}
+.pd-history-head{display:flex;align-items:center;justify-content:space-between;gap:8px}.pd-history-head p{margin:0}
+.pd-history-dialog{width:min(92vw,28rem)}.pd-history-dialog h3{margin:0 0 8px;font-size:1.05rem}.pd-history-table{display:grid;gap:6px;max-height:60vh;overflow-y:auto}
 .pd-inventory-updated{margin:0 0 10px}
 .pd-store-select-form{margin:0}.pd-store-select-form label{display:flex;align-items:center;gap:8px;font-weight:600}
 .pd-store-group{display:grid;gap:10px}.pd-store-group-items{display:grid;gap:10px}
 .pd-store-group-item{display:flex;flex-wrap:wrap;align-items:center;justify-content:space-between;gap:10px;border-top:1px solid #eef2f0;padding-top:8px}
+.pd-store-group-item-info{display:grid;gap:2px;flex:1 1 200px;min-width:0}.pd-store-group-item-info small{display:block}
 .pd-store-batch-bar{display:flex;gap:10px;align-items:center;justify-content:flex-end;background:#fff;border-radius:12px;padding:10px;box-shadow:0 8px 30px #071d1828}
 .pd-store-batch-bar button{width:auto;padding:12px 18px}
 .pd-store-group-head{display:flex;flex-wrap:wrap;align-items:center;justify-content:space-between;gap:10px}
@@ -208,6 +211,7 @@ body{font-size:calc(1rem * var(--jba-font-scale))}
 .pd-purchase-actions input[type="number"]{width:88px}
 .pd-purchase-store-pick{display:flex;align-items:center;gap:8px}
 @media(min-width:801px){.pd-card-actions{justify-content:flex-start}.pd-batch-bar{justify-content:flex-end}.pd-batch-bar button{max-width:280px}}
+@media(max-width:800px){.pd-batch-bar{position:fixed;left:10px;right:10px;bottom:calc(76px + env(safe-area-inset-bottom));z-index:95}.pd-list,.pd-purchase-list{margin-bottom:96px}}
 
 /* -- wechat sales order refactor: paid/partially_shipped states, image zoom, shipments, multi-address -- */
 .state-paid{background:#e6f0ff;color:#174a84}.state-partially_shipped{background:#fdeccb;color:#7a4a00}
