@@ -1,7 +1,7 @@
 {% extends "base.html" %}
-{% block title %}拍照识别 · Japan Buying Agent{% endblock %}
+{% block title %}识别小票 · Japan Buying Agent{% endblock %}
 {% block content %}
-<section class="page-intro"><div class="section-head"><div><h1>拍照识别</h1><p class="muted">原图会完整保留，后台自动准备识别图。</p></div><a class="button secondary" href="/receipts">识别历史</a></div><p id="recentCompleted" class="recent-completed" hidden></p></section>
+<section class="page-intro"><div class="section-head"><div><h1>识别小票</h1><p class="muted">原图会完整保留，后台自动准备识别图。</p></div><a class="button secondary" href="/receipts">识别历史</a></div><p id="recentCompleted" class="recent-completed" hidden></p></section>
 <form id="uploadForm" class="card stack compact-upload" novalidate>
   <div class="upload-actions">
     <label class="pick-button">📷 直接拍照<input id="cameraInput" type="file" accept=".jpg,.jpeg,.png,.webp,.heic,.heif,image/jpeg,image/png,image/webp,image/heic,image/heif" capture="environment" hidden></label>

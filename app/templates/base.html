@@ -25,30 +25,48 @@
         <a href="/more"><span>•••</span><b>更多</b></a>
       </nav>
       <div class="sidebar-groups">
+        <p class="sidebar-section-label">常用功能</p>
         {% if nav_can('field') %}
         <details open><summary>现场作业</summary>
-          <a href="/price-check">扫码查价</a><a href="/field-purchase">扫码（批量）</a><a href="/receipts/upload">拍照识别</a><a href="/stores">门店</a><a href="/purchase-batches">采购批次</a><a href="/sales-orders">微信订单</a><a href="/domestic-logistics">国内物流</a><a href="/customers">客户管理</a><a href="/procurement-demands">采购需求</a><a href="/procurement-demands/report-shortage">补货需求</a>
+          <a href="/price-check">扫码查价</a><a href="/receipts/upload">识别小票</a><a href="/purchase-batches">采购批次</a><a href="/sales-orders">微信订单</a><a href="/domestic-logistics">国内物流</a><a href="/customers">客户管理</a><a href="/procurement-demands">采购需求</a><a href="/procurement-demands/report-shortage">补货需求</a>
         </details>
         {% endif %}
         {% if nav_can('products') %}
-        <details><summary>商品库存</summary>
-          <a href="/products">商品</a><a href="/watched-products">关注商品</a><a href="/product-enrichment">新品异常</a><a href="/restock-lists">补货清单</a><a href="/locations">位置管理</a><a href="/qinsi-inventory-snapshots">库存快照</a>
+        <details><summary>商品与库存</summary>
+          <a href="/products">商品</a><a href="/watched-products">关注商品</a><a href="/product-enrichment">新品异常</a><a href="/restock-lists">补货清单</a><a href="/qinsi-inventory-snapshots">库存快照</a>
         </details>
         {% endif %}
         {% if nav_can('tasks') %}
-        {% set unread_count = nav_unread_count() %}
-        <details><summary>AI任务</summary>
-          <a href="/receipts">小票记录</a><a href="/gpt-jobs">GPT识别任务</a><a href="/notifications">通知{% if unread_count %}<span class="nav-count">{{ unread_count }}</span>{% endif %}</a><a href="/monitor-status">监控状态</a><a href="/platform-config">平台配置状态</a>
-        </details>
-        {% endif %}
-        {% if nav_can('qinsi') %}
-        <details><summary>秦丝数据</summary>
-          <a href="/products/qinsi-master-import">秦丝商品主数据导入</a><a href="/products/import">商品导入</a><a href="/qinsi-exports">秦丝导出</a><a href="/qinsi-inventory-snapshots">秦丝库存快照</a><a href="/qinsi-sales-summary">秦丝进销存汇总</a>
+        <details><summary>小票与提醒</summary>
+          {% set unread_count = nav_unread_count() %}
+          <a href="/receipts">小票记录</a><a href="/notifications">通知{% if unread_count %}<span class="nav-count">{{ unread_count }}</span>{% endif %}</a>
         </details>
         {% endif %}
         {% if nav_can('analytics') %}
         <details><summary>分析</summary>
           <a href="/purchase-analytics">采购分析</a><a href="/watched-products">价格历史</a><a href="/product-enrichment">异常统计</a>
+        </details>
+        {% endif %}
+        <p class="sidebar-section-label">后台管理</p>
+        {% if nav_can('products') or nav_can('qinsi') %}
+        <details><summary>商品管理</summary>
+          {% if nav_can('products') %}<a href="/locations">位置管理</a>{% endif %}
+          {% if nav_can('qinsi') %}<a href="/jan-governance">JAN 治理</a><a href="/product-image-localization">图片本地化</a>{% endif %}
+        </details>
+        {% endif %}
+        {% if nav_can('field') %}
+        <details><summary>门店管理</summary>
+          <a href="/stores">门店</a>
+        </details>
+        {% endif %}
+        {% if nav_can('qinsi') %}
+        <details><summary>秦丝导入/同步/维护</summary>
+          <a href="/products/qinsi-master-import">秦丝商品主数据导入</a><a href="/products/import">商品导入</a><a href="/qinsi-exports">秦丝导出</a><a href="/qinsi-inventory-snapshots">秦丝库存快照</a><a href="/qinsi-sales-summary">秦丝进销存汇总</a>
+        </details>
+        {% endif %}
+        {% if nav_can('tasks') %}
+        <details><summary>系统与任务状态</summary>
+          <a href="/gpt-jobs">GPT识别任务</a><a href="/monitor-status">监控状态</a><a href="/platform-config">平台配置状态</a>
         </details>
         {% endif %}
       </div>

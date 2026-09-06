@@ -663,11 +663,15 @@ def test_home_bottom_nav_does_not_send_procurement_to_purchase_batches(client):
     assert "/purchase-batches" not in bottom_nav
 
 
-def test_field_purchase_batch_scan_still_reachable_from_more_menu(client):
+def test_field_purchase_batch_scan_hidden_from_menu_but_route_still_works(client):
+    # Superseded expectation: this entry point used to be linked from /more.
+    # It's now deliberately hidden from every nav surface (menu clutter --
+    # /price-check covers the common single-item case) while the route,
+    # template, JS, and its own tests stay fully intact and reachable by URL.
     http, db, _tmp = client
     more_response = http.get("/more")
     assert more_response.status_code == 200
-    assert "扫码（批量）" in more_response.text
-    assert '/field-purchase' in more_response.text
+    assert "扫码（批量）" not in more_response.text
+    assert 'href="/field-purchase"' not in more_response.text
     field_response = http.get("/field-purchase")
     assert field_response.status_code == 200

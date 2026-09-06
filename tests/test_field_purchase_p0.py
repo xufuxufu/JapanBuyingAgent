@@ -716,14 +716,14 @@ def test_field_purchase_api_and_navigation_permissions(client, monkeypatch, jpeg
     monkeypatch.setenv("JBA_DEFAULT_ROLE", "buyer")
     buyer_more = test_client.get("/more")
     assert "现场作业" in buyer_more.text
-    assert "秦丝数据" not in buyer_more.text
-    assert "AI任务" in buyer_more.text
+    assert "秦丝导入/同步/维护" not in buyer_more.text and "JAN 治理" not in buyer_more.text
+    assert "小票与提醒" in buyer_more.text and "系统与任务状态" in buyer_more.text
     assert "/receipts" in buyer_more.text and "小票记录" in buyer_more.text
     buyer_tasks = test_client.get("/tasks")
     assert "小票批次 / 小票记录" in buyer_tasks.text
     monkeypatch.setenv("JBA_DEFAULT_ROLE", "admin")
     admin_more = test_client.get("/more")
-    assert "秦丝数据" in admin_more.text
+    assert "秦丝导入/同步/维护" in admin_more.text and "JAN 治理" in admin_more.text
 
 
 def test_camera_contract_uses_moderate_resolution_roi_and_safe_capability_fallback():
