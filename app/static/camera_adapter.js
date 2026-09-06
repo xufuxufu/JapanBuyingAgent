@@ -481,6 +481,30 @@
       this.renderDiagnostics();
     }
 
+    // Resumes decoding on the SAME already-open stream/track after a
+    // pauseAfterSuccess() -- no getUserMedia call, no device re-enumeration,
+    // just restarting the decode loop with the detector/zxingReader that
+    // pauseAfterSuccess() (unlike stop()) deliberately left untouched.
+    // Returns false if the session was actually stopped (nothing to resume
+    // from) so the caller knows it must call start() instead.
+    async resume() {
+      if (!this.stream || !this.track) return false;
+      const loopId = this.loopGeneration;
+      this.loopStartedAt = Date.now();
+      this.stats.roiMode = "full_frame";
+      this.stats.lastStopReason = "";
+      if (this.detector) {
+        const started = await this.startBarcodeDetectorLoop(loopId);
+        if (started) this.setStatus("请将 JAN 条码完整放入画面。");
+        return started;
+      }
+      if (this.isZxingReady()) {
+        await this.startZxingLoop(loopId);
+        return true;
+      }
+      return false;
+    }
+
     stop(reason = "stop") {
       this.scanning = false;
       this.loopGeneration += 1;

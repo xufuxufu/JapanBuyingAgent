@@ -25,7 +25,7 @@ from sqlalchemy.orm import Session, selectinload
 
 from app.config import PREVIEW_DIR, PRODUCT_IMAGE_DIR, PROJECT_ROOT, QINSI_PRODUCT_IMAGE_DIR, TAG_EVIDENCE_DIR, default_role, ensure_data_directories, get_deepseek_config, is_testing
 from app.db import SessionLocal, engine, get_db
-from app.models import Customer, CustomerAddress, DurableBackgroundJob, DuplicateDetectionLog, EnrichmentAuditLog, FieldPurchaseItem, PlatformProviderState, ProcurementDemand, ProcurementDemandPlan, Product, ProductAlias, ProductEnrichmentCandidate, ProductWatchConfig, ProductWatchSnapshot, PurchaseBatch, PurchaseBatchItem, QinsiExportJob, QinsiGoodsImportRow, QinsiImportBatch, QinsiPurchaseExportJob, Receipt, ReceiptBatch, ReceiptImage, ReceiptItem, RestockList, RestockListItem, SalesOrder, SalesOrderItem, SalesShipment, Salesperson, ShipmentTrackingEvent, Store, StoreBrand, TagEvidence, ZipPackageItem, ZipPackageJob
+from app.models import Customer, CustomerAddress, DurableBackgroundJob, DuplicateDetectionLog, EnrichmentAuditLog, FieldPurchaseItem, PlatformProviderState, ProcurementDemand, ProcurementDemandPlan, Product, ProductAlias, ProductEnrichmentCandidate, ProductOffer, ProductWatchConfig, ProductWatchSnapshot, PurchaseBatch, PurchaseBatchItem, QinsiExportJob, QinsiGoodsImportRow, QinsiImportBatch, QinsiPurchaseExportJob, Receipt, ReceiptBatch, ReceiptImage, ReceiptItem, RestockList, RestockListItem, SalesOrder, SalesOrderItem, SalesShipment, Salesperson, ShipmentTrackingEvent, Store, StoreBrand, TagEvidence, ZipPackageItem, ZipPackageJob
 from app.analytics_service import analytics_dashboard, procurement_data, resolve_date_range
 from app.product_matching import (
     bind_product,
@@ -53,8 +53,8 @@ from app.product_admin import (
     update_product_master,
 )
 from app.price_service import (
-    build_lookup_view, query_prices, recent_price_lookup_histories, refresh_product_online_price_task,
-    update_store_price,
+    PriceLookupView, build_lookup_view, query_prices, recent_price_lookup_histories,
+    refresh_product_online_price_task, update_store_price,
 )
 from app.product_enrichment import (
     accept_task, bind_task_to_existing, enrichment_summary_for_receipt, ensure_existing_product_enrichment_task, get_task,
@@ -1089,6 +1089,92 @@ def price_check_page(
     })
 
 
+def _run_price_lookup(
+    db: Session, background_tasks: BackgroundTasks, lookup: PriceLookupInput,
+) -> PriceLookupView:
+    """Shared body of the scan/manual-entry lookup, used by both the classic
+    form-post route and the JSON API route below -- one call site into
+    query_prices(), no per-route platform logic."""
+    local = resolve_local_product_by_jan(db, lookup.jan)
+    providers = [] if local.product is not None and not lookup.force_refresh else None
+    view = query_prices(db, lookup, providers=providers, trigger_enrichment=False)
+    if local.product is None or product_needs_jan_completion(local.product):
+        database_url = db.get_bind().url.render_as_string(hide_password=False)
+        background_tasks.add_task(process_price_lookup_enrichment, database_url, lookup.jan, view.history.id)
+    return view
+
+
+def _offer_payload(offer: ProductOffer) -> dict:
+    return {
+        "title": offer.title,
+        "url": offer.url,
+        "image_url": offer.image_url,
+        "platform_display_name": offer.platform_display_name,
+        "seller_display_name": offer.seller_display_name,
+        "pack_quantity": offer.pack_quantity,
+        "listing_price_text": offer.listing_price_text,
+        "display_price": float(offer.display_price) if offer.display_price is not None else None,
+        "display_price_text": offer.display_price_text,
+        "normalized_unit_price": offer.normalized_unit_price is not None,
+        "stock_label": offer.stock_label,
+    }
+
+
+def _yen(value) -> str | None:
+    return None if value is None else f"¥{value:,}"
+
+
+def _lookup_view_payload(db: Session, view: PriceLookupView) -> dict:
+    provider_banner = None
+    if view.providers_all_failed:
+        provider_banner = "查询失败，暂无线上结果"
+    elif view.providers_partial_failed:
+        provider_banner = "部分平台查询失败，结果可能不完整"
+    product = view.product
+    product_payload = None
+    if product is not None:
+        product_payload = {
+            "id": product.id,
+            "display_name": view.product_display_name,
+            "internal_sku": product.internal_sku,
+            "jan": product.jan or view.history.jan,
+            "qinsi_product_code": product.qinsi_product_code,
+            "url": f"/products/{product.id}",
+            "image_url": product.preferred_image_url,
+            "historical_lowest_purchase_price_text": _yen(view.historical_lowest_purchase_price),
+            "recent_purchase_price_text": _yen(view.recent_purchase_price),
+            "latest_purchase_store_name": view.latest_purchase_store_name,
+            "latest_purchase_store_address": view.latest_purchase_store_address,
+            "watched": get_watch(db, product.id) is not None,
+        }
+    return {
+        "history_id": view.history.id,
+        "jan": view.history.jan,
+        "cache_hit": view.history.cache_hit,
+        "result_url": f"/price-check/results/{view.history.id}",
+        "current_store_price": view.current_store_price,
+        "online_min_price_text": _yen(view.online_min_price),
+        "difference_text": _yen(abs(view.difference)) if view.difference is not None else None,
+        "comparison_status": view.comparison_status,
+        "comparison_label": PRICE_COMPARISON_CN.get(view.comparison_status) if view.comparison_status else None,
+        "providers_all_failed": view.providers_all_failed,
+        "providers_partial_failed": view.providers_partial_failed,
+        "provider_banner": provider_banner,
+        "offers": [_offer_payload(offer) for offer in view.result_offers],
+        "attempts": [
+            {
+                "provider_code": attempt.provider_code,
+                "status": attempt.status,
+                "status_label": PRICE_PROVIDER_STATUS_CN.get(attempt.status, attempt.status),
+                "message": attempt.message,
+                "result_count": attempt.result_count,
+            }
+            for attempt in view.attempts
+        ],
+        "product": product_payload,
+    }
+
+
 @app.post("/price-check", response_class=HTMLResponse)
 def price_check_submit(
     request: Request, background_tasks: BackgroundTasks,
@@ -1105,9 +1191,7 @@ def price_check_submit(
             "jan": jan, "current_store_price": current_store_price,
         }, status_code=422)
     try:
-        local = resolve_local_product_by_jan(db, lookup.jan)
-        providers = [] if local.product is not None and not lookup.force_refresh else None
-        view = query_prices(db, lookup, providers=providers, trigger_enrichment=False)
+        view = _run_price_lookup(db, background_tasks, lookup)
     except ValueError as exc:
         return templates.TemplateResponse(request, "price_check.html", {
             "histories": recent_price_lookup_histories(db), "error": str(exc),
@@ -1116,10 +1200,26 @@ def price_check_submit(
     except Exception as exc:
         _log_price_check_failure(request, jan=lookup.jan, exc=exc)
         raise
-    if local.product is None or product_needs_jan_completion(local.product):
-        database_url = db.get_bind().url.render_as_string(hide_password=False)
-        background_tasks.add_task(process_price_lookup_enrichment, database_url, lookup.jan, view.history.id)
     return RedirectResponse(f"/price-check/results/{view.history.id}", status_code=303)
+
+
+@app.post("/api/price-check/lookup")
+def api_price_check_lookup(
+    request: Request, background_tasks: BackgroundTasks,
+    payload: dict = Body(...), db: Session = Depends(get_db),
+):
+    try:
+        lookup = PriceLookupInput.model_validate(payload)
+    except ValidationError as exc:
+        return JSONResponse({"ok": False, "message": _validation_message(exc)}, status_code=422)
+    try:
+        view = _run_price_lookup(db, background_tasks, lookup)
+    except ValueError as exc:
+        return JSONResponse({"ok": False, "message": str(exc)}, status_code=409)
+    except Exception as exc:
+        _log_price_check_failure(request, jan=lookup.jan, exc=exc)
+        return JSONResponse({"ok": False, "message": "查询失败，请稍后重试"}, status_code=500)
+    return {"ok": True, **_lookup_view_payload(db, view)}
 
 
 @app.get("/price-check/results/{history_id}", response_class=HTMLResponse)
@@ -1143,6 +1243,7 @@ def price_check_result(history_id: int, request: Request, db: Session = Depends(
 def price_check_update_store_price(
     history_id: int, request: Request, current_store_price: str = Form(""), db: Session = Depends(get_db),
 ):
+    is_fetch = request.headers.get("x-requested-with") == "fetch"
     raw = current_store_price.strip()
     parsed: int | None = None
     if raw:
@@ -1151,17 +1252,26 @@ def price_check_update_store_price(
         except ValueError:
             parsed = None
         if parsed is None or parsed < 0:
+            message = "店内价必须是不小于 0 的整数"
+            if is_fetch:
+                return JSONResponse({"ok": False, "message": message}, status_code=422)
             return RedirectResponse(
-                f"/price-check/results/{history_id}?price_error={quote('店内价必须是不小于 0 的整数')}",
+                f"/price-check/results/{history_id}?price_error={quote(message)}",
                 status_code=303,
             )
     try:
         update_store_price(db, history_id, parsed)
     except LookupError as exc:
+        if is_fetch:
+            return JSONResponse({"ok": False, "message": str(exc)}, status_code=404)
         raise HTTPException(404, str(exc)) from exc
     except Exception as exc:
         _log_price_check_failure(request, jan=None, history_id=history_id, exc=exc)
+        if is_fetch:
+            return JSONResponse({"ok": False, "message": "保存失败，请稍后重试"}, status_code=500)
         raise
+    if is_fetch:
+        return {"ok": True, **_lookup_view_payload(db, build_lookup_view(db, history_id))}
     return RedirectResponse(f"/price-check/results/{history_id}?price_saved=1", status_code=303)
 
 

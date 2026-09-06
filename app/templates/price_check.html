@@ -44,6 +44,42 @@
     <button id="priceCopyCameraDiagnostic" type="button" class="secondary compact" hidden>复制安全诊断</button>
     <pre id="priceCameraDebug" class="camera-debug" {% if request.query_params.get('debug') != '1' %}hidden{% endif %}></pre>
   </div>
+
+  <section class="card" id="scanResultCard" hidden>
+    <div class="section-head price-result-head">
+      <div><span id="resultBadge" class="badge"></span><h2 id="resultHeading"></h2></div>
+      <div class="button-row">
+        <button id="requeryButton" type="button" class="secondary compact">重新查询</button>
+        <a id="resultFullPageLink" class="button secondary compact" href="#" target="_blank" rel="noopener noreferrer">完整结果页</a>
+      </div>
+    </div>
+    <div id="resultProviderBanner"></div>
+    <div class="card price-compare-card" id="resultPriceCompareSection">
+      <div class="price-compare-grid">
+        <form id="resultStorePriceForm" class="price-compare-store">
+          <label for="resultStorePriceInput">店内价<small>（税込）</small></label>
+          <div class="store-price-row">
+            <input id="resultStorePriceInput" type="number" min="0" step="1" inputmode="decimal" placeholder="未填写">
+            <button type="submit" class="compact">保存</button>
+          </div>
+          <span id="resultStorePriceFeedback" class="store-price-feedback"></span>
+        </form>
+        <div class="price-compare-online">
+          <small>网上最低</small>
+          <strong id="resultOnlineMin">暂无可信结果</strong>
+        </div>
+      </div>
+      <p class="price-compare-diff">差额 <strong id="resultDiff">—</strong><span id="resultComparisonLabel">等待可比较价格</span></p>
+    </div>
+    <section id="resultOffersSection">
+      <div class="section-head"><div><h2>线上商品结果一览</h2><p class="muted">当前按商品价格排序，未计入配送费。</p></div></div>
+      <div id="resultOffers" class="offer-list"></div>
+    </section>
+    <section class="card local-product-card" id="resultProductCard" hidden></section>
+    <div class="scan-bottom-action">
+      <button id="rescanButton" class="button" type="button">继续扫码</button>
+    </div>
+  </section>
 </section>
 
 {% if histories %}
@@ -79,6 +115,25 @@
   const debug = document.querySelector('#priceCameraDebug');
   const copyDiagnostic = document.querySelector('#priceCopyCameraDiagnostic');
   const stage = document.querySelector('#scannerStage');
+
+  const scanResultCard = document.querySelector('#scanResultCard');
+  const resultBadge = document.querySelector('#resultBadge');
+  const resultHeading = document.querySelector('#resultHeading');
+  const resultFullPageLink = document.querySelector('#resultFullPageLink');
+  const resultProviderBanner = document.querySelector('#resultProviderBanner');
+  const resultPriceCompareSection = document.querySelector('#resultPriceCompareSection');
+  const resultStorePriceForm = document.querySelector('#resultStorePriceForm');
+  const resultStorePriceInput = document.querySelector('#resultStorePriceInput');
+  const resultStorePriceFeedback = document.querySelector('#resultStorePriceFeedback');
+  const resultOnlineMin = document.querySelector('#resultOnlineMin');
+  const resultDiff = document.querySelector('#resultDiff');
+  const resultComparisonLabel = document.querySelector('#resultComparisonLabel');
+  const resultOffersSection = document.querySelector('#resultOffersSection');
+  const resultOffers = document.querySelector('#resultOffers');
+  const resultProductCard = document.querySelector('#resultProductCard');
+  const rescanButton = document.querySelector('#rescanButton');
+  const requeryButton = document.querySelector('#requeryButton');
+
   const scanner = new window.JBACamera.UnifiedJanScanner({
     video,
     placeholder,
@@ -90,24 +145,34 @@
     zoomIn,
     debug,
     onCode(value) {
+      // Simple lock (item 7): a decode while we're already querying/showing
+      // a result is ignored outright -- the scan loop is paused during that
+      // window anyway, but multiple frames/providers racing to report the
+      // same code is not something to rely on the decoder alone to prevent.
+      if (uiState !== 'scanning') return;
+      uiState = 'querying';
       input.value = value;
       const firstDecodeMs = cameraStartedAt ? Date.now() - cameraStartedAt : null;
       sendCameraDiagnostics('first_decode', {firstDecodeMs});
       enterQueryingState(value);
-      submitPriceForm();
+      runLookup(value, {forceRefresh: true});
     },
   });
 
   let cameraStartedAt = 0;
+  let uiState = 'scanning'; // 'scanning' | 'querying' | 'showing_result'
+  let lastJan = '';
+  let currentHistoryId = null;
 
   function enterQueryingState(jan) {
-    scanner.stop('price_check_stop');
-    start.disabled = false;
-    start.textContent = '开启扫码';
-    // Hide the (now stopped, dark) camera view entirely instead of leaving
-    // it on screen -- the user doesn't need to see readyState=0/videoWidth=0
-    // internals, just a clear "querying" state.
-    stage.hidden = true;
+    // Pause the decode loop but deliberately do NOT stop the camera --
+    // the whole point of this page is one MediaStream/getUserMedia grant
+    // reused across every scan in the session (see camera_adapter.js's
+    // pauseAfterSuccess/resume). Only an explicit stop, pagehide, or really
+    // leaving the page releases the stream (see stopCamera()/pagehide below).
+    scanner.pauseAfterSuccess();
+    stage.classList.add('scanner-stage-compact');
+    scanResultCard.hidden = true;
     status.classList.add('querying-status');
     status.textContent = `JAN ${jan} 正在查询价格…`;
   }
@@ -129,74 +194,370 @@
     } catch (_) {}
   }
 
-  async function submitPriceForm() {
+  function renderProviderBanner(bannerText, allFailed) {
+    resultProviderBanner.replaceChildren();
+    if (!bannerText) return;
+    const div = document.createElement('div');
+    div.className = allFailed ? 'warning price-provider-banner' : 'badge warning price-provider-badge';
+    div.textContent = bannerText;
+    resultProviderBanner.append(div);
+  }
+
+  function renderOffers(offers) {
+    resultOffers.replaceChildren();
+    if (!offers || !offers.length) {
+      const empty = document.createElement('div');
+      empty.className = 'card info';
+      empty.textContent = '当前没有线上商品结果。';
+      resultOffers.append(empty);
+      return;
+    }
+    for (const offer of offers) {
+      const row = document.createElement('a');
+      row.className = 'offer-result-row';
+      row.href = offer.url || '#';
+      row.target = '_blank';
+      row.rel = 'noopener noreferrer';
+      if (offer.image_url) {
+        const img = document.createElement('img');
+        img.src = offer.image_url;
+        img.alt = offer.title || '';
+        img.loading = 'lazy';
+        img.referrerPolicy = 'no-referrer';
+        row.append(img);
+      } else {
+        const emptyImage = document.createElement('div');
+        emptyImage.className = 'offer-image-empty';
+        emptyImage.textContent = '暂无图';
+        row.append(emptyImage);
+      }
+      const main = document.createElement('div');
+      main.className = 'offer-result-main';
+      const h3 = document.createElement('h3');
+      h3.textContent = offer.title || '';
+      main.append(h3);
+      const p = document.createElement('p');
+      p.textContent = `${offer.platform_display_name || ''} · ${offer.seller_display_name || ''}`;
+      main.append(p);
+      if (offer.pack_quantity && offer.pack_quantity > 1) {
+        const small = document.createElement('small');
+        small.textContent = `${offer.pack_quantity}个装 ¥${offer.listing_price_text}`;
+        main.append(small);
+      }
+      row.append(main);
+      const priceBox = document.createElement('div');
+      priceBox.className = 'offer-result-price';
+      const strong = document.createElement('strong');
+      strong.textContent = (offer.display_price !== null && offer.display_price !== undefined)
+        ? `¥${offer.display_price_text}${offer.normalized_unit_price ? '/个' : ''}`
+        : '暂无';
+      priceBox.append(strong);
+      const small2 = document.createElement('small');
+      small2.textContent = offer.stock_label || '';
+      priceBox.append(small2);
+      row.append(priceBox);
+      resultOffers.append(row);
+    }
+  }
+
+  function addWatch(productId, button) {
+    button.disabled = true;
+    fetch('/watched-products/add', {
+      method: 'POST',
+      headers: {'X-Requested-With': 'fetch'},
+      body: new URLSearchParams({product_id: String(productId)}),
+    }).then(async (response) => {
+      const data = await response.json().catch(() => null);
+      if (response.ok && data && data.ok) {
+        const manageLink = document.createElement('a');
+        manageLink.className = 'button secondary';
+        manageLink.href = '/watched-products';
+        manageLink.textContent = '管理关注';
+        button.replaceWith(manageLink);
+      } else {
+        button.disabled = false;
+        status.textContent = (data && data.message) || '关注失败，请重试';
+      }
+    }).catch(() => { button.disabled = false; });
+  }
+
+  function renderProductCard(product) {
+    resultProductCard.replaceChildren();
+    resultProductCard.hidden = false;
+    if (!product) {
+      const badge = document.createElement('span');
+      badge.className = 'badge warning';
+      badge.textContent = '新品候选 · 资料补全中';
+      resultProductCard.append(badge);
+      return;
+    }
+    const badge = document.createElement('span');
+    badge.className = 'badge success';
+    badge.textContent = '本地已有商品';
+    resultProductCard.append(badge);
+
+    const wrap = document.createElement('div');
+    wrap.className = 'local-product-result';
+    if (product.image_url) {
+      const img = document.createElement('img');
+      img.className = 'product-thumb-large';
+      img.src = product.image_url;
+      img.alt = '商品图片';
+      img.loading = 'lazy';
+      wrap.append(img);
+    } else {
+      const emptyImage = document.createElement('div');
+      emptyImage.className = 'product-image-empty';
+      emptyImage.textContent = '暂无图';
+      wrap.append(emptyImage);
+    }
+    const info = document.createElement('div');
+    const h2 = document.createElement('h2');
+    h2.textContent = product.display_name || '';
+    info.append(h2);
+    const p = document.createElement('p');
+    const code = document.createElement('code');
+    code.textContent = product.internal_sku || '';
+    p.append(code);
+    if (product.qinsi_product_code) p.append(document.createTextNode(` · 秦丝编码 ${product.qinsi_product_code}`));
+    info.append(p);
+    const grid = document.createElement('div');
+    grid.className = 'summary-grid';
+    const rows = [
+      [product.jan || '', 'JAN'],
+      [product.historical_lowest_purchase_price_text || '暂无', '历史最低采购价'],
+      [product.recent_purchase_price_text || '暂无', '上一次采购价'],
+      [product.latest_purchase_store_name || '暂无', '上一次采购店铺'],
+      [product.latest_purchase_store_address || '暂无', '上一次采购店铺地址'],
+    ];
+    for (const [value, label] of rows) {
+      const span = document.createElement('span');
+      const strong = document.createElement('strong');
+      strong.textContent = value;
+      span.append(strong, document.createTextNode(label));
+      grid.append(span);
+    }
+    info.append(grid);
+    wrap.append(info);
+    resultProductCard.append(wrap);
+
+    const buttonRow = document.createElement('div');
+    buttonRow.className = 'button-row';
+    const viewLink = document.createElement('a');
+    viewLink.className = 'button secondary';
+    viewLink.href = product.url;
+    viewLink.textContent = '查看本地商品';
+    buttonRow.append(viewLink);
+    if (product.watched) {
+      const manageLink = document.createElement('a');
+      manageLink.className = 'button secondary';
+      manageLink.href = '/watched-products';
+      manageLink.textContent = '管理关注';
+      buttonRow.append(manageLink);
+    } else {
+      const watchButton = document.createElement('button');
+      watchButton.type = 'button';
+      watchButton.textContent = '关注';
+      watchButton.addEventListener('click', () => addWatch(product.id, watchButton));
+      buttonRow.append(watchButton);
+    }
+    resultProductCard.append(buttonRow);
+  }
+
+  function showResult(data) {
+    uiState = 'showing_result';
+    currentHistoryId = data.history_id;
+    status.classList.remove('querying-status');
+    status.textContent = '查询完成，可以继续扫码。';
+    resultBadge.textContent = data.cache_hit ? '使用短时缓存' : '本次查询';
+    resultHeading.textContent = `JAN ${data.jan}`;
+    resultFullPageLink.hidden = false;
+    resultFullPageLink.href = data.result_url;
+    resultPriceCompareSection.hidden = false;
+    resultOffersSection.hidden = false;
+    renderProviderBanner(data.provider_banner, data.providers_all_failed);
+    resultStorePriceInput.value = data.current_store_price ?? '';
+    resultStorePriceFeedback.textContent = '';
+    resultStorePriceFeedback.className = 'store-price-feedback';
+    resultOnlineMin.textContent = data.online_min_price_text || '暂无可信结果';
+    resultDiff.textContent = data.difference_text || '—';
+    resultComparisonLabel.textContent = data.comparison_label || '等待可比较价格';
+    renderOffers(data.offers);
+    renderProductCard(data.product);
+    scanResultCard.hidden = false;
+  }
+
+  function showError(jan, message) {
+    uiState = 'showing_result';
+    currentHistoryId = null;
+    status.classList.remove('querying-status');
+    status.textContent = '查询失败，可以重新查询或继续扫码。';
+    resultBadge.textContent = '查询失败';
+    resultHeading.textContent = `JAN ${jan}`;
+    resultFullPageLink.hidden = true;
+    resultPriceCompareSection.hidden = true;
+    resultOffersSection.hidden = true;
+    resultProductCard.hidden = true;
+    renderProviderBanner(message, true);
+    scanResultCard.hidden = false;
+  }
+
+  async function runLookup(jan, {currentStorePrice = null, forceRefresh = true} = {}) {
+    lastJan = jan;
+    uiState = 'querying';
     submit.disabled = true;
     submit.textContent = '查询中…';
-    const slowTimer = setTimeout(() => {
-      status.textContent = '网络查询较慢，正在继续获取…';
-    }, 2000);
+    const slowTimer = setTimeout(() => { status.textContent = '网络查询较慢，正在继续获取…'; }, 2000);
     try {
-      const response = await fetch(form.action, {method: 'POST', body: new FormData(form)});
+      const response = await fetch('/api/price-check/lookup', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({jan, current_store_price: currentStorePrice, force_refresh: forceRefresh}),
+      });
       clearTimeout(slowTimer);
-      if (response.ok && response.redirected) {
-        window.location.href = response.url;
-        return;
+      const data = await response.json().catch(() => null);
+      if (response.ok && data && data.ok) {
+        showResult(data);
+      } else {
+        showError(jan, (data && data.message) || '查询失败，请稍后重试');
       }
     } catch (_) {
       clearTimeout(slowTimer);
+      showError(jan, '网络异常，请检查连接后重试');
+    } finally {
+      submit.disabled = false;
+      submit.textContent = '查询商品';
     }
-    // Validation/conflict errors (422/409), or the fetch itself failing:
-    // fall back to a real navigation so the server renders its normal
-    // error page instead of silently doing nothing.
-    form.submit();
   }
 
   function stopCamera(message) {
     scanner.stop('price_check_stop');
-    stage.hidden = false;
+    uiState = 'scanning';
+    stage.classList.remove('scanner-stage-compact');
     status.classList.remove('querying-status');
     start.disabled = false;
     start.textContent = '开启扫码';
     if (message) status.textContent = message;
   }
 
-  async function startCamera(deviceId='') {
+  async function startCamera(deviceId = '') {
     start.disabled = true;
-    stage.hidden = false;
     status.classList.remove('querying-status');
     status.textContent = '正在请求摄像头权限…';
     cameraStartedAt = Date.now();
     try {
       await scanner.start(deviceId);
+      uiState = 'scanning';
       start.disabled = false;
       start.textContent = '停止扫码';
       copyDiagnostic.hidden = true;
       sendCameraDiagnostics('camera_started');
     } catch (error) {
-      const details=window.JBACamera.cameraErrorDetails(error,{secureContext:globalThis.isSecureContext,platform:scanner.cameraAdapter.platform,mediaDevices:navigator.mediaDevices});
+      const details = window.JBACamera.cameraErrorDetails(error, {secureContext: globalThis.isSecureContext, platform: scanner.cameraAdapter.platform, mediaDevices: navigator.mediaDevices});
       stopCamera(details.message);
-      debug.hidden=false;
-      debug.textContent=JSON.stringify(details.diagnostic,null,2);
-      copyDiagnostic.hidden=false;
+      debug.hidden = false;
+      debug.textContent = JSON.stringify(details.diagnostic, null, 2);
+      copyDiagnostic.hidden = false;
     }
   }
-  start.addEventListener('click',()=>{if(scanner.track){stopCamera('扫码已停止，可手动输入 JAN。');return;}status.textContent='正在请求摄像头…';startCamera()});
-  cameraSelect.addEventListener('change',()=>scanner.switchDevice(cameraSelect.value));
-  zoomOut.addEventListener('click',()=>scanner.setZoom(scanner.zoomValue-(scanner.capabilities.zoom?.step||.2)));
-  zoomReset.addEventListener('click',()=>scanner.setZoom(1));
-  zoomIn.addEventListener('click',()=>scanner.setZoom(scanner.zoomValue+(scanner.capabilities.zoom?.step||.2)));
-  torchButton.addEventListener('click',()=>scanner.setTorch(!scanner.torchOn));
-  stage.addEventListener('click',async(event)=>{if(!scanner.track)return;const rect=video.getBoundingClientRect();await scanner.focusAt({x:Math.min(1,Math.max(0,(event.clientX-rect.left)/rect.width)),y:Math.min(1,Math.max(0,(event.clientY-rect.top)/rect.height))})});
-  copyDiagnostic.addEventListener('click',async()=>{try{await navigator.clipboard.writeText(debug.textContent||'');status.textContent='安全诊断已复制。'}catch(_){status.textContent='无法自动复制；请长按诊断文本手动复制。'}});
-  form.addEventListener('submit', (event) => { event.preventDefault(); submitPriceForm(); });
+
+  start.addEventListener('click', () => {
+    if (scanner.track) { stopCamera('扫码已停止，可手动输入 JAN。'); return; }
+    status.textContent = '正在请求摄像头…';
+    startCamera();
+  });
+  cameraSelect.addEventListener('change', () => scanner.switchDevice(cameraSelect.value));
+  zoomOut.addEventListener('click', () => scanner.setZoom(scanner.zoomValue - (scanner.capabilities.zoom?.step || .2)));
+  zoomReset.addEventListener('click', () => scanner.setZoom(1));
+  zoomIn.addEventListener('click', () => scanner.setZoom(scanner.zoomValue + (scanner.capabilities.zoom?.step || .2)));
+  torchButton.addEventListener('click', () => scanner.setTorch(!scanner.torchOn));
+  stage.addEventListener('click', async (event) => {
+    if (!scanner.track) return;
+    const rect = video.getBoundingClientRect();
+    await scanner.focusAt({x: Math.min(1, Math.max(0, (event.clientX - rect.left) / rect.width)), y: Math.min(1, Math.max(0, (event.clientY - rect.top) / rect.height))});
+  });
+  copyDiagnostic.addEventListener('click', async () => {
+    try { await navigator.clipboard.writeText(debug.textContent || ''); status.textContent = '安全诊断已复制。'; }
+    catch (_) { status.textContent = '无法自动复制；请长按诊断文本手动复制。'; }
+  });
+
+  form.addEventListener('submit', (event) => {
+    event.preventDefault();
+    if (uiState === 'querying') return;
+    const jan = input.value.trim();
+    if (!jan) return;
+    const currentStorePrice = form.current_store_price.value.trim() || null;
+    const forceRefresh = form.force_refresh.checked;
+    uiState = 'querying';
+    enterQueryingState(jan);
+    runLookup(jan, {currentStorePrice, forceRefresh});
+  });
+
+  resultStorePriceForm.addEventListener('submit', async (event) => {
+    event.preventDefault();
+    if (!currentHistoryId) return;
+    const button = resultStorePriceForm.querySelector('button');
+    button.disabled = true;
+    resultStorePriceFeedback.textContent = '';
+    resultStorePriceFeedback.className = 'store-price-feedback';
+    try {
+      const response = await fetch(`/price-check/results/${currentHistoryId}/store-price`, {
+        method: 'POST',
+        headers: {'X-Requested-With': 'fetch'},
+        body: new URLSearchParams({current_store_price: resultStorePriceInput.value}),
+      });
+      const data = await response.json().catch(() => null);
+      if (response.ok && data && data.ok) {
+        resultOnlineMin.textContent = data.online_min_price_text || '暂无可信结果';
+        resultDiff.textContent = data.difference_text || '—';
+        resultComparisonLabel.textContent = data.comparison_label || '等待可比较价格';
+        resultStorePriceInput.value = data.current_store_price ?? '';
+        resultStorePriceFeedback.textContent = '已保存';
+        resultStorePriceFeedback.className = 'store-price-feedback saved';
+      } else {
+        resultStorePriceFeedback.textContent = (data && data.message) || '保存失败';
+        resultStorePriceFeedback.className = 'store-price-feedback error';
+      }
+    } catch (_) {
+      resultStorePriceFeedback.textContent = '网络异常，保存失败';
+      resultStorePriceFeedback.className = 'store-price-feedback error';
+    } finally {
+      button.disabled = false;
+    }
+  });
+
+  requeryButton.addEventListener('click', () => {
+    if (!lastJan || uiState === 'querying') return;
+    enterQueryingState(lastJan);
+    runLookup(lastJan, {forceRefresh: true});
+  });
+
+  rescanButton.addEventListener('click', async () => {
+    scanResultCard.hidden = true;
+    stage.classList.remove('scanner-stage-compact');
+    status.classList.remove('querying-status');
+    if (scanner.track) {
+      // Same MediaStream as before -- resume() never calls getUserMedia.
+      uiState = 'scanning';
+      const resumed = await scanner.resume();
+      status.textContent = resumed ? '请将 JAN 条码完整放入画面。' : '摄像头已断开，请重新开启扫码。';
+      if (!resumed) startCamera();
+    } else {
+      // Camera was never started (manual-entry-only session) or was
+      // explicitly stopped -- this is the one case a fresh start() (and a
+      // real getUserMedia call) is actually necessary.
+      uiState = 'scanning';
+      startCamera();
+    }
+  });
+
   window.addEventListener('pagehide', () => stopCamera());
 
-  // "继续扫码" from the result page links here with ?autostart=1 so the user
-  // doesn't have to tap "开启扫码" again for every single item. If the
-  // browser blocks/rejects the automatic camera request (permission not yet
-  // granted, insecure context, etc.), startCamera()'s own catch path already
-  // shows the normal error message and leaves the big manual button enabled
-  // -- so this never risks a blank/stuck page, just falls back to manual.
+  // "继续扫码" from the full result page (or a bookmark) still lands here
+  // with ?autostart=1 -- e.g. someone opens /price-check/results/{id} in a
+  // new tab and taps its own "继续扫码" link. That's still a fresh page
+  // load, so a real start() (and getUserMedia call) is unavoidable there;
+  // within THIS page's own session, rescanButton above never re-navigates.
   if (new URLSearchParams(location.search).get('autostart') === '1') {
     startCamera();
   }

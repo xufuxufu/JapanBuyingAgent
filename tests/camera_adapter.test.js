@@ -135,3 +135,92 @@ test("calling start() twice without an explicit stop never leaves two live track
 
   assert.equal(firstTrack.stopCalls, 1, "the previous track must be stopped before a new one opens");
 });
+
+test("resume() with no active stream returns false and never calls getUserMedia", async () => {
+  const mediaDevices = makeMediaDevices();
+  const video = makeVideo();
+  const scanner = new UnifiedJanScanner({
+    video, onCode() {},
+    cameraOptions: { mediaDevices, secureContext: true, storage: null },
+  });
+
+  const resumed = await scanner.resume();
+
+  assert.equal(resumed, false);
+  assert.equal(mediaDevices.calls.length, 0);
+});
+
+test("resume() after pauseAfterSuccess restarts decoding on the same track without a new getUserMedia call", async () => {
+  const mediaDevices = makeMediaDevices();
+  const video = makeVideo();
+  const scanner = new UnifiedJanScanner({
+    video, onCode() {},
+    cameraOptions: { mediaDevices, secureContext: true, storage: null },
+  });
+  const track = mediaDevices.lastTrack;
+  scanner.stream = makeStream(track);
+  scanner.track = track;
+  scanner.detector = { fake: true }; // stand-in for a real BarcodeDetector instance
+  scanner.scanning = true;
+  scanner.pauseAfterSuccess();
+  assert.equal(scanner.scanning, false, "paused before resuming");
+
+  const resumed = await scanner.resume();
+
+  assert.equal(resumed, true);
+  assert.equal(scanner.scanning, true, "resume() restarts the decode loop");
+  assert.equal(mediaDevices.calls.length, 0, "resume() must never call getUserMedia");
+  assert.equal(track.stopCalls, 0, "resume() must never stop the reused track");
+  scanner.stop("test_cleanup");
+});
+
+test("resume() after an explicit stop returns false -- caller must start() instead", async () => {
+  const mediaDevices = makeMediaDevices();
+  const video = makeVideo();
+  const scanner = new UnifiedJanScanner({
+    video, onCode() {},
+    cameraOptions: { mediaDevices, secureContext: true, storage: null },
+  });
+  await scanner.cameraAdapter.start("", { onStream: async () => {} });
+  scanner.stream = scanner.cameraAdapter.stream;
+  scanner.track = scanner.cameraAdapter.track;
+  scanner.stop("user_stop");
+
+  const resumed = await scanner.resume();
+
+  assert.equal(resumed, false);
+});
+
+test("a full scan-pause-resume cycle across several items calls getUserMedia exactly once", async () => {
+  // End-to-end version of the price_check.html flow this round adds: one
+  // start(), then N "decode a JAN -> pause -> resume" cycles, with the
+  // camera session itself never re-requested in between.
+  class FakeBarcodeDetector {
+    static async getSupportedFormats() { return ["ean_13", "ean_8", "upc_a", "upc_e"]; }
+    async detect() { return []; }
+  }
+  const originalBarcodeDetector = global.BarcodeDetector;
+  global.BarcodeDetector = FakeBarcodeDetector;
+  const mediaDevices = makeMediaDevices();
+  const video = makeVideo();
+  const scanner = new UnifiedJanScanner({
+    video, onCode() {},
+    cameraOptions: { mediaDevices, secureContext: true, storage: null },
+  });
+  try {
+    await scanner.start();
+    assert.equal(mediaDevices.calls.length, 1);
+    assert.ok(scanner.detector, "a BarcodeDetector-backed session should have a detector");
+
+    for (let item = 0; item < 5; item += 1) {
+      scanner.pauseAfterSuccess();
+      const resumed = await scanner.resume();
+      assert.equal(resumed, true, `resume #${item} should succeed on the same stream`);
+    }
+
+    assert.equal(mediaDevices.calls.length, 1, "still exactly one getUserMedia call after 5 scanned items");
+  } finally {
+    scanner.stop("test_cleanup");
+    global.BarcodeDetector = originalBarcodeDetector;
+  }
+});
