@@ -18,6 +18,7 @@ from app.price_providers import (
     RakutenPriceProvider,
     WebFallbackPriceProvider,
     YahooShoppingPriceProvider,
+    get_default_price_providers,
 )
 import app.price_service as price_service
 from app.price_service import _search_provider_coalesced, build_lookup_view, online_reference_price_from_offers, query_prices, update_store_price
@@ -1069,7 +1070,8 @@ def test_scan_and_result_pages_and_missing_config_do_not_500(client, monkeypatch
     assert result.status_code == 200
     assert "本地已有商品" in result.text and "当前按商品价格排序，未计入配送费。" in result.text
     assert test_client.get("/health").status_code == 200
-    assert db_session.scalar(select(func.count()).select_from(PriceProviderAttempt)) == 5
+    # One attempt per default provider (Yahoo/Rakuten/Amazon/Nishimatsuya/Anpanman/WebFallback/Manual).
+    assert db_session.scalar(select(func.count()).select_from(PriceProviderAttempt)) == len(get_default_price_providers())
 
 
 # ---------------- durability: repeated real scans over HTTP ----------------

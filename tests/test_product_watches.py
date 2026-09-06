@@ -179,6 +179,19 @@ def test_watch_list_and_product_detail_return_200(client):
     assert detail.status_code == 200 and "关注状态" in detail.text and "650" in detail.text
 
 
+def test_product_detail_shows_dash_not_none_for_missing_watch_target_price(client):
+    http, db, _ = client
+    product = make_product(db, "17")  # no purchase_price, no online price -> no valid target
+    config = add_watch(db, product.id)
+    assert config.effective_target_price is None
+
+    detail = http.get(f"/products/{product.id}")
+
+    assert detail.status_code == 200
+    assert ">None<" not in detail.text
+    assert "关注目标价" in detail.text
+
+
 def test_update_frequency_restock_and_pause(db_session):
     product = make_product(db_session, "12", purchase_price=900)
     add_watch(db_session, product.id)

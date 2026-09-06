@@ -26,7 +26,20 @@ from app.rakuten_ip_monitor import rakuten_ip_warning_message, rakuten_public_ip
 SUBSCRIPTION_PATTERN = re.compile(r"定期(?:購入|便)|サブスク|subscription", re.IGNORECASE)
 JAN_PATTERN = re.compile(r"(?<!\d)(\d{8}|\d{12,14})(?!\d)")
 YEN_PRICE_PATTERNS = (
-    re.compile(r"(?:税込価格|販売価格|通常価格|価格|税込み?|税抜)\D{0,24}(?:￥|¥)?\s*([1-9][0-9,]{1,8})\s*円?", re.IGNORECASE),
+    # "通常価格"/"参考価格"/"旧価格"/"定価" label the pre-discount reference
+    # price, not what a buyer actually pays -- deliberately not a trigger
+    # label here (see the exclusion context below too), so a page showing
+    # both a struck-through original price and a sale price doesn't return
+    # the original one just because it happens to appear first in the text.
+    # The bare "価格" alternative would otherwise also match as a substring of
+    # "通常価格"/"参考価格"/"旧価格" (no word boundary between them in
+    # Japanese), so those three are excluded via lookbehind right here rather
+    # than relying only on the surrounding-context check below.
+    re.compile(
+        r"(?:セール価格|特価|会員価格|税込価格|販売価格|(?<!通常)(?<!参考)(?<!旧)価格|税込み?|税抜)"
+        r"\D{0,24}(?:￥|¥)?\s*([1-9][0-9,]{1,8})\s*円?",
+        re.IGNORECASE,
+    ),
     re.compile(r"(?:￥|¥)\s*([1-9][0-9,]{1,8})"),
     re.compile(r"([1-9][0-9,]{1,8})\s*円\s*(?:\(?(?:税込|税抜)\)?)", re.IGNORECASE),
 )
@@ -337,12 +350,21 @@ def _json_ld_image(product: dict[str, Any] | None) -> str | None:
 
 
 def _extract_price(text: str) -> int | None:
-    for pattern in YEN_PRICE_PATTERNS:
+    for index, pattern in enumerate(YEN_PRICE_PATTERNS):
         for match in pattern.finditer(text):
             start = max(0, match.start() - 18)
             end = min(len(text), match.end() + 18)
             context = text[start:end]
             if re.search(r"送料|送料無料|以上購入|手数料", context):
+                continue
+            # Pattern 0 already anchors on an explicit "current price" label
+            # (セール価格/税込価格/...) immediately before the number, and
+            # "通常価格"/"参考価格"/etc. were deliberately left out of that
+            # label list -- so only the label-less patterns (1/2, a bare ¥
+            # amount) need this extra check, otherwise a nearby, unrelated
+            # "通常価格 ¥2,500" a few characters before a genuine
+            # "セール価格 ¥1,980" would wrongly veto the correct match too.
+            if index != 0 and re.search(r"通常価格|参考価格|旧価格|定価", context):
                 continue
             value = match.group(1).replace(",", "")
             if value.isdigit():
@@ -1409,6 +1431,279 @@ class WebFallbackPriceProvider(PriceProvider):
         )
 
 
+NISHIMATSUYA_DOMAIN = "24028-net.jp"
+
+
+class NishimatsuyaPriceProvider(PriceProvider):
+    """西松屋 has no public API and its own site (24028-net.jp) could not be
+    reached at all while building this (CloudFront returns a country-level
+    403 for every path, including robots.txt, from this environment) --
+    confirmed a real access barrier, not something to route around. Per the
+    agreed fallback plan this reuses the same DuckDuckGo site-scoped search +
+    official-page-parsing machinery as WebFallbackPriceProvider (JSON-LD
+    first, then the shared price regex), just scoped to this one domain via
+    the search query and result-link filtering, and reported under its own
+    provider code so results are still attributed to 西松屋 specifically.
+    """
+
+    code = "nishimatsuya"
+    display_name = "西松屋"
+    base_url = "https://www.24028-net.jp/"
+    user_agent = "JapanBuyingAgent/1.0"
+
+    def __init__(self, client: Any | None = None):
+        self.client = client
+
+    def search_link(self, jan: str) -> str:
+        return f"https://www.google.com/search?q={quote_plus(f'site:{NISHIMATSUYA_DOMAIN} {jan}')}"
+
+    def _get(self, url: str, timeout_seconds: float, **kwargs) -> httpx.Response:
+        headers = {"User-Agent": self.user_agent, **kwargs.pop("headers", {})}
+        if self.client is None:
+            with httpx.Client(timeout=timeout_seconds, follow_redirects=True) as client:
+                return client.get(url, headers=headers, **kwargs)
+        return self.client.get(url, timeout=timeout_seconds, follow_redirects=True, headers=headers, **kwargs)
+
+    def _search_links(self, jan: str, timeout_seconds: float) -> list[str]:
+        response = self._get(
+            "https://duckduckgo.com/html/",
+            timeout_seconds,
+            params={"q": f'site:{NISHIMATSUYA_DOMAIN} "{jan}"', "kl": "jp-jp"},
+        )
+        response.raise_for_status()
+        parser = _SearchResultParser(str(response.url))
+        parser.feed(response.text)
+        seen: set[str] = set()
+        links: list[str] = []
+        for url in parser.links:
+            clean = url.split("#", 1)[0]
+            if NISHIMATSUYA_DOMAIN not in _host(clean) or clean in seen:
+                continue
+            seen.add(clean)
+            links.append(clean)
+        return links[:3]
+
+    def _candidate_from_page(self, jan: str, url: str, timeout_seconds: float) -> PriceCandidate | None:
+        response = self._get(url, timeout_seconds)
+        if response.status_code >= 400:
+            return None
+        content_type = response.headers.get("content-type", "")
+        if content_type and "html" not in content_type.casefold():
+            return None
+        parser = _ProductPageParser()
+        parser.feed(response.text[:500_000])
+        json_products = _json_ld_products(parser)
+        json_product = _json_ld_product_for_jan(json_products, jan)
+        page_jans = JAN_PATTERN.findall(parser.text)
+        json_jans = JAN_PATTERN.findall(json.dumps(json_product or {}, ensure_ascii=False))
+        jan_verified = jan in set(page_jans + json_jans)
+        host = _host(str(response.url))
+        title = _official_page_title(parser, json_product, host)
+        if not title:
+            return None
+        image = _official_page_image(parser, json_product, host)
+        image_url = urljoin(str(response.url), image) if image else None
+        # JSON-LD Offer.price is schema.org's own definition of the current
+        # transactional price; only fall back to the shared regex (which
+        # cannot tell a struck-through original price from the real one as
+        # reliably) when a page has no structured data at all.
+        price = _json_ld_price(json_product)
+        if price is None:
+            price = _extract_price(parser.text)
+        if price is None:
+            return None
+        spec_text = extract_spec_text(parser.text)
+        return PriceCandidate(
+            title=title,
+            url=str(response.url),
+            image_url=image_url,
+            seller="西松屋",
+            item_price=price,
+            shipping_price=0,
+            shipping_known=False,
+            jan=jan if jan_verified else None,
+            stock_status="unknown",
+            condition="new",
+            listing_type="single",
+            link_type="product",
+            jan_verified=jan_verified,
+            match_type="EXACT_JAN" if jan_verified else "UNVERIFIED",
+            confidence=0.75 if jan_verified else 0.3,
+            fetched_at=datetime.now(timezone.utc),
+            raw_data=_official_page_raw_data(
+                jan, parser, json_product, host=host, source_url=str(response.url),
+                price=price, image_url=image_url, spec_text=spec_text,
+            ),
+        )
+
+    def search(self, jan: str, timeout_seconds: float) -> ProviderResponse:
+        if self.client is None and os.getenv("JBA_TESTING") == "1" and os.getenv("JBA_WEB_FALLBACK_ENABLED") is None:
+            return ProviderResponse(
+                "manual_only",
+                message="测试环境未注入西松屋查询client，跳过真实Web请求",
+                search_url=self.search_link(jan),
+                error_code="TESTING_DISABLED",
+            )
+        try:
+            links = self._search_links(jan, timeout_seconds)
+        except Exception as exc:
+            return ProviderResponse(
+                "error",
+                message=f"西松屋搜索失败：{type(exc).__name__}",
+                search_url=self.search_link(jan),
+                error_code="SEARCH_FAILED",
+            )
+        offers: list[PriceCandidate] = []
+        for url in links:
+            try:
+                candidate = self._candidate_from_page(jan, url, timeout_seconds)
+            except Exception:
+                candidate = None
+            if candidate is not None:
+                offers.append(candidate)
+        return ProviderResponse(
+            "success" if offers else "empty",
+            tuple(offers),
+            None if offers else "西松屋未找到JAN一致的可信商品页",
+            search_url=self.search_link(jan),
+            error_code=None if offers else "NOT_FOUND",
+        )
+
+
+class AnpanmanStorePriceProvider(PriceProvider):
+    """アンパンマン公式オンラインストア (store.anpanman.jp) is a standard
+    Shopify storefront. There is no separate developer API to authenticate
+    against, but Shopify's public storefront itself exposes two stable,
+    unauthenticated, documented-by-platform-convention surfaces every
+    Shopify store has: server-rendered search HTML at /search?q=...&type=product
+    (confirmed server-rendered -- no JS needed, robots.txt explicitly marks
+    product/search pages crawlable) and a public per-product JSON view at
+    /products/{handle}.json (confirmed live: returns title/vendor/variant
+    price/compare_at_price/barcode/images with no auth). Searching by JAN
+    text was confirmed to return the exact matching product; the JSON's
+    variant `barcode` field is then compared against the searched JAN for
+    verification, rather than trusting title similarity.
+    """
+
+    code = "anpanman_store"
+    display_name = "アンパンマン公式オンラインストア"
+    base_url = "https://store.anpanman.jp/"
+    user_agent = "JapanBuyingAgent/1.0"
+
+    def __init__(self, client: Any | None = None):
+        self.client = client
+
+    def search_link(self, jan: str) -> str:
+        return f"{self.base_url}search?q={quote_plus(jan)}&type=product"
+
+    def _get(self, url: str, timeout_seconds: float, **kwargs) -> httpx.Response:
+        headers = {"User-Agent": self.user_agent, **kwargs.pop("headers", {})}
+        if self.client is None:
+            with httpx.Client(timeout=timeout_seconds, follow_redirects=True) as client:
+                return client.get(url, headers=headers, **kwargs)
+        return self.client.get(url, timeout=timeout_seconds, follow_redirects=True, headers=headers, **kwargs)
+
+    def _search_handles(self, jan: str, timeout_seconds: float) -> list[str]:
+        response = self._get(f"{self.base_url}search", timeout_seconds, params={"q": jan, "type": "product"})
+        response.raise_for_status()
+        handles: list[str] = []
+        seen: set[str] = set()
+        for match in re.finditer(r'href="/products/([a-z0-9_-]+)(?:[?"])', response.text, re.IGNORECASE):
+            handle = match.group(1)
+            if handle not in seen:
+                seen.add(handle)
+                handles.append(handle)
+        return handles[:5]
+
+    def _product_offer(self, handle: str, jan: str, timeout_seconds: float) -> PriceCandidate | None:
+        response = self._get(f"{self.base_url}products/{handle}.json", timeout_seconds)
+        if response.status_code != 200:
+            return None
+        payload = (response.json() or {}).get("product") or {}
+        variants = payload.get("variants") or []
+        if not variants:
+            return None
+        # Prefer the variant whose own barcode matches the searched JAN --
+        # a multi-variant product (e.g. different colors) can have a
+        # different barcode per variant, so variants[0] is not always right.
+        variant = next(
+            (item for item in variants if str(item.get("barcode") or "").strip() == jan), variants[0],
+        )
+        title = str(payload.get("title") or "").strip()
+        if not title:
+            return None
+        price = _as_int(variant.get("price"))
+        if price <= 0:
+            return None
+        compare_at_raw = str(variant.get("compare_at_price") or "").strip()
+        compare_at_price = _as_int(compare_at_raw) if compare_at_raw else None
+        barcode = str(variant.get("barcode") or "").strip() or None
+        jan_verified = bool(barcode) and barcode == jan
+        images = payload.get("images") or []
+        image_url = str(images[0].get("src")) if images and isinstance(images[0], dict) else None
+        return PriceCandidate(
+            title=title,
+            url=f"{self.base_url}products/{handle}",
+            image_url=image_url,
+            seller=self.display_name,
+            item_price=price,
+            shipping_price=0,
+            shipping_known=False,
+            jan=barcode or (jan if jan_verified else None),
+            stock_status="unknown",
+            condition="new",
+            listing_type="single",
+            brand=str(payload.get("vendor") or "").strip() or None,
+            link_type="product",
+            jan_verified=jan_verified,
+            match_type="EXACT_JAN" if jan_verified else "UNVERIFIED",
+            confidence=1.0 if jan_verified else 0.4,
+            fetched_at=datetime.now(timezone.utc),
+            raw_data={
+                "handle": handle,
+                "shopName": self.display_name,
+                "seller": self.display_name,
+                "brand": payload.get("vendor"),
+                "productImageUrl": image_url,
+                "compare_at_price": compare_at_price,
+                "price": price,
+            },
+        )
+
+    def search(self, jan: str, timeout_seconds: float) -> ProviderResponse:
+        if self.client is None and os.getenv("JBA_TESTING") == "1" and os.getenv("JBA_WEB_FALLBACK_ENABLED") is None:
+            return ProviderResponse(
+                "manual_only",
+                message="测试环境未注入アンパンマン查询client，跳过真实Web请求",
+                search_url=self.search_link(jan),
+                error_code="TESTING_DISABLED",
+            )
+        try:
+            handles = self._search_handles(jan, timeout_seconds)
+        except Exception as exc:
+            return ProviderResponse(
+                "error",
+                message=f"アンパンマン公式ストア搜索失败：{type(exc).__name__}",
+                search_url=self.search_link(jan),
+                error_code="SEARCH_FAILED",
+            )
+        offers: list[PriceCandidate] = []
+        for handle in handles:
+            try:
+                candidate = self._product_offer(handle, jan, timeout_seconds)
+            except Exception:
+                candidate = None
+            if candidate is not None:
+                offers.append(candidate)
+        return ProviderResponse(
+            "success" if offers else "empty",
+            tuple(offers),
+            None if offers else "アンパンマン公式ストア未找到匹配商品",
+            search_url=self.search_link(jan),
+            error_code=None if offers else "NOT_FOUND",
+        )
+
+
 class ManualFallbackPriceProvider(PriceProvider):
     code = "manual"
     display_name = "Manual/Fallback"
@@ -1427,6 +1722,8 @@ def get_default_price_providers() -> list[PriceProvider]:
         YahooShoppingPriceProvider(),
         RakutenPriceProvider(),
         AmazonCreatorsPriceProvider(),
+        NishimatsuyaPriceProvider(),
+        AnpanmanStorePriceProvider(),
         WebFallbackPriceProvider(),
         ManualFallbackPriceProvider(),
     ]
