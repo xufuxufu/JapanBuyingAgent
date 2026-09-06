@@ -23,7 +23,7 @@
       <td>{% if view.is_recommended_primary %}<span class="badge">推荐主</span>{% else %}—{% endif %}</td>
       <td>{{ product.id }}</td>
       <td>{{ product.internal_sku }}</td>
-      <td>{{ product.display_name or product.name_cn or product.name_ja or '未命名商品' }}</td>
+      <td>{{ product_display_label(product) }}</td>
       <td>{{ product.qinsi_product_code or '—' }}</td>
       <td>{{ product.status }}</td>
       <td>{{ product.product_origin }} / {{ product.source }}</td>

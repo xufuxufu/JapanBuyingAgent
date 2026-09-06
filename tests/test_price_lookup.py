@@ -5,6 +5,7 @@ import time
 from dataclasses import dataclass
 
 import httpx
+import pytest
 from pydantic import ValidationError
 from sqlalchemy import func, select
 
@@ -130,6 +131,13 @@ def test_jan_validation_and_product_name_rules():
         else:
             raise AssertionError(f"invalid JAN accepted: {invalid}")
     assert format_product_display_name("中文", "日本語") == "中文|日本語"
+    # Neither side may fabricate a "中文名待补"/"日文名待补" placeholder --
+    # a missing name means the other name (or nothing) comes back, never a
+    # sentinel string leaking into UI/search text.
+    assert format_product_display_name(None, "日本語") == "日本語"
+    assert format_product_display_name("中文", None) == "中文"
+    assert format_product_display_name(None, None) is None
+    assert format_product_display_name("", "") is None
     try:
         normalize_product_name("名" * 129, "中文名")
     except ValueError as exc:
@@ -614,6 +622,55 @@ def test_provider_processing_failure_is_isolated_and_does_not_500(db_session, mo
     assert view.providers_partial_failed is True
     assert view.providers_all_failed is False
     assert view.online_min_price == 600
+
+
+def test_refresh_product_online_price_requires_jan(db_session):
+    from app.price_service import refresh_product_online_price
+
+    product = Product(jan=None, name_cn="无条码商品")
+    db_session.add(product)
+    db_session.commit()
+    with pytest.raises(ValueError, match="JAN"):
+        refresh_product_online_price(db_session, product)
+
+
+def test_refresh_product_online_price_reuses_query_prices(db_session, monkeypatch):
+    # Product-detail and watched-products re-query must go through the exact
+    # same provider pipeline as scanning -- not a separate hardcoded search.
+    import app.price_service as price_service_module
+    from app.price_service import refresh_product_online_price
+
+    product = Product(jan=VALID_JAN, name_cn="重新查价商品")
+    db_session.add(product)
+    db_session.commit()
+    fake = FakeProvider("rakuten", ProviderResponse("success", (offer(1234),)))
+    monkeypatch.setattr(price_service_module, "get_default_price_providers", lambda: [fake])
+
+    view = refresh_product_online_price(db_session, product)
+
+    assert fake.calls == 1
+    assert view.online_min_price == 1234
+    assert view.product.id == product.id
+
+
+def test_watched_products_refresh_price_route_calls_unified_service(client, monkeypatch):
+    import app.price_service as price_service_module
+    from app.watch_service import add_watch
+
+    http, db, _ = client
+    product = Product(jan=VALID_JAN, name_cn="关注商品重新查价", purchase_price=100)
+    db.add(product)
+    db.commit()
+    add_watch(db, product.id)
+    fake = FakeProvider("rakuten", ProviderResponse("success", (offer(3000),)))
+    monkeypatch.setattr(price_service_module, "get_default_price_providers", lambda: [fake])
+
+    response = http.post(f"/watched-products/{product.id}/refresh-price", follow_redirects=True)
+
+    assert response.status_code == 200
+    assert fake.calls == 1
+    saved = db.scalar(select(ProductOffer).where(ProductOffer.product_id == product.id))
+    assert saved is not None and saved.item_price == 3000
 
 
 def test_all_providers_failing_returns_view_with_retry_flag_not_500(db_session):

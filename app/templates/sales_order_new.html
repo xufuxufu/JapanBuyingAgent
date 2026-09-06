@@ -170,7 +170,7 @@
       {% for item in order.items %}
       {
         product_id: {{ item.product_id|tojson }},
-        display_name: {{ (item.product.display_name if item.product else item.product_name_snapshot)|tojson }},
+        display_name: {{ (product_display_label(item.product) if item.product else item.product_name_snapshot)|tojson }},
         manual_name: {{ (item.product_name_snapshot if not item.product_id else none)|tojson }},
         jan: {{ item.jan_snapshot|tojson }},
         quantity: {{ item.quantity }},

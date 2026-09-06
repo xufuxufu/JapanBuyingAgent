@@ -49,7 +49,7 @@
         {% for candidate in jan_candidates %}
         <article class="card">
           {% if candidate.preferred_image_url %}<img class="candidate-image" src="{{ candidate.preferred_image_url }}" alt="{{ candidate.display_name or candidate.internal_sku }}">{% endif %}
-          <h3>{{ candidate.display_name or candidate.name_cn or candidate.name_ja or candidate.internal_sku }}</h3>
+          <h3>{{ product_display_label(candidate) }}</h3>
           <p>{{ candidate.specification or candidate.model_spec or '规格未填写' }}</p>
           <p>秦丝货号：{{ candidate.qinsi_product_code or '—' }}</p>
           <form method="post" action="/field-purchase/items/{{ item.id }}/bind">

@@ -182,6 +182,18 @@ def add_watch(
         config.frequency_tier = frequency_tier
     if user_target_price not in (None, ""):
         config.user_target_price = _positive_int(user_target_price)
+    # Watching a product (via this direct path, not accept_recommendations)
+    # must resolve any pending recommendation for it -- otherwise the same
+    # product shows up twice on the watch list: once under its new config,
+    # and again under "系统推荐" still asking to be accepted/ignored.
+    for recommendation in session.scalars(
+        select(ProductWatchRecommendation).where(
+            ProductWatchRecommendation.product_id == product_id,
+            ProductWatchRecommendation.accepted.is_(False),
+            ProductWatchRecommendation.ignored.is_(False),
+        )
+    ):
+        recommendation.accepted = True
     refresh_recommended_target(session, config)
     session.commit()
     session.refresh(config)

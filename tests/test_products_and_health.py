@@ -436,6 +436,28 @@ def test_products_and_product_detail_pages_are_http_200(client):
         assert expected in detail.text
 
 
+def test_missing_chinese_name_never_shows_placeholder_on_product_pages(client):
+    http, db, _ = client
+    product = Product(jan="4901234500001", name_cn=None, name_ja="専用シャンプー", status="active")
+    db.add(product)
+    db.commit()
+    # A legacy row whose stored display_name column still carries the old
+    # baked-in placeholder (from before this fix) must not leak through --
+    # the display layer recomputes from name_cn/name_ja, not the stale column.
+    db.execute(
+        Product.__table__.update().where(Product.id == product.id).values(display_name="中文名待补|専用シャンプー"),
+    )
+    db.commit()
+
+    detail = http.get(f"/products/{product.id}")
+    listing = http.get("/watched-products")
+
+    assert detail.status_code == 200
+    assert "中文名待补" not in detail.text
+    assert "専用シャンプー" in detail.text
+    assert "中文名待补" not in listing.text
+
+
 def test_health_reports_database_unavailable():
     class BrokenSession:
         def execute(self, _statement):

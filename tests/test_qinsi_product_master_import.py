@@ -161,7 +161,9 @@ def test_qinsi_master_import_existing_jan_updates_without_duplicate_and_overwrit
     assert db_session.scalar(select(func.count()).select_from(Product)) == 1
     assert existing.name_cn == "秦丝名称覆盖"
     assert existing.name_ja is None
-    assert existing.display_name.startswith("秦丝名称覆盖|")
+    # No name_ja means display_name is just the Chinese name -- no "|日文名待补"
+    # placeholder tacked on for the missing side.
+    assert existing.display_name == "秦丝名称覆盖"
     assert "高质量中文名" not in existing.display_name
     assert existing.name_locked is False
     assert existing.product_data_confirmed is False

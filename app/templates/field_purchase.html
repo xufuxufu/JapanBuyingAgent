@@ -142,8 +142,8 @@
     <div id="fieldBatchItems" class="field-item-list">
       {% for item in (selected_batch.items if selected_batch else []) %}
       {% set item_image = item.product.preferred_image_url if item.product else '' %}
-      <div class="row field-batch-item" data-server-item="{{ item.id }}" data-jan="{{ item.jan or '' }}" data-product-id="{{ item.product.id if item.product else '' }}" data-product-name="{{ item.product.display_name if item.product else '' }}" data-image-url="{{ item_image or '' }}">
-        <span><strong>{{ item.product.display_name if item.product else (item.jan or ('草稿 #' ~ item.temporary_id[-6:])) }}</strong><small>{{ item.jan or ('草稿 #' ~ item.temporary_id[-6:]) }} · {{ item.status }}</small></span>
+      <div class="row field-batch-item" data-server-item="{{ item.id }}" data-jan="{{ item.jan or '' }}" data-product-id="{{ item.product.id if item.product else '' }}" data-product-name="{{ product_display_label(item.product) if item.product else '' }}" data-image-url="{{ item_image or '' }}">
+        <span><strong>{{ product_display_label(item.product) if item.product else (item.jan or ('草稿 #' ~ item.temporary_id[-6:])) }}</strong><small>{{ item.jan or ('草稿 #' ~ item.temporary_id[-6:]) }} · {{ item.status }}</small></span>
         <span class="badge">×{{ item.quantity }}</span>
       </div>
       {% else %}<p class="muted">尚未扫码。</p>{% endfor %}

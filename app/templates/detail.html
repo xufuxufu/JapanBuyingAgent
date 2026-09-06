@@ -65,7 +65,7 @@
         <td>{{ item.unit_price if item.unit_price is not none else '—' }}</td>
         <td>{{ item.discount_amount }}</td>
         <td>{{ item.line_total if item.line_total is not none else '—' }}</td>
-        <td>{% if item.product %}<a href="/products/{{ item.product.id }}">{{ item.product.display_name or item.product.name_cn or item.product.internal_sku }}</a>{% else %}<span class="muted">未匹配</span>{% endif %}</td>
+        <td>{% if item.product %}<a href="/products/{{ item.product.id }}">{{ product_display_label(item.product) }}</a>{% else %}<span class="muted">未匹配</span>{% endif %}</td>
         <td>{{ item.match_status }} / {{ item.review_status }}</td>
       </tr>
       {% endfor %}

@@ -52,7 +52,10 @@ from app.product_admin import (
     save_product_photo_for_completion,
     update_product_master,
 )
-from app.price_service import build_lookup_view, query_prices, recent_price_lookup_histories, update_store_price
+from app.price_service import (
+    build_lookup_view, query_prices, recent_price_lookup_histories, refresh_product_online_price_task,
+    update_store_price,
+)
 from app.product_enrichment import (
     accept_task, bind_task_to_existing, enrichment_summary_for_receipt, ensure_existing_product_enrichment_task, get_task,
     list_review_tasks, process_enrichment_task, process_price_lookup_enrichment, process_receipt_items_enrichment,
@@ -288,6 +291,7 @@ def _nav_unread_count() -> int:
 templates.env.globals["nav_unread_count"] = _nav_unread_count
 templates.env.globals["product_image_url"] = preferred_product_image_url
 templates.env.globals["product_display_image"] = product_display_image
+templates.env.globals["product_display_label"] = product_display_label
 templates.env.globals["qinsi_product_export_image_warning"] = qinsi_product_export_image_warning
 templates.env.globals["qinsi_product_export_rakuten_fallback_warning"] = qinsi_product_export_rakuten_fallback_warning
 
@@ -3101,7 +3105,7 @@ def _product_search_payload(
     inventory = (inventory_by_id or {}).get(product.id)
     return {
         "id": product.id,
-        "display_name": product.display_name or product.name_cn or product.name_ja or product.internal_sku,
+        "display_name": product_display_label(product),
         "jan": product.jan,
         "internal_sku": product.internal_sku,
         "qinsi_product_code": product.qinsi_product_code,
@@ -3179,7 +3183,7 @@ def _procurement_product_search_payload(
     sales_30d = sales_30d_by_id.get(product.id)
     return {
         "id": product.id,
-        "display_name": product.display_name or product.name_cn or product.name_ja or product.internal_sku,
+        "display_name": product_display_label(product),
         "jan": product.jan,
         "qinsi_product_code": product.qinsi_product_code,
         "image_url": preferred_product_image_url(product),
@@ -3225,7 +3229,7 @@ def _image_search_result_payload(
     inventory = inventory_by_id.get(product.id)
     return {
         "product_id": product.id,
-        "name": product.display_name or product.name_cn or product.name_ja or product.internal_sku,
+        "name": product_display_label(product),
         "jan": product.jan,
         "qinsi_product_code": product.qinsi_product_code,
         "image_url": preferred_product_image_url(product),
@@ -4959,6 +4963,21 @@ def watched_products_remove(
     return RedirectResponse(f"{_return_path(return_to)}?message={quote(message)}", status_code=303)
 
 
+@app.post("/watched-products/{product_id}/refresh-price")
+def watched_products_refresh_price(
+    product_id: int, background_tasks: BackgroundTasks, return_to: str = Form("/watched-products"),
+    db: Session = Depends(get_db),
+):
+    product = db.get(Product, product_id)
+    if product is None:
+        return RedirectResponse(f"{_return_path(return_to)}?error={quote('商品不存在')}", status_code=303)
+    if not (product.jan or "").strip():
+        return RedirectResponse(f"{_return_path(return_to)}?error={quote('商品缺少JAN，无法查询线上价格')}", status_code=303)
+    database_url = db.get_bind().url.render_as_string(hide_password=False)
+    background_tasks.add_task(refresh_product_online_price_task, database_url, product_id)
+    return RedirectResponse(f"{_return_path(return_to)}?message={quote('已提交线上查价，请稍后刷新查看结果')}", status_code=303)
+
+
 @app.post("/watched-products/{product_id}/update")
 def watched_products_update(
     product_id: int, user_target_price: str = Form(""), frequency_tier: str = Form("normal"),
@@ -5263,24 +5282,6 @@ def product_redownload_image(product_id: int, db: Session = Depends(get_db)):
         )
     return RedirectResponse(
         f"/products/{product_id}?message={quote(message)}",
-        status_code=303,
-    )
-
-
-@app.post("/products/{product_id}/restore-auto-image")
-def product_restore_auto_image(product_id: int, db: Session = Depends(get_db)):
-    product = db.get(Product, product_id)
-    if not product:
-        raise HTTPException(404, "商品不存在")
-    product.main_image_locked = False
-    product.main_image_path = None
-    product.main_image_hash = None
-    product.image_width = None
-    product.image_height = None
-    product.image_quality = None
-    db.commit()
-    return RedirectResponse(
-        f"/products/{product_id}?message={quote('已恢复自动图片优先级')}",
         status_code=303,
     )
 

@@ -12,6 +12,7 @@ from app.models import (
     QinsiInventorySnapshot, QinsiInventorySnapshotLine,
     QinsiPurchaseExportLine, QinsiPurchaseExportLineSource, Receipt, ReceiptImage, ReceiptItem, RestockList, Store,
 )
+from app.product_translation_service import product_display_label
 from app.qinsi_inventory import inventory_settings
 
 
@@ -479,7 +480,7 @@ def procurement_data(session: Session, period: DateRange, filters: dict[str, str
                   "store": store, "image": image, "unit_paid": unit_paid.quantize(Decimal("0.01"))}
         details.append(detail)
         for groups, key, label in (
-            (product_groups, product.id, product.display_name or product.name_cn or product.name_ja or product.internal_sku),
+            (product_groups, product.id, product_display_label(product)),
             (batch_groups, batch.id, f"{batch.batch_no} / {receipt.receipt_number or '无小票号'}"),
             (store_groups, str(store.id) if store else "none", store.display_name if store else (batch.store_name or receipt.raw_store_name or "未填写门店")),
             (operator_groups, batch.operator_name or "unrecorded", batch.operator_name or "未记录"),

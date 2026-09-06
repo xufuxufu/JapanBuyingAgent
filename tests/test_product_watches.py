@@ -14,7 +14,8 @@ from app.models import (
 )
 from app.watch_service import (
     accept_recommendations, add_watch, bulk_enable_watches, calculate_recommended_target,
-    generate_watch_recommendations, refresh_recommended_target, remove_watch, set_watch_enabled, update_watch,
+    generate_watch_recommendations, list_watch_groups, refresh_recommended_target, remove_watch,
+    set_watch_enabled, update_watch,
 )
 
 
@@ -214,6 +215,25 @@ def test_watch_ajax_success_duplicate_and_remove(client):
     assert duplicate.json() == {"ok": True, "message": "已关注"}
     assert removed.json() == {"ok": True, "message": "已取消关注"}
     assert repeated.json() == {"ok": True, "message": "当前未关注"}
+
+
+def test_manual_watch_resolves_pending_recommendation_no_duplicate_listing(db_session):
+    # Root cause of "点击关注没有正确加入关注商品列表": add_watch used to leave
+    # any pre-existing pending recommendation untouched, so the same product
+    # showed up twice -- once under its new watch, again under "系统推荐"
+    # still demanding accept/ignore -- which reads as "watching didn't work".
+    product = make_product(db_session, "16", purchase_price=300)
+    recommendation = ProductWatchRecommendation(product_id=product.id, reason="scan_count")
+    db_session.add(recommendation)
+    db_session.commit()
+
+    add_watch(db_session, product.id, source="manual")
+
+    db_session.refresh(recommendation)
+    assert recommendation.accepted is True
+    groups = list_watch_groups(db_session)
+    assert [row.product.id for row in groups["watched"]] == [product.id]
+    assert groups["recommended"] == []
 
 
 def test_watch_ajax_database_error_is_masked(client, monkeypatch):

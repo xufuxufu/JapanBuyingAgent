@@ -15,6 +15,7 @@ from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, selectinload
 
+from app.db import build_engine
 from app.local_product import resolve_local_product_by_jan
 from app.models import (
     Marketplace, PlatformLookupResult, PlatformProviderState, PriceLookupHistory, PriceProviderAttempt, PriceSearchRun,
@@ -554,6 +555,31 @@ def _trigger_enrichment_for_lookup(session: Session, jan: str, history_id: int) 
             process_enrichment_task(session, task)
     except Exception:
         session.rollback()
+
+
+def refresh_product_online_price(session: Session, product: Product) -> PriceLookupView:
+    """The single re-query entry point shared by the product-detail page and
+    the watched-products list -- both just want a fresh call into the same
+    provider pipeline scanning already uses, not a separate search path."""
+    jan = (product.jan or "").strip()
+    if not jan:
+        raise ValueError("商品缺少JAN，无法查询线上价格")
+    lookup = PriceLookupInput(jan=jan, current_store_price=None, force_refresh=True)
+    return query_prices(session, lookup, trigger_enrichment=False)
+
+
+def refresh_product_online_price_task(database_url: str, product_id: int) -> None:
+    engine = build_engine(database_url)
+    try:
+        with Session(engine) as session:
+            product = session.get(Product, product_id)
+            if product is None:
+                return
+            refresh_product_online_price(session, product)
+    except Exception:
+        logger.exception("product_online_price_refresh_failed product_id=%s", product_id)
+    finally:
+        engine.dispose()
 
 
 def query_prices(

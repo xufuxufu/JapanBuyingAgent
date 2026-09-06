@@ -58,7 +58,7 @@
     <td>{{ line.product_name_snapshot or '—' }}<br><small class="muted">货号：{{ line.qinsi_product_code or '—' }} · JAN：{{ line.jan_candidate or '—' }}</small></td>
     <td>{{ '已匹配' if line.match_status == 'matched' else ('冲突' if line.match_status == 'conflict' else '未匹配') }}</td>
     <td>{{ match_method_labels.get(line.matching_method, line.matching_method or '—') }}</td>
-    <td>{% if line.product %}<a href="/products/{{ line.product.id }}">{{ line.product.display_name or line.product.name_cn or line.product.name_ja or line.product.internal_sku }}</a><br><small class="muted">{{ line.product.internal_sku }} · id={{ line.product.id }}</small>{% else %}—{% endif %}</td>
+    <td>{% if line.product %}<a href="/products/{{ line.product.id }}">{{ product_display_label(line.product) }}</a><br><small class="muted">{{ line.product.internal_sku }} · id={{ line.product.id }}</small>{% else %}—{% endif %}</td>
     <td>{{ line.sales_quantity if line.sales_quantity is not none else '—' }}</td>
     <td>{{ line.sales_amount if line.sales_amount is not none else '—' }}</td>
     <td>{{ line.purchase_quantity if line.purchase_quantity is not none else '—' }}</td>

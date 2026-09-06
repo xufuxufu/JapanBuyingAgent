@@ -19,6 +19,7 @@ from app.config import clean_env_value, rakuten_http_referer
 from app.local_product import resolve_local_product_by_jan
 from app.product_image_localization import preferred_product_image_url
 from app.product_specs import extract_spec_text, parse_product_specs
+from app.product_translation_service import product_display_label
 from app.rakuten_ip_monitor import rakuten_ip_warning_message, rakuten_public_ip_status
 
 
@@ -1208,7 +1209,7 @@ class LocalQinsiPriceProvider(PriceProvider):
         resolution = resolve_local_product_by_jan(self.session, jan)
         if resolution.is_conflict:
             labels = "、".join(
-                product.display_name or product.name_cn or product.name_ja or product.internal_sku
+                product_display_label(product)
                 for product in resolution.candidate_products
             )
             return ProviderResponse(
@@ -1221,7 +1222,7 @@ class LocalQinsiPriceProvider(PriceProvider):
             return ProviderResponse("empty", message="本地商品和秦丝条码均未命中", error_code="NOT_FOUND")
         price = _as_int(product.purchase_price)
         candidate = PriceCandidate(
-            title=product.display_name or product.name_cn or product.name_ja or product.internal_sku,
+            title=product_display_label(product),
             url=f"/products/{product.id}",
             item_price=price,
             shipping_price=0,

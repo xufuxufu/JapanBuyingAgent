@@ -42,15 +42,28 @@ def normalize_product_name(value: str | None, label: str) -> str | None:
     return value
 
 
-def format_product_display_name(name_cn: str | None, name_ja: str | None) -> str:
-    cn = (normalize_product_name_whitespace(name_cn) or "中文名待补").replace(PRODUCT_NAME_SEPARATOR, "·")
-    ja = (normalize_product_name_whitespace(name_ja) or "日文名待补").replace(PRODUCT_NAME_SEPARATOR, "·")
-    raw = f"{cn}{PRODUCT_NAME_SEPARATOR}{ja}"
-    if len(raw) <= DISPLAY_NAME_MAX_LENGTH:
-        return raw
-    cn_budget = (DISPLAY_NAME_MAX_LENGTH - 1) // 2
-    ja_budget = DISPLAY_NAME_MAX_LENGTH - 1 - cn_budget
-    return f"{_truncate_preserving_tokens(cn, cn_budget)}{PRODUCT_NAME_SEPARATOR}{_truncate_preserving_tokens(ja, ja_budget)}"
+def format_product_display_name(name_cn: str | None, name_ja: str | None) -> str | None:
+    """Combine the Chinese/Japanese product names for display and storage.
+
+    Never fabricates a "中文名待补"/"日文名待补" placeholder for the side
+    that is missing -- callers get back whichever name actually exists, or
+    None if neither does, so a missing name never leaks into UI/search text.
+    """
+    cn = normalize_product_name_whitespace(name_cn)
+    cn = cn.replace(PRODUCT_NAME_SEPARATOR, "·") if cn else None
+    ja = normalize_product_name_whitespace(name_ja)
+    ja = ja.replace(PRODUCT_NAME_SEPARATOR, "·") if ja else None
+    if cn and ja:
+        raw = f"{cn}{PRODUCT_NAME_SEPARATOR}{ja}"
+        if len(raw) <= DISPLAY_NAME_MAX_LENGTH:
+            return raw
+        cn_budget = (DISPLAY_NAME_MAX_LENGTH - 1) // 2
+        ja_budget = DISPLAY_NAME_MAX_LENGTH - 1 - cn_budget
+        return f"{_truncate_preserving_tokens(cn, cn_budget)}{PRODUCT_NAME_SEPARATOR}{_truncate_preserving_tokens(ja, ja_budget)}"
+    single = cn or ja
+    if single is None:
+        return None
+    return _truncate_preserving_tokens(single, DISPLAY_NAME_MAX_LENGTH)
 
 
 def _truncate_preserving_tokens(value: str, limit: int) -> str:

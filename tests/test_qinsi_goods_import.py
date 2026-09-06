@@ -371,7 +371,9 @@ def test_formal_import_overwrites_qinsi_name_image_keeps_purchase_facts_and_uniq
 
     assert product.name_cn == "秦丝权威名"
     assert product.name_ja is None
-    assert product.display_name.startswith("秦丝权威名|")
+    # No name_ja means display_name is just the Chinese name -- no "|日文名待补"
+    # placeholder tacked on for the missing side.
+    assert product.display_name == "秦丝权威名"
     assert "本地人工名" not in product.display_name
     assert product.main_image_source_url == "https://images.qinsilk.com/authority.jpg"
     assert product.image_url == "https://images.qinsilk.com/authority.jpg"

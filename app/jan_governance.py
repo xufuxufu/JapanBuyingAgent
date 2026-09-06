@@ -17,6 +17,7 @@ from app.local_product import (
     resolve_local_product_by_jan,
 )
 from app.models import Product, ProductBarcode
+from app.product_translation_service import product_display_label
 
 
 @dataclass(frozen=True, slots=True)
@@ -39,7 +40,7 @@ class JanGovernanceReport:
 
 
 def _label(product: Product) -> str:
-    name = product.display_name or product.name_cn or product.name_ja or "未命名"
+    name = product_display_label(product)
     spec = product.specification or product.model_spec or "规格未填"
     return f"{product.internal_sku} · {name} · {spec}"
 
