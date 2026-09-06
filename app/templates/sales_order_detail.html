@@ -212,6 +212,7 @@
 </section>
 {% endif %}
 
+{% if item_editable or primary_next_action or 'cancelled' in allowed_transitions or order.status in ('completed', 'cancelled') %}
 <section class="card so-detail-card">
   <h2>操作</h2>
   <div class="button-row">
@@ -227,6 +228,7 @@
   </div>
   {% if not primary_next_action and order.status in ('completed', 'cancelled') %}<p class="muted">当前状态已是流转终点，无需继续操作。</p>{% endif %}
 </section>
+{% endif %}
 
 <div id="trackingScanOverlay" class="tracking-scan-overlay" hidden>
   <div class="tracking-scan-panel">

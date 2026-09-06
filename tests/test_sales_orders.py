@@ -239,6 +239,60 @@ def test_partially_shipped_status_uses_danger_pill_styling(client):
     assert 'state-partially_shipped">部分发货<' in detail.text
 
 
+def test_partially_shipped_detail_hides_empty_actions_card(client):
+    # partially_shipped has no primary_next_action, item editing is locked,
+    # and 'cancelled' is not in its ALLOWED_TRANSITIONS -- so there is
+    # genuinely nothing to show here. The whole "操作" card must not render
+    # (no fake buttons, no empty shell) rather than appearing blank.
+    http, db, _ = client
+    order = two_item_paid_order(db)
+    item_a, item_b, item_c = order.items
+    shipment = create_shipment(db, order.id, item_quantities=[(item_a.id, 1)])
+    add_shipping_label(db, shipment.id, content=shipping_label_jpeg_bytes(), original_filename="empty-actions.jpg")
+    mark_shipment_shipped(db, shipment.id)
+    reloaded = get_sales_order(db, order.id)
+    assert reloaded.status == "partially_shipped"
+
+    detail = http.get(f"/sales-orders/{order.id}")
+    assert detail.status_code == 200
+    assert "<h2>操作</h2>" not in detail.text
+
+
+def test_orders_with_available_actions_still_show_actions_card(client):
+    http, db, _ = client
+
+    submitted_order = simple_order(db, name_suffix="actions-submitted")
+    submitted_detail = http.get(f"/sales-orders/{submitted_order.id}")
+    assert "<h2>操作</h2>" in submitted_detail.text
+    assert "编辑订单" in submitted_detail.text
+    assert "标记已付款" in submitted_detail.text
+
+    paid_order = simple_order(db, name_suffix="actions-paid")
+    pay(db, paid_order)
+    paid_detail = http.get(f"/sales-orders/{paid_order.id}")
+    assert "<h2>操作</h2>" in paid_detail.text
+    assert "取消订单" in paid_detail.text
+
+    shipped_order = simple_order(db, name_suffix="actions-shipped")
+    shipped_order = ship_full(db, shipped_order)
+    shipped_detail = http.get(f"/sales-orders/{shipped_order.id}")
+    assert "<h2>操作</h2>" in shipped_detail.text
+    assert "标记已收货" in shipped_detail.text
+
+    completed_order = simple_order(db, name_suffix="actions-completed")
+    completed_order = ship_full(db, completed_order)
+    update_sales_order_status(db, completed_order.id, "completed")
+    completed_detail = http.get(f"/sales-orders/{completed_order.id}")
+    assert "<h2>操作</h2>" in completed_detail.text
+    assert "当前状态已是流转终点" in completed_detail.text
+
+    cancelled_order = simple_order(db, name_suffix="actions-cancelled")
+    cancel_sales_order(db, cancelled_order.id)
+    cancelled_detail = http.get(f"/sales-orders/{cancelled_order.id}")
+    assert "<h2>操作</h2>" in cancelled_detail.text
+    assert "当前状态已是流转终点" in cancelled_detail.text
+
+
 # ---------------- auto-complete from carrier tracking (delivered -> 已收货) ----------------
 
 
