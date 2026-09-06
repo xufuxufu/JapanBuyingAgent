@@ -46,11 +46,26 @@ def test_upload_progress_and_duplicate_submit_guard_are_present(client):
 
 
 def test_high_resolution_image_is_not_resized_by_default(tmp_path, monkeypatch):
+    # 2000x2600 (5.2MP) is deliberately smaller than a real phone photo (this
+    # app's own receipts run closer to 3000x4000) but still comfortably
+    # exceeds every internal working-copy size prepare_receipt_image touches
+    # (detect_receipt_bbox thumbnails to <=1200x1800, lightly_correct_
+    # perspective to <=1000x1600) and stays far below the 7000px oversize
+    # threshold this test is asserting against -- so it's still a real
+    # exercise of "large image, no resize" while using a fraction of the
+    # peak encode memory a full 3000x4000 (12MP) source needs during the
+    # final quality=95/subsampling=0/optimize=True JPEG save below. That
+    # save previously made this test flaky under full-suite memory pressure
+    # (a real, reproducible libjpeg "Insufficient memory (case 4)" encoder
+    # error -- not a decode bug and not a bug in prepare_receipt_image
+    # itself, which is unchanged here) whenever peak resident memory from
+    # earlier tests in the same run left too little headroom for a second
+    # 4:4:4/optimize pass over 36MB of raw pixel data.
     source, destination = tmp_path / "large.jpg", tmp_path / "out.jpg"
-    Image.new("RGB", (3000, 4000), "white").save(source, "JPEG", quality=90)
+    Image.new("RGB", (2000, 2600), "white").save(source, "JPEG", quality=90)
     monkeypatch.setattr("app.image_processing.detect_receipt_bbox", lambda _image: None)
     result = prepare_receipt_image(source, destination)
-    assert (result.width, result.height) == (3000, 4000)
+    assert (result.width, result.height) == (2000, 2600)
     assert "oversize_resize" not in result.method and "light_enhance" not in result.method
 
 
