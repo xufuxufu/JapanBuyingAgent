@@ -151,6 +151,7 @@ body{font-size:calc(1rem * var(--jba-font-scale))}
 .so-page-header{display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:nowrap;margin-top:14px}.so-page-header h1{margin:0;font-size:1.5rem;overflow-wrap:anywhere}
 .so-page-sub{margin:4px 0 12px;font-size:.92rem}
 .so-tabs{display:flex;flex-wrap:nowrap;gap:8px;overflow-x:auto;padding:4px 0 10px;margin-bottom:4px}.so-tab{display:inline-flex;align-items:center;gap:6px;flex:0 0 auto;padding:9px 14px;border-radius:99px;background:#fff;border:1px solid #e0e8e5;color:#17202a;text-decoration:none;font-weight:700;white-space:nowrap}.so-tab .badge{background:#f1f6f4}.so-tab.active{background:#0b5d4b;color:#fff;border-color:#0b5d4b}.so-tab.active .badge{background:#ffffff30;color:#fff}
+.so-tab-danger{background:#fdecec;color:#a3241f;border-color:#f2b8b5}.so-tab-danger .badge{background:#f8d7d5;color:#a3241f}.so-tab-danger.active{background:#c62828;color:#fff;border-color:#c62828}.so-tab-danger.active .badge{background:#ffffff30;color:#fff}
 .so-filter-card{padding:12px 14px}.so-filter{display:grid;gap:0}.so-filter-quick-row{display:flex;gap:8px}.so-filter-quick-row input{flex:1}
 .so-filter-date-group{display:grid;gap:0}
 .so-filter-more{margin-top:10px;border-top:1px solid #e5e8e9;padding-top:8px}.so-filter-more summary{cursor:pointer;font-weight:700;color:#0b5d4b;list-style:none}.so-filter-more summary::-webkit-details-marker{display:none}
@@ -216,7 +217,7 @@ body{font-size:calc(1rem * var(--jba-font-scale))}
 @media(max-width:800px){.pd-batch-bar{position:fixed;left:10px;right:10px;bottom:calc(76px + env(safe-area-inset-bottom));z-index:95}.pd-list,.pd-purchase-list{margin-bottom:96px}}
 
 /* -- wechat sales order refactor: paid/partially_shipped states, image zoom, shipments, multi-address -- */
-.state-paid{background:#e6f0ff;color:#174a84}.state-partially_shipped{background:#fdeccb;color:#7a4a00}
+.state-paid{background:#e6f0ff;color:#174a84}.state-partially_shipped{background:#fdecec;color:#a3241f;border:1px solid #f2b8b5;font-weight:800}
 .so-lock-notice{display:inline-block;margin:0 0 10px;padding:8px 12px;border-radius:8px}
 .zoomable{cursor:zoom-in}
 .image-zoom-overlay{position:fixed;inset:0;z-index:2000;background:rgba(10,15,13,.88);display:flex;align-items:center;justify-content:center;cursor:zoom-out;overflow:hidden}
@@ -244,6 +245,16 @@ body{font-size:calc(1rem * var(--jba-font-scale))}
 .shipment-label-preview{margin:8px 0}.shipment-label-preview-image{width:96px;height:96px;object-fit:contain;background:#fff;border-radius:8px}
 .logistics-fixup-delete-form{display:flex;align-items:center;justify-content:space-between;gap:.6rem;margin-top:6px}
 .shipment-tracking-form{margin:8px 0}
+.so-tracking-form{margin:0}
+.so-tracking-actions{display:flex;gap:8px;flex-wrap:wrap;margin-top:2px}.so-tracking-actions>*{flex:1 1 auto;min-width:0}
+.shipment-card>form,.shipment-card>.shipping-label-upload-form{margin:10px 0}.shipment-card>form:first-child{margin-top:0}
+.tracking-scan-overlay{position:fixed;inset:0;z-index:1500;background:#07110fef;display:grid;place-items:center;padding:16px}
+.tracking-scan-overlay[hidden]{display:none}
+.tracking-scan-panel{background:#fff;border-radius:16px;padding:16px;width:100%;max-width:420px;max-height:92vh;overflow-y:auto;display:grid;gap:10px}
+.tracking-scan-panel .scanner-stage{aspect-ratio:4/3}
+.tracking-scan-candidates{display:grid;gap:8px}
+.tracking-scan-candidate-list{display:grid;gap:8px}
+.tracking-scan-candidate{width:100%;justify-content:space-between;font-family:ui-monospace,Consolas,monospace;background:#e5f3ef;color:#075843}
 @media(max-width:800px){.search-result-item{grid-template-columns:44px minmax(0,1fr)}.search-result-thumb,.search-result-thumb-empty{width:44px;height:44px}.item-selected-card{grid-template-columns:44px minmax(0,1fr)}.item-selected-image{width:44px;height:44px}.shipment-item-row{grid-template-columns:auto minmax(0,1fr);grid-template-areas:"check info" "stepper stepper"}.shipment-item-row input[type="checkbox"]{grid-area:check}.shipment-item-info{grid-area:info}.shipment-item-stepper{grid-area:stepper;justify-content:flex-end}}
 
 /* -- customer list/detail + address management (Phase 7) -- */

@@ -9,10 +9,10 @@ from PIL import Image
 from sqlalchemy import select
 
 from app.kuaidi100_tracking_client import Kuaidi100ClientError
-from app.models import SalesShipment, ShipmentTrackingEvent
+from app.models import SalesOrder, SalesShipment, ShipmentTrackingEvent
 from app.sales_order_service import (
     SalesOrderItemInput, add_shipping_label, create_customer, create_sales_order, create_shipment,
-    ensure_default_salesperson, mark_shipment_shipped, update_sales_order_status,
+    ensure_default_salesperson, get_sales_order, mark_shipment_shipped, update_sales_order_status,
 )
 from app.shipment_tracking_service import (
     query_shipment_tracking, run_due_shipment_tracking_cycle, select_due_shipment_ids,
@@ -162,6 +162,53 @@ def test_delivered_response_sets_terminal_and_status(db_session):
     assert updated.tracking_error is None
     assert updated.tracking_next_check_at is None
     assert len(fake.calls) == 1
+
+
+# ---------------- delivered -> order auto-completed (已收货) ----------------
+
+
+def test_delivered_result_auto_completes_a_fully_shipped_single_shipment_order(db_session):
+    shipment = shipped_shipment(db_session)
+    order_id = shipment.sales_order_id
+    query_shipment_tracking(db_session, shipment.id, client=FakeHTTPClient(delivered_payload(shipment.tracking_no)))
+    order = db_session.get(SalesOrder, order_id)
+    assert order.status == "completed"
+
+
+def test_in_transit_result_never_auto_completes_the_order(db_session):
+    shipment = shipped_shipment(db_session)
+    order_id = shipment.sales_order_id
+    query_shipment_tracking(db_session, shipment.id, client=FakeHTTPClient(in_transit_payload(shipment.tracking_no)))
+    order = db_session.get(SalesOrder, order_id)
+    assert order.status == "shipped"
+
+
+def test_delivered_result_never_completes_a_still_partially_shipped_order(db_session):
+    """A split order: one shipment out of two delivered must NOT flip the
+    order to completed early -- see maybe_complete_order_from_tracking's own
+    direct unit tests in test_sales_orders.py for the full split/no-tracking
+    matrix; this confirms the wiring through query_shipment_tracking itself."""
+    salesperson = ensure_default_salesperson(db_session)
+    buyer = create_customer(db_session, name="拆分物流客户", phone="13800000009", wechat_name="wx_split_tk")
+    order = create_sales_order(
+        db_session, customer_id=buyer.id, salesperson_id=salesperson.id,
+        items=[SalesOrderItemInput(product_id=None, manual_name="拆分物流商品", jan=None, quantity=2, unit_sale_price=Decimal("50"))],
+        shipping_address="拆分物流地址", recipient_phone="13800000009",
+    )
+    update_sales_order_status(db_session, order.id, "paid")
+    order = get_sales_order(db_session, order.id)
+    item = order.items[0]
+    shipment = create_shipment(
+        db_session, order.id, item_quantities=[(item.id, 1)], carrier="中通", tracking_no="70000000000010",
+        recipient_phone="13800000009",
+    )
+    add_shipping_label(db_session, shipment.id, content=_label_bytes(), original_filename="split.jpg")
+    mark_shipment_shipped(db_session, shipment.id)
+    assert get_sales_order(db_session, order.id).status == "partially_shipped"
+
+    query_shipment_tracking(db_session, shipment.id, client=FakeHTTPClient(delivered_payload(shipment.tracking_no)))
+    reloaded = db_session.get(SalesOrder, order.id)
+    assert reloaded.status == "partially_shipped"
 
 
 def test_in_transit_response_is_not_terminal(db_session):

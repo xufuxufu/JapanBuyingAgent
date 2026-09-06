@@ -15,6 +15,7 @@ from app.models import (
 )
 from app.sales_order_service import (
     ORDER_NO_DAILY_SEQUENCE_MAX,
+    STATUS_LABELS,
     TOKYO,
     ADDRESS_EDITABLE_STATUSES, ALLOWED_TRANSITIONS, DEFAULT_SALESPERSON_NAME, ITEM_EDITABLE_STATUSES,
     ITEM_LOCKED_MESSAGE, SHIPPING_LABEL_DELETABLE_STATUSES, SHIPPING_LABEL_UPLOADABLE_STATUSES,
@@ -22,7 +23,8 @@ from app.sales_order_service import (
     create_customer, create_sales_order, create_shipment, delete_customer_address,
     ensure_default_salesperson, find_duplicate_customer_address, get_sales_order,
     get_shipping_label, last_sale_price_for_product, list_customer_addresses, list_sales_orders,
-    mark_shipment_shipped, remove_shipping_label, status_counts, update_customer_address, update_sales_order,
+    maybe_complete_order_from_tracking, mark_shipment_shipped, remove_shipping_label,
+    status_counts, update_customer_address, update_sales_order,
     update_sales_order_address, update_sales_order_status, update_shipment_tracking,
     suggest_order_no,
 )
@@ -181,6 +183,122 @@ def test_status_counts_reflect_current_orders(db_session):
     assert counts["submitted"] >= 1
     assert counts["paid"] >= 1
     assert counts["completed"] == counts.get("completed", 0)
+
+
+def test_paid_status_user_facing_label_is_awaiting_shipment(client):
+    # "paid" must read as 待发货 (what needs to happen next), never 已付款.
+    http, db, _ = client
+    order = simple_order(db, name_suffix="wording-paid")
+    pay(db, order)
+    detail = http.get(f"/sales-orders/{order.id}")
+    assert detail.status_code == 200
+    assert 'state-paid">待发货<' in detail.text
+    # A paid order's detail page has no "标记已付款" action left to show (that
+    # only exists for "submitted"), so "已付款" must not appear at all here.
+    assert "已付款" not in detail.text
+
+
+def test_completed_status_user_facing_label_is_received(client):
+    # "completed" must read as 已收货, never 已完成.
+    http, db, _ = client
+    order = simple_order(db, name_suffix="wording-completed")
+    order = ship_full(db, order)
+    update_sales_order_status(db, order.id, "completed")
+    detail = http.get(f"/sales-orders/{order.id}")
+    assert detail.status_code == 200
+    assert 'state-completed">已收货<' in detail.text
+    assert "已完成" not in detail.text
+
+
+def test_sales_orders_tabs_always_use_new_status_wording(client):
+    http, _db, _ = client
+    listing = http.get("/sales-orders")
+    assert "待发货" in listing.text
+    assert "已收货" in listing.text
+
+
+def test_item_locked_message_no_longer_says_paid(db_session):
+    assert "已付款" not in ITEM_LOCKED_MESSAGE
+    assert STATUS_LABELS["paid"] == "待发货"
+    assert STATUS_LABELS["completed"] == "已收货"
+
+
+def test_partially_shipped_status_uses_danger_pill_styling(client):
+    http, db, _ = client
+    order = two_item_paid_order(db)
+    item_a, item_b, item_c = order.items
+    shipment = create_shipment(db, order.id, item_quantities=[(item_a.id, 1)])
+    add_shipping_label(db, shipment.id, content=shipping_label_jpeg_bytes(), original_filename="danger.jpg")
+    mark_shipment_shipped(db, shipment.id)
+
+    listing = http.get("/sales-orders")
+    assert 'state-partially_shipped">部分发货<' in listing.text
+    assert "so-tab-danger" in listing.text
+
+    detail = http.get(f"/sales-orders/{order.id}")
+    assert 'state-partially_shipped">部分发货<' in detail.text
+
+
+# ---------------- auto-complete from carrier tracking (delivered -> 已收货) ----------------
+
+
+def test_maybe_complete_ignores_orders_that_are_not_fully_shipped(db_session):
+    order = simple_order(db_session, name_suffix="auto-complete-1")
+    assert maybe_complete_order_from_tracking(order) is False
+    assert order.status == "submitted"
+
+
+def test_maybe_complete_blocks_partially_shipped_order_even_if_its_one_shipment_is_terminal(db_session):
+    order = two_item_paid_order(db_session)
+    item_a, item_b, item_c = order.items
+    shipment = create_shipment(db_session, order.id, item_quantities=[(item_a.id, 3)], tracking_no="ZT-A1")
+    add_shipping_label(db_session, shipment.id, content=shipping_label_jpeg_bytes(), original_filename="s1.jpg")
+    mark_shipment_shipped(db_session, shipment.id)
+    reloaded = get_sales_order(db_session, order.id)
+    assert reloaded.status == "partially_shipped"
+    reloaded.shipments[0].tracking_terminal = True
+
+    assert maybe_complete_order_from_tracking(reloaded) is False
+    assert reloaded.status == "partially_shipped"
+
+
+def test_maybe_complete_blocks_when_any_fully_shipped_shipment_lacks_tracking_no(db_session):
+    order = two_item_paid_order(db_session)
+    item_a, item_b, item_c = order.items
+    s1 = create_shipment(db_session, order.id, item_quantities=[(item_a.id, 5), (item_c.id, 3)], tracking_no="ZT-A2")
+    add_shipping_label(db_session, s1.id, content=shipping_label_jpeg_bytes(), original_filename="s1.jpg")
+    mark_shipment_shipped(db_session, s1.id)
+    s2 = create_shipment(db_session, order.id, item_quantities=[(item_b.id, 1)])  # no tracking_no -- "can't tell"
+    add_shipping_label(db_session, s2.id, content=shipping_label_jpeg_bytes(), original_filename="s2.jpg")
+    mark_shipment_shipped(db_session, s2.id)
+    reloaded = get_sales_order(db_session, order.id)
+    assert reloaded.status == "shipped"
+    for shipment in reloaded.shipments:
+        shipment.tracking_terminal = True  # even pretending every shipment is terminal...
+
+    assert maybe_complete_order_from_tracking(reloaded) is False  # ...one lacking a tracking_no still blocks it
+    assert reloaded.status == "shipped"
+
+
+def test_maybe_complete_succeeds_once_every_shipment_is_tracked_and_terminal(db_session):
+    order = two_item_paid_order(db_session)
+    item_a, item_b, item_c = order.items
+    s1 = create_shipment(db_session, order.id, item_quantities=[(item_a.id, 5), (item_c.id, 3)], tracking_no="ZT-A3")
+    add_shipping_label(db_session, s1.id, content=shipping_label_jpeg_bytes(), original_filename="s1.jpg")
+    mark_shipment_shipped(db_session, s1.id)
+    s2 = create_shipment(db_session, order.id, item_quantities=[(item_b.id, 1)], tracking_no="ZT-B3")
+    add_shipping_label(db_session, s2.id, content=shipping_label_jpeg_bytes(), original_filename="s2.jpg")
+    mark_shipment_shipped(db_session, s2.id)
+    reloaded = get_sales_order(db_session, order.id)
+    assert reloaded.status == "shipped"
+    # Only ONE of the two shipments delivered yet -- must not complete.
+    reloaded.shipments[0].tracking_terminal = True
+    assert maybe_complete_order_from_tracking(reloaded) is False
+    assert reloaded.status == "shipped"
+
+    reloaded.shipments[1].tracking_terminal = True  # now both are terminal
+    assert maybe_complete_order_from_tracking(reloaded) is True
+    assert reloaded.status == "completed"
 
 
 def test_partially_shipped_and_shipped_status_and_backwards_transitions_never_human_settable(db_session):
@@ -1352,6 +1470,32 @@ def test_detail_page_shows_uploaded_shipping_label(client):
     detail = http.get(f"/sales-orders/{order.id}")
     assert detail.status_code == 200
     assert "shipping-label-thumb" in detail.text
+
+
+def test_detail_page_has_tracking_scan_dom_for_pending_shipment(client):
+    http, db, _ = client
+    order, shipment = paid_order_with_shipment(db, name_suffix="scan-dom-1")
+    detail = http.get(f"/sales-orders/{order.id}")
+    assert detail.status_code == 200
+    text = detail.text
+    assert 'id="trackingScanOverlay"' in text
+    assert 'id="trackingScanVideo"' in text
+    assert 'class="secondary compact tracking-scan-trigger"' in text
+    assert f'data-target="trackingNoInput-{shipment.id}"' in text
+    assert f'id="trackingNoInput-{shipment.id}"' in text
+    assert "/static/camera_adapter.js" in text
+    assert "/static/tracking_scan.js" in text
+
+
+def test_detail_page_has_tracking_scan_dom_for_shipped_shipment_fixup(client):
+    http, db, _ = client
+    order = simple_order(db, name_suffix="scan-dom-2")
+    order = ship_full(db, order, tracking_no="ZT-ORIGINAL")
+    shipment = order.shipments[0]
+    detail = http.get(f"/sales-orders/{order.id}")
+    assert detail.status_code == 200
+    assert f'data-target="trackingNoInputFix-{shipment.id}"' in detail.text
+    assert f'id="trackingNoInputFix-{shipment.id}"' in detail.text
 
 
 def test_workbench_shows_paid_order_awaiting_shipment(client):

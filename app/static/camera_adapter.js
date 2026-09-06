@@ -175,11 +175,14 @@
     };
   }
 
-  async function createBarcodeDetector() {
+  const DEFAULT_BARCODE_DETECTOR_FORMATS = Object.freeze(["ean_13", "ean_8", "upc_a", "upc_e"]);
+  const DEFAULT_ZXING_FORMAT_NAMES = Object.freeze(["EAN_13", "EAN_8", "UPC_A"]);
+
+  async function createBarcodeDetector(requestedFormats) {
     if (!global.BarcodeDetector) return null;
+    const wanted = (requestedFormats && requestedFormats.length) ? requestedFormats : DEFAULT_BARCODE_DETECTOR_FORMATS;
     const supported = await global.BarcodeDetector.getSupportedFormats();
-    const formats = ["ean_13", "ean_8", "upc_a", "upc_e"]
-      .filter((format) => supported.includes(format));
+    const formats = wanted.filter((format) => supported.includes(format));
     return formats.length ? new global.BarcodeDetector({formats}) : null;
   }
 
@@ -230,6 +233,11 @@
       // auto-exposure convergence, wasting decode attempts on a still-settling
       // frame. This short pause only applies to the ZXing fallback path.
       this.zxingSettleDelayMs = Number(options.zxingSettleDelayMs || 260);
+      // Both default to the JAN-only EAN/UPC formats above -- pass these to
+      // scan other 1D formats (e.g. shipping-label tracking-number barcodes,
+      // typically Code128/Code39) without touching JAN-scanning callers.
+      this.barcodeFormats = options.barcodeFormats || null;
+      this.zxingFormatNames = options.zxingFormatNames || null;
       this.cameraAdapter = options.cameraAdapter || new CameraAdapter(options.cameraOptions || {});
       this.detector = null;
       this.zxingReader = null;
@@ -375,7 +383,8 @@
         delayBetweenScanAttempts: this.scanIntervalMs,
         delayBetweenScanSuccess: this.sameCodeDebounceMs,
       });
-      this.zxingReader.possibleFormats = [formats.EAN_13, formats.EAN_8, formats.UPC_A];
+      const wantedNames = (this.zxingFormatNames && this.zxingFormatNames.length) ? this.zxingFormatNames : DEFAULT_ZXING_FORMAT_NAMES;
+      this.zxingReader.possibleFormats = wantedNames.map((name) => formats[name]).filter(Boolean);
       this.stats.zxingLoaded = true;
       this.stats.zxingReaderCreated = true;
       this.stats.roiMode = "full_frame";
@@ -450,7 +459,7 @@
       if (this.zoomIn) this.zoomIn.hidden = !zoomAvailable;
       this.stats.zxingLoaded = this.isZxingReady();
       try {
-        this.detector = await createBarcodeDetector();
+        this.detector = await createBarcodeDetector(this.barcodeFormats);
       } catch (error) {
         this.detector = null;
         state.warnings.push({stage: "BarcodeDetector", name: (error && error.name) || "Error"});
@@ -914,6 +923,8 @@
     ANDROID_MAIN_CAMERA_LABEL,
     CameraAdapter,
     UnifiedJanScanner,
+    DEFAULT_BARCODE_DETECTOR_FORMATS,
+    DEFAULT_ZXING_FORMAT_NAMES,
     DEFAULT_DEVICE_KEY,
     MINIMAL_CONSTRAINTS,
     START_TIMEOUT_MS,

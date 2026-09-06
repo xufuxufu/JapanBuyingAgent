@@ -25,12 +25,19 @@ TOKYO = timezone(timedelta(hours=9), "Asia/Tokyo")
 
 ORDER_STATUSES = {"submitted", "paid", "partially_shipped", "shipped", "completed", "cancelled"}
 
+# User-facing text only -- the underlying `status` column values (see
+# ORDER_STATUSES/ALLOWED_TRANSITIONS) are unchanged and still what routes,
+# templates and tests key off of. "paid"/"completed" are deliberately no
+# longer surfaced as "已付款"/"已完成" to users -- the wording now reflects
+# what needs to happen next ("待发货") or what already happened to the
+# customer's parcel ("已收货"), matching how staff actually think about the
+# workflow. Never re-introduce "已付款"/"已完成" in user-facing copy.
 STATUS_LABELS: dict[str, str] = {
     "submitted": "新订单",
-    "paid": "已付款",
+    "paid": "待发货",
     "partially_shipped": "部分发货",
     "shipped": "已发货",
-    "completed": "已完成",
+    "completed": "已收货",
     "cancelled": "已取消",
 }
 
@@ -53,13 +60,13 @@ ALLOWED_TRANSITIONS: dict[str, set[str]] = {
 # per status. Cancellation and other allowed transitions stay reachable but secondary.
 PRIMARY_NEXT_ACTION: dict[str, tuple[str, str]] = {
     "submitted": ("paid", "标记已付款"),
-    "shipped": ("completed", "标记完成"),
+    "shipped": ("completed", "标记已收货"),
 }
 
 # Items (product/quantity/price) and the customer can only change before payment;
 # paid+ orders lock them (see ITEM_LOCKED_MESSAGE / ensure_items_editable below).
 ITEM_EDITABLE_STATUSES = {"submitted"}
-ITEM_LOCKED_MESSAGE = "订单已付款，商品、数量和售价已锁定；发货前仍可修改收货地址。"
+ITEM_LOCKED_MESSAGE = "订单待发货，商品、数量和售价已锁定；发货前仍可修改收货地址。"
 
 # The order-level "current/default" address represents whatever hasn't shipped
 # yet; it stays editable until every item is fully shipped (or the order is
@@ -691,6 +698,34 @@ def _recompute_order_status_from_shipments(order: SalesOrder) -> None:
         order.status = "partially_shipped"
     else:
         order.status = "paid"
+
+
+def maybe_complete_order_from_tracking(order: SalesOrder) -> bool:
+    """Auto-transition shipped -> completed (已收货) once every shipment on a
+    FULLY shipped order has reached a terminal carrier-tracking state.
+
+    Deliberately conservative: a single shipment's delivery must never
+    complete a split/partially_shipped order early (order.status must
+    already be "shipped", i.e. every item's remaining_quantity is 0), and
+    ANY shipment lacking a tracking number is treated as "can't tell" and
+    blocks auto-completion outright -- it never guesses. In practice this
+    also means non-中通 shipments (never queried by
+    shipment_tracking_service, so tracking_terminal stays False forever)
+    never auto-complete an order; a human still marks those done manually
+    via PRIMARY_NEXT_ACTION.
+
+    Returns True if the order was just auto-completed, else False. Caller is
+    responsible for committing.
+    """
+    if order.status != "shipped":
+        return False
+    shipped_shipments = [s for s in order.shipments if s.status == "shipped"]
+    if not shipped_shipments:
+        return False
+    if all(s.tracking_terminal and (s.tracking_no or "").strip() for s in shipped_shipments):
+        order.status = "completed"
+        return True
+    return False
 
 
 def mark_shipment_shipped(

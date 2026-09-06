@@ -10,8 +10,12 @@ module changed to support that; it only needed a `limit` kwarg.
 
 Business dispatch status (SalesShipment.status: pending/shipped) and carrier
 tracking status (tracking_status/tracking_terminal) are intentionally kept
-separate -- a delivered/签收 tracking result never auto-completes the
-SalesOrder.
+separate. As of 2026-09-06, a delivered/签收 result CAN auto-complete the
+SalesOrder (status "shipped" -> "completed", user-facing 已收货) -- but only
+once the whole order is fully shipped AND every one of its shipments has its
+own terminal tracking result; see
+sales_order_service.maybe_complete_order_from_tracking() for the exact rule.
+A single shipment's delivery never completes a still-partially_shipped order.
 """
 
 from __future__ import annotations
@@ -29,6 +33,7 @@ from app.kuaidi100_tracking_client import (
     query_zhongtong_tracking,
 )
 from app.models import SalesOrder, SalesShipment, ShipmentTrackingEvent
+from app.sales_order_service import maybe_complete_order_from_tracking
 
 TRACKING_THROTTLE_SECONDS = 60
 DUE_POLL_INTERVAL = timedelta(hours=2)
@@ -126,6 +131,8 @@ def query_shipment_tracking(
         shipment.tracking_last_event_at = max(ev.event_time for ev in result.events)
 
     shipment.tracking_next_check_at = None if result.terminal else now + DUE_POLL_INTERVAL
+    if result.terminal:
+        maybe_complete_order_from_tracking(shipment.sales_order)
     session.commit()
     return shipment
 

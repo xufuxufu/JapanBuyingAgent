@@ -129,10 +129,13 @@
 
       {% if shipment.status == 'pending' %}
       <div class="form-grid shipment-tracking-form">
-        <form method="post" action="/sales-orders/{{ order.id }}/shipments/{{ shipment.id }}/tracking" class="full form-grid">
+        <form method="post" action="/sales-orders/{{ order.id }}/shipments/{{ shipment.id }}/tracking" class="full form-grid so-tracking-form">
           <label>物流公司<input name="carrier" value="{{ shipment.carrier or '' }}" maxlength="50"></label>
-          <label>运单号<input name="tracking_no" value="{{ shipment.tracking_no or '' }}" maxlength="100"></label>
-          <button type="submit" class="compact">保存物流信息</button>
+          <label>运单号<input name="tracking_no" id="trackingNoInput-{{ shipment.id }}" value="{{ shipment.tracking_no or '' }}" maxlength="100"></label>
+          <div class="full so-tracking-actions">
+            <button type="button" class="secondary compact tracking-scan-trigger" data-target="trackingNoInput-{{ shipment.id }}">拍照/扫码识别运单号</button>
+            <button type="submit" class="compact">保存物流信息</button>
+          </div>
         </form>
       </div>
       <div class="shipping-label-grid">
@@ -170,10 +173,13 @@
       <button type="button" class="secondary compact logistics-fixup-toggle">修改物流信息</button>
       <div class="logistics-fixup-block" hidden>
         <p class="muted">用于纠正录入错误：可修改物流公司/运单号、补传或替换面单图片。不会改变已发商品、数量或发货时间。</p>
-        <form method="post" action="/sales-orders/{{ order.id }}/shipments/{{ shipment.id }}/tracking" class="form-grid">
+        <form method="post" action="/sales-orders/{{ order.id }}/shipments/{{ shipment.id }}/tracking" class="form-grid so-tracking-form">
           <label>物流公司<input name="carrier" value="{{ shipment.carrier or '' }}" maxlength="50"></label>
-          <label>运单号<input name="tracking_no" value="{{ shipment.tracking_no or '' }}" maxlength="100"></label>
-          <button type="submit" class="compact">保存物流信息</button>
+          <label>运单号<input name="tracking_no" id="trackingNoInputFix-{{ shipment.id }}" value="{{ shipment.tracking_no or '' }}" maxlength="100"></label>
+          <div class="full so-tracking-actions">
+            <button type="button" class="secondary compact tracking-scan-trigger" data-target="trackingNoInputFix-{{ shipment.id }}">拍照/扫码识别运单号</button>
+            <button type="submit" class="compact">保存物流信息</button>
+          </div>
         </form>
         <form method="post" action="/sales-orders/{{ order.id }}/shipments/{{ shipment.id }}/shipping-labels" enctype="multipart/form-data" class="shipping-label-upload-form shipment-label-form">
           <label class="tag-photo-picker">拍照或从相册选择替换面单图片<input type="file" name="file" accept="image/*" class="shipment-label-input" hidden></label>
@@ -220,6 +226,27 @@
   </div>
   {% if not primary_next_action and order.status in ('completed', 'cancelled') %}<p class="muted">当前状态已是流转终点，无需继续操作。</p>{% endif %}
 </section>
+
+<div id="trackingScanOverlay" class="tracking-scan-overlay" hidden>
+  <div class="tracking-scan-panel">
+    <div class="scanner-stage" id="trackingScanStage">
+      <video id="trackingScanVideo" playsinline muted autoplay aria-label="运单号扫码相机"></video>
+      <div class="scanner-guide" aria-hidden="true"></div>
+      <p id="trackingScanPlaceholder">正在开启摄像头…</p>
+    </div>
+    <p id="trackingScanStatus" class="muted scanner-status" role="status">请将运单号条码对准取景框。</p>
+    <div id="trackingScanCandidates" class="tracking-scan-candidates" hidden>
+      <p class="muted">识别到多个可能的运单号，请选择：</p>
+      <div id="trackingScanCandidateList" class="tracking-scan-candidate-list"></div>
+    </div>
+    <div class="button-row">
+      <button type="button" id="trackingScanCancel" class="secondary compact">取消，手动输入</button>
+    </div>
+  </div>
 </div>
+</div>
+<script src="/static/camera_adapter.js"></script>
+<script src="/static/vendor/zxing/zxing-browser-0.2.0.min.js"></script>
+<script src="/static/tracking_scan.js"></script>
 <script src="/static/sales_order_detail.js" defer></script>
 {% endblock %}

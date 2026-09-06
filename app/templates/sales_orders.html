@@ -7,7 +7,7 @@
 <nav class="so-tabs" aria-label="订单状态">
   <a class="so-tab{% if not status %} active{% endif %}" href="/sales-orders">全部<span class="badge">{{ total_count }}</span></a>
   {% for value, label, count in tabs %}
-  <a class="so-tab{% if status == value %} active{% endif %}" href="/sales-orders?status={{ value }}">{{ label }}<span class="badge">{{ count }}</span></a>
+  <a class="so-tab{% if status == value %} active{% endif %}{% if value == 'partially_shipped' %} so-tab-danger{% endif %}" href="/sales-orders?status={{ value }}">{{ label }}<span class="badge">{{ count }}</span></a>
   {% endfor %}
 </nav>
 
