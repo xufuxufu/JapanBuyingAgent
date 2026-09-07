@@ -1013,6 +1013,44 @@ def test_qinsi_purchase_confirm_list_shows_product_images(client):
     assert "暂无图片" in response.text
 
 
+# ---------------- #13 regression: image fallback and long-filename layout ----------------
+
+
+def test_qinsi_purchase_confirm_list_falls_back_to_qinsi_image_url(client):
+    # A product synced from QinSi may only carry qinsi_image_url (no
+    # main_image_source_url/display_image_url/local file) -- the confirm table must
+    # still show it instead of falling through to "暂无图片".
+    http, db, _ = client
+    purchase, models, _ = make_purchase(db, [{
+        "name": "秦丝图片兜底商品", "jan": "4901234567894", "origin": "qinsi",
+    }], same_warehouse=True)
+    models[0].qinsi_image_url = "https://img.test/qinsi-master.jpg"
+    db.commit()
+    job = generate_purchase_batch_exports(db, purchase.id)[0]
+
+    response = http.get(f"/qinsi-exports/{job.id}")
+
+    assert response.status_code == 200
+    assert "https://img.test/qinsi-master.jpg" in response.text
+
+
+def test_qinsi_export_detail_long_filename_uses_ellipsis_and_title(client):
+    http, db, _ = client
+    purchase, _, _ = make_purchase(db, [{
+        "name": "长文件名商品", "jan": "4901234567894", "origin": "qinsi",
+    }], same_warehouse=True)
+    job = generate_purchase_batch_exports(db, purchase.id)[0]
+    long_name = "qinsi_RESTOCK_" + "x" * 80 + "_20260907_120000.xlsx"
+    job.filename = long_name
+    db.commit()
+
+    response = http.get(f"/qinsi-exports/{job.id}")
+
+    assert response.status_code == 200
+    assert f'title="{long_name}"' in response.text
+    assert 'class="ellipsis"' in response.text
+
+
 def test_receipt_source_link_opens_confirmed_review_at_item_anchor(client):
     http, db, _ = client
     purchase, _, _ = make_purchase(db, [{

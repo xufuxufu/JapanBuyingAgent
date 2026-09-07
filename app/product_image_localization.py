@@ -76,6 +76,9 @@ def _product_source_image_url(product: Product | None) -> tuple[str | None, str 
     legacy_source = (product.image_url or "").strip()
     if legacy_source:
         return legacy_source, "image_url"
+    qinsi_source = (product.qinsi_image_url or "").strip()
+    if qinsi_source:
+        return qinsi_source, "qinsi_image_url"
     return None, None
 
 
