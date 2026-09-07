@@ -286,6 +286,113 @@ def test_mismatched_marketplace_item_code_can_complete_existing_product_with_war
     assert db_session.scalar(select(func.count()).select_from(Product).where(Product.jan == VALID_JAN)) == 1
 
 
+# ---------------- #12 regression: provider isolation and JAN-exact trust ----------------
+
+
+@dataclass
+class ErrorProvider(PriceProvider):
+    code: str
+    message: str
+    error_code: str = "AUTH_FAILED"
+    display_name: str = "Error Provider"
+    base_url: str | None = "https://example.test"
+
+    def search(self, jan: str, timeout_seconds: float) -> ProviderResponse:
+        return ProviderResponse("error", message=self.message, error_code=self.error_code)
+
+
+def test_jan_exact_result_not_rejected_by_short_receipt_name(db_session, monkeypatch, tmp_path):
+    # A receipt's OCR name is often a truncated/abbreviated version of the real product
+    # title (e.g. "kinoka ハンドクリーム サン" on the receipt vs. the marketplace's full
+    # "kinoka ハンドクリーム 40g サンダルウッドの香り"). Nothing in the identity/candidate
+    # pipeline compares the online title against the receipt's own name -- JAN match is
+    # the only identity signal used -- so a short OCR name must never cause a JAN-exact
+    # online result to be dropped.
+    configure_deepseek(monkeypatch)
+    monkeypatch.setattr(enrichment, "PRODUCT_IMAGE_DIR", tmp_path / "products")
+    jan = "4987353270129"
+    batch = ReceiptBatch(batch_no=f"KINOKA-{id(db_session)}", status="review", image_status="ready", gpt_status="json_imported")
+    receipt = Receipt(batch=batch, raw_store_name="测试店", confirmation_status="pending", review_status="pending")
+    item = ReceiptItem(
+        receipt=receipt, line_no=1, raw_name="kinoka ハンドクリーム サン", jan_candidate=jan,
+        quantity=1, unit_price=800, discount_amount=0, line_total=800, confidence=0.9,
+        review_status="pending", match_status="unmatched",
+    )
+    db_session.add(batch)
+    db_session.commit()
+
+    task = ensure_receipt_item_tasks(db_session, [item], "gpt_receipt_json")[0]
+    process_enrichment_task(
+        db_session, task,
+        providers=[FakeProvider("yahoo", (offer(
+            "kinoka ハンドクリーム 40g サンダルウッドの香り", jan=jan,
+            url="https://shopping.yahoo.co.jp/item/kinoka-sandalwood",
+        ),))],
+        deepseek_client=DeepSeekClient("kinoka护手霜 40g 檀香味|kinoka ハンドクリーム 40g サンダルウッドの香り"),
+        image_client=ImageClient(),
+        force=True,
+    )
+
+    db_session.refresh(item)
+    product = db_session.scalar(select(Product).where(Product.jan == jan))
+    assert product is not None
+    assert product.status != "new_pending_completion"
+    assert product.name_ja == "kinoka ハンドクリーム 40g サンダルウッドの香り"
+    assert item.product_id == product.id
+
+
+def test_rakuten_failure_is_isolated_and_yahoo_fallback_still_completes_product(db_session, monkeypatch, tmp_path):
+    configure_deepseek(monkeypatch)
+    monkeypatch.setattr(enrichment, "PRODUCT_IMAGE_DIR", tmp_path / "products")
+    product = Product(jan=VALID_JAN, name_cn=None, name_ja="缺商品", status="new_pending_completion")
+    db_session.add(product)
+    db_session.commit()
+    task = ensure_existing_product_enrichment_task(db_session, product)
+
+    process_enrichment_task(
+        db_session, task,
+        providers=[
+            ErrorProvider("rakuten", "Rakuten unavailable: CLIENT_IP_NOT_ALLOWED"),
+            FakeProvider("yahoo_shopping", (offer("正式オンライン商品 10個"),)),
+        ],
+        deepseek_client=DeepSeekClient("正式中文商品10个|正式オンライン商品 10個"),
+        image_client=ImageClient(),
+        force=True,
+    )
+
+    db_session.refresh(product)
+    assert product.status != "new_pending_completion"
+    assert product.name_ja == "正式オンライン商品 10個"
+
+
+def test_enrich_by_jan_route_shows_sanitized_per_provider_diagnostics_on_total_failure(client, monkeypatch):
+    import app.price_service as price_service_module
+
+    http, db, _ = client
+    product = Product(jan=VALID_JAN, name_cn=None, name_ja="缺商品", status="new_pending_completion")
+    db.add(product)
+    db.commit()
+
+    providers = [
+        ErrorProvider("rakuten", "Rakuten unavailable: CLIENT_IP_NOT_ALLOWED"),
+        FakeProvider("yahoo_shopping", ()),
+    ]
+    monkeypatch.setattr(price_service_module, "get_default_price_providers", lambda: providers)
+
+    response = http.post(
+        f"/products/{product.id}/enrich-by-jan", data={"return_to": f"/products/{product.id}"}, follow_redirects=False,
+    )
+    assert response.status_code == 303
+    location = response.headers["location"]
+    assert "Rakuten" in location
+    assert "applicationId" not in location and "accessKey" not in location and "secret" not in location.casefold()
+
+    result = http.get(location)
+    assert "部分查询源当前不可用" in result.text
+    assert "Rakuten" in result.text and "CLIENT_IP_NOT_ALLOWED" in result.text
+    assert "applicationId" not in result.text and "accessKey" not in result.text
+
+
 def test_receipt_existing_missing_product_with_valid_jan_uses_online_completion(db_session, monkeypatch):
     configure_deepseek(monkeypatch)
     product = Product(
@@ -806,6 +913,111 @@ def test_manual_confirmed_product_is_never_overwritten(db_session):
     assert task.product_id == product.id and item.product_id == product.id
 
 
+# ---------------- #10 regression: receipt_enrichment_progress() states ----------------
+# The review page previously only said "product data is completing in the background"
+# with no indication of how many items were done, matched, or stuck. These states are
+# computed entirely from existing ProductEnrichmentTask/ReceiptItem/Product fields.
+
+
+def test_progress_is_completed_immediately_when_no_task_is_needed(db_session):
+    from app.product_enrichment import receipt_enrichment_progress
+
+    product = Product(
+        jan=VALID_JAN, name_cn="现有商品", name_ja="既存商品", brand="品牌", capacity="500ml",
+        main_image_source_url="https://img.test/a.jpg", purchase_price=1000, status="active",
+    )
+    db_session.add(product)
+    db_session.flush()
+    item = make_item(db_session, confirmed=True)
+    item.match_status, item.product_id = "matched_existing", product.id
+    db_session.commit()
+
+    progress = receipt_enrichment_progress(db_session, item.receipt_id)
+    assert progress == {
+        "status": "completed", "total": 1, "processed": 1, "matched": 1, "unmatched": 0,
+        "remaining": 0, "last_updated": None, "elapsed_seconds": None, "error_summary": None,
+    }
+
+
+def test_progress_is_completed_when_item_has_no_valid_jan(db_session):
+    from app.product_enrichment import receipt_enrichment_progress
+
+    item = make_item(db_session, jan=None, confirmed=True)
+    item.match_status = "needs_review"
+    db_session.commit()
+
+    progress = receipt_enrichment_progress(db_session, item.receipt_id)
+    assert progress["status"] == "completed"
+    assert progress["processed"] == 1 and progress["matched"] == 0 and progress["unmatched"] == 1
+
+
+def test_progress_is_pending_before_the_task_starts_then_running(db_session):
+    from app.product_enrichment import receipt_enrichment_progress
+
+    item = make_item(db_session, confirmed=True)
+    task = ensure_receipt_item_tasks(db_session, [item], "gpt_receipt_json")[0]
+    db_session.commit()
+
+    pending = receipt_enrichment_progress(db_session, item.receipt_id)
+    assert pending["status"] == "pending"
+    assert pending["total"] == 1 and pending["remaining"] == 1 and pending["processed"] == 0
+
+    task.status = "running"
+    db_session.commit()
+    running = receipt_enrichment_progress(db_session, item.receipt_id)
+    assert running["status"] == "running"
+    assert running["remaining"] == 1
+
+
+def test_progress_is_completed_with_elapsed_time_after_task_finishes(db_session):
+    from app.product_enrichment import receipt_enrichment_progress
+
+    item = make_item(db_session, confirmed=True)
+    task = ensure_receipt_item_tasks(db_session, [item], "gpt_receipt_json")[0]
+    task.created_at = datetime(2026, 1, 1, 12, 0, 0, tzinfo=timezone.utc)
+    task.status = "completed"
+    task.completed_at = datetime(2026, 1, 1, 12, 0, 38, tzinfo=timezone.utc)
+    # A completed task that produced a brand-new product still counts as "unmatched" --
+    # it genuinely had no prior match, which is not a failure.
+    item.match_status = "new_product"
+    db_session.commit()
+
+    progress = receipt_enrichment_progress(db_session, item.receipt_id)
+    assert progress["status"] == "completed"
+    assert progress["processed"] == 1 and progress["matched"] == 0 and progress["unmatched"] == 1
+    assert progress["remaining"] == 0
+    assert progress["elapsed_seconds"] == 38
+
+
+def test_progress_is_failed_with_sanitized_error_summary(db_session):
+    from app.product_enrichment import receipt_enrichment_progress
+
+    item = make_item(db_session, confirmed=True)
+    task = ensure_receipt_item_tasks(db_session, [item], "gpt_receipt_json")[0]
+    task.status = "failed"
+    task.last_error = "Rakuten unavailable: CLIENT_IP_NOT_ALLOWED"
+    db_session.commit()
+
+    progress = receipt_enrichment_progress(db_session, item.receipt_id)
+    assert progress["status"] == "failed"
+    assert progress["error_summary"] == "Rakuten unavailable: CLIENT_IP_NOT_ALLOWED"
+    assert progress["remaining"] == 0 and progress["processed"] == 1
+
+
+def test_progress_reports_no_task_needed_for_ignored_only_receipt(db_session):
+    from app.product_enrichment import receipt_enrichment_progress
+
+    item = make_item(db_session, confirmed=True)
+    item.review_status = "ignored"
+    db_session.commit()
+
+    progress = receipt_enrichment_progress(db_session, item.receipt_id)
+    assert progress == {
+        "status": "completed", "total": 0, "processed": 0, "matched": 0, "unmatched": 0,
+        "remaining": 0, "last_updated": None, "elapsed_seconds": None, "error_summary": None,
+    }
+
+
 def test_enrichment_list_detail_and_product_detail_return_200(client):
     http, db, _ = client
     item = make_item(db, jan=OTHER_JAN)
@@ -816,6 +1028,31 @@ def test_enrichment_list_detail_and_product_detail_return_200(client):
     assert http.get("/product-enrichment").status_code == 200
     assert http.get(f"/product-enrichment/{task.id}").status_code == 200
     assert http.get(f"/products/{product.id}").status_code == 200
+
+
+def test_review_page_shows_running_completed_and_failed_progress_banners(client):
+    http, db, _ = client
+    item = make_item(db, confirmed=True)
+    batch_id = item.receipt.batch.id
+    task = ensure_receipt_item_tasks(db, [item], "gpt_receipt_json")[0]
+    db.commit()
+
+    running = http.get(f"/receipts/{batch_id}/review?receipt_id={item.receipt_id}")
+    assert running.status_code == 200
+    assert "商品资料补全排队中" in running.text
+    assert "商品资料仍在补全中，当前审核结果可能继续变化。" in running.text
+
+    task.status, task.completed_at = "completed", datetime.now(timezone.utc)
+    db.commit()
+    completed = http.get(f"/receipts/{batch_id}/review?receipt_id={item.receipt_id}")
+    assert "商品资料补全完成" in completed.text
+
+    task.status, task.completed_at, task.last_error = "failed", None, "Rakuten unavailable: CLIENT_IP_NOT_ALLOWED"
+    db.commit()
+    failed = http.get(f"/receipts/{batch_id}/review?receipt_id={item.receipt_id}")
+    assert "商品资料补全异常" in failed.text
+    assert "Rakuten unavailable: CLIENT_IP_NOT_ALLOWED" in failed.text
+    assert "重新补全" in failed.text
 
 
 def test_products_page_does_not_display_missing_cn_placeholder_as_name(client):

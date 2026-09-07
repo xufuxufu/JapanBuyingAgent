@@ -2,7 +2,36 @@
 {% block title %}GPT 任务 {{ job.job_no }}{% endblock %}
 {% block content %}
 <div class="section-head"><div><h1>GPT 识别任务</h1><p class="muted">任务编号 {{ job.job_no }}</p></div><span class="badge">{{ status_text }}</span></div>
-{% if request.query_params.get('imported') == '1' %}<div class="success">导入成功，商品资料正在后台补全。</div>{% endif %}
+{% if request.query_params.get('imported') == '1' %}<div class="success">导入成功，商品资料正在后台补全，下方进度会自动更新。</div>{% endif %}
+<section class="card" id="job-enrichment-progress-card" data-job-id="{{ job.id }}" data-status="{{ enrichment_progress.status }}">
+  {% if enrichment_progress.total == 0 %}<p class="muted" id="job-enrichment-progress-headline">本任务暂无商品资料后台补全。</p>
+  {% else %}
+  <p><strong id="job-enrichment-progress-headline">{% if enrichment_progress.status == 'completed' %}商品资料补全完成{% elif enrichment_progress.status == 'failed' %}商品资料补全异常{% else %}商品资料补全中{% endif %}</strong>
+  <span id="job-enrichment-progress-detail" class="muted">已处理 {{ enrichment_progress.processed }} / {{ enrichment_progress.total }} · 已匹配 {{ enrichment_progress.matched }} · 未匹配 {{ enrichment_progress.unmatched }}{% if enrichment_progress.remaining %} · 剩余 {{ enrichment_progress.remaining }}{% endif %}{% if enrichment_progress.last_updated %} · 最近更新 {{ enrichment_progress.last_updated|tokyo_datetime(true) }}{% endif %}</span></p>
+  {% if enrichment_progress.status == 'failed' %}<p class="warning" id="job-enrichment-progress-error">错误摘要：{{ enrichment_progress.error_summary or '未知错误' }} · <a href="/product-enrichment">打开异常待办</a></p>{% endif %}
+  {% endif %}
+</section>
+{% if enrichment_progress.total and enrichment_progress.status != 'completed' %}
+<script>
+(function(){
+  var card=document.getElementById('job-enrichment-progress-card');
+  var url='/api/gpt-jobs/'+card.dataset.jobId+'/enrichment-progress';
+  var STATUS_TEXT={completed:'商品资料补全完成',failed:'商品资料补全异常',running:'商品资料补全中',pending:'商品资料补全中'};
+  function poll(){
+    fetch(url,{cache:'no-store',credentials:'same-origin'}).then(function(r){return r.json()}).then(function(data){
+      card.dataset.status=data.status;
+      document.getElementById('job-enrichment-progress-headline').textContent=STATUS_TEXT[data.status]||data.status;
+      var detail='已处理 '+data.processed+' / '+data.total+' · 已匹配 '+data.matched+' · 未匹配 '+data.unmatched;
+      if(data.remaining)detail+=' · 剩余 '+data.remaining;
+      if(data.last_updated)detail+=' · 最近更新 '+new Date(data.last_updated).toLocaleTimeString('zh-CN',{hour12:false});
+      document.getElementById('job-enrichment-progress-detail').textContent=detail;
+      if(data.status==='pending'||data.status==='running'){setTimeout(poll,2500)}else{location.reload()}
+    }).catch(function(){setTimeout(poll,4000)});
+  }
+  setTimeout(poll,2500);
+})();
+</script>
+{% endif %}
 <section class="card">
   <div class="summary-grid">
     <span>批次数<strong>{{ job.batch_count }}</strong></span><span>图片数<strong>{{ job.image_count }}</strong></span>

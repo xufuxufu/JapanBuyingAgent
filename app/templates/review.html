@@ -1,7 +1,44 @@
 {% extends "base.html" %}
 {% block title %}人工确认{% endblock %}
 {% block content %}
-<section class="card"><strong>新品资料：</strong>自动完成 {{ enrichment_summary.completed }} · 待确认 {{ enrichment_summary.review }} · 失败 {{ enrichment_summary.failed }}{% if enrichment_summary.review or enrichment_summary.failed %} · <a href="/product-enrichment">打开异常待办</a>{% endif %}</section>
+<section class="card" id="enrichment-progress-card" data-batch-id="{{ batch.id }}" data-receipt-id="{{ receipt.id }}" data-status="{{ enrichment_progress.status }}">
+  {% if enrichment_progress.total == 0 %}<p class="muted" id="enrichment-progress-headline">本小票无需商品资料后台补全。</p>
+  {% else %}
+  <p><strong id="enrichment-progress-headline">{% if enrichment_progress.status == 'completed' %}商品资料补全完成{% elif enrichment_progress.status == 'failed' %}商品资料补全异常{% elif enrichment_progress.status == 'running' %}商品资料补全中{% else %}商品资料补全排队中{% endif %}</strong>
+  <span id="enrichment-progress-detail" class="muted">已处理 {{ enrichment_progress.processed }} / {{ enrichment_progress.total }} · 已匹配 {{ enrichment_progress.matched }} · 未匹配 {{ enrichment_progress.unmatched }}{% if enrichment_progress.remaining %} · 剩余 {{ enrichment_progress.remaining }}{% endif %}{% if enrichment_progress.elapsed_seconds is not none %} · 耗时 {{ enrichment_progress.elapsed_seconds }} 秒{% endif %}{% if enrichment_progress.last_updated %} · 最近更新 {{ enrichment_progress.last_updated|tokyo_datetime(true) }}{% endif %}</span></p>
+  <p class="muted" id="enrichment-progress-note">{% if enrichment_progress.status in ['pending', 'running'] %}商品资料仍在补全中，当前审核结果可能继续变化。{% elif enrichment_progress.status == 'completed' %}商品资料补全完成。{% endif %}</p>
+  {% if enrichment_progress.status == 'failed' %}<div class="warning" id="enrichment-progress-error"><strong>商品资料补全异常</strong><p>错误摘要：{{ enrichment_progress.error_summary or '未知错误' }}</p><div class="button-row"><a class="button secondary compact" href="/product-enrichment">打开异常待办</a><form method="post" action="/receipts/{{ batch.id }}/review/retry-enrichment"><input type="hidden" name="receipt_id" value="{{ receipt.id }}"><button class="secondary" type="submit">重新补全</button></form></div></div>{% endif %}
+  {% endif %}
+</section>
+{% if enrichment_progress.total and enrichment_progress.status in ['pending', 'running'] %}
+<script>
+(function(){
+  var card=document.getElementById('enrichment-progress-card');
+  var url='/api/receipts/'+card.dataset.batchId+'/enrichment-progress?receipt_id='+card.dataset.receiptId;
+  var STATUS_TEXT={completed:'商品资料补全完成',failed:'商品资料补全异常',running:'商品资料补全中',pending:'商品资料补全排队中'};
+  function render(data){
+    card.dataset.status=data.status;
+    document.getElementById('enrichment-progress-headline').textContent=STATUS_TEXT[data.status]||data.status;
+    var detail='已处理 '+data.processed+' / '+data.total+' · 已匹配 '+data.matched+' · 未匹配 '+data.unmatched;
+    if(data.remaining)detail+=' · 剩余 '+data.remaining;
+    if(data.elapsed_seconds!==null&&data.elapsed_seconds!==undefined)detail+=' · 耗时 '+data.elapsed_seconds+' 秒';
+    if(data.last_updated)detail+=' · 最近更新 '+new Date(data.last_updated).toLocaleTimeString('zh-CN',{hour12:false});
+    document.getElementById('enrichment-progress-detail').textContent=detail;
+    var note=document.getElementById('enrichment-progress-note');
+    if(data.status==='completed'){note.textContent='商品资料补全完成，页面将自动刷新以显示最新匹配结果。';setTimeout(function(){location.reload()},1200)}
+    else if(data.status==='failed'){note.textContent='';location.reload()}
+    else{note.textContent='商品资料仍在补全中，当前审核结果可能继续变化。'}
+  }
+  function poll(){
+    fetch(url,{cache:'no-store',credentials:'same-origin'}).then(function(r){return r.json()}).then(function(data){
+      render(data);
+      if(data.status==='pending'||data.status==='running')setTimeout(poll,2500);
+    }).catch(function(){setTimeout(poll,4000)});
+  }
+  setTimeout(poll,2500);
+})();
+</script>
+{% endif %}
 {% set locked = receipt.confirmation_status == 'confirmed' %}
 <div class="section-head"><div><h1>人工确认</h1><p class="muted">{{ batch.batch_no }}</p></div><span class="badge">{{ receipt_status_cn.get(receipt.confirmation_status, '状态未知') }}</span></div>
 {% if request.query_params.get('message') %}<div class="success message">{{ request.query_params.get('message') }}</div>{% endif %}
@@ -38,7 +75,7 @@
   <label>识别置信度<input type="number" min="0" max="1" step="0.01" name="confidence" value="{{ item.confidence }}"></label><input type="hidden" name="review_status" value="{{ item.review_status }}">
   {% if jan_suggestion %}<p class="warning full">建议修正为 {{ jan_suggestion }}</p>{% endif %}
   <button class="full" type="submit">{{ '纠错保存此行' if locked else '保存此行' }}</button></form>
-  <div class="match-panel"><div><strong>匹配状态：{{ match_status_cn.get(item.match_status, '未匹配') }}</strong><p class="muted">原始名称：{{ item.raw_name }} · JAN：{{ item.jan_candidate or '无' }}</p></div>
+  <div class="match-panel"><div><strong>匹配状态：{{ match_status_cn.get(item.match_status, '未匹配') }}</strong>{% if item.match_status in ['matched_existing', 'conflict'] %}<p class="muted">匹配依据：{{ match_reason_cn.get(item.match_method, '人工确认') }}</p>{% endif %}<p class="muted">原始名称：{{ item.raw_name }} · JAN：{{ item.jan_candidate or '无' }}</p></div>
   {% if matched_product %}<div><strong>{{ product_display_label(matched_product) }}</strong><p class="muted">内部SKU：{{ matched_product.internal_sku }} · 秦丝商品编码：{{ matched_product.qinsi_product_code or '无' }}</p><a class="button secondary compact" href="/products/{{ matched_product.id }}">查看商品</a></div>
   {% elif item.product_id %}<div class="warning"><strong>原关联商品已删除或合并</strong><p>商品 ID {{ item.product_id }} 不存在；小票原始事实仍保留。</p></div>
   {% elif item.match_status == 'new_product' %}<div class="warning"><strong>新商品</strong><p>待补商品资料</p></div>

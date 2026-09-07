@@ -1775,3 +1775,109 @@ def enrichment_summary_for_receipt(session: Session, receipt_id: int) -> dict[st
         "review": counts.get("needs_review", 0) + counts.get("pending", 0) + counts.get("running", 0),
         "failed": counts.get("failed", 0),
     }
+
+
+ENRICHMENT_ACTIVE_TASK_STATUSES = {"pending", "running"}
+
+
+def receipt_enrichment_progress(session: Session, receipt_id: int) -> dict[str, object]:
+    """Compute product-data-completion progress for one receipt's (non-ignored) items,
+    entirely from existing ProductEnrichmentTask/ReceiptItem/Product state -- no new column
+    or migration needed. Definitions (see the #10 fix notes for the full reasoning):
+
+    - An item is "processed" once it either never needed a background completion task at
+      all (already matched to a product that doesn't need JAN completion, or has no valid
+      JAN to look up) or its task has reached a terminal status (completed/failed/etc).
+    - "remaining" is items whose task is still pending/running, or that have a valid JAN
+      needing a task the background trigger has not created yet (queued, not started).
+    - "matched"/"unmatched" split processed items by whether they ended up bound to an
+      existing product (matched_existing) -- a successfully-completed *new* product still
+      counts as "unmatched" here, since it genuinely had no prior match.
+    - overall status is "failed" if any task tied to this receipt actually failed (a real,
+      persisted signal); otherwise "running"/"pending"/"completed" from the remaining count.
+    """
+    items = list(session.scalars(
+        select(ReceiptItem).where(ReceiptItem.receipt_id == receipt_id, ReceiptItem.review_status != "ignored")
+    ))
+    total = len(items)
+    if total == 0:
+        return {
+            "status": "completed", "total": 0, "processed": 0, "matched": 0, "unmatched": 0,
+            "remaining": 0, "last_updated": None, "elapsed_seconds": None, "error_summary": None,
+        }
+
+    item_ids = [item.id for item in items]
+    sources = list(session.scalars(
+        select(ProductEnrichmentSource).where(
+            ProductEnrichmentSource.source_type == "receipt_item",
+            ProductEnrichmentSource.source_id.in_(item_ids),
+        )
+    ))
+    task_ids = {source.task_id for source in sources}
+    tasks_by_id = {
+        task.id: task for task in session.scalars(select(ProductEnrichmentTask).where(ProductEnrichmentTask.id.in_(task_ids)))
+    } if task_ids else {}
+    task_by_item_id = {source.source_id: tasks_by_id[source.task_id] for source in sources if source.task_id in tasks_by_id}
+
+    product_ids = {item.product_id for item in items if item.product_id is not None}
+    products_by_id = {
+        product.id: product for product in session.scalars(select(Product).where(Product.id.in_(product_ids)))
+    } if product_ids else {}
+
+    processed = matched = remaining = 0
+    touched_tasks: list[ProductEnrichmentTask] = []
+    for item in items:
+        task = task_by_item_id.get(item.id)
+        if task is not None:
+            touched_tasks.append(task)
+            if task.status in ENRICHMENT_ACTIVE_TASK_STATUSES:
+                remaining += 1
+                continue
+            processed += 1
+            if item.match_status == "matched_existing":
+                matched += 1
+            continue
+        jan = (item.jan_candidate or "").strip()
+        matched_product = products_by_id.get(item.product_id) if item.product_id else None
+        needs_task = bool(validate_jan(jan)) and (
+            product_needs_jan_completion(matched_product) if matched_product is not None
+            else item.match_status in {"new_product", "conflict"}
+        )
+        if needs_task:
+            remaining += 1
+        else:
+            processed += 1
+            if item.match_status == "matched_existing":
+                matched += 1
+    unmatched = processed - matched
+
+    failed_tasks = [task for task in touched_tasks if task.status == "failed"]
+    if failed_tasks:
+        status = "failed"
+    elif remaining == 0:
+        status = "completed"
+    elif any(task.status == "running" for task in touched_tasks):
+        status = "running"
+    else:
+        status = "pending"
+
+    updated_ats = [task.updated_at for task in touched_tasks if task.updated_at]
+    last_updated = max(updated_ats) if updated_ats else None
+
+    elapsed_seconds = None
+    if status == "completed" and touched_tasks:
+        started_candidates = [task.created_at for task in touched_tasks if task.created_at]
+        completed_candidates = [task.completed_at for task in touched_tasks if task.completed_at]
+        if started_candidates and completed_candidates:
+            elapsed_seconds = max(0, int((max(completed_candidates) - min(started_candidates)).total_seconds()))
+
+    error_summary = None
+    if failed_tasks:
+        reasons = sorted({(task.last_error or "").strip() for task in failed_tasks if (task.last_error or "").strip()})
+        error_summary = "；".join(reasons[:3]) if reasons else "补全失败，原因未知"
+
+    return {
+        "status": status, "total": total, "processed": processed, "matched": matched,
+        "unmatched": unmatched, "remaining": remaining,
+        "last_updated": last_updated, "elapsed_seconds": elapsed_seconds, "error_summary": error_summary,
+    }

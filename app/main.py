@@ -25,7 +25,7 @@ from sqlalchemy.orm import Session, selectinload
 
 from app.config import PREVIEW_DIR, PRODUCT_IMAGE_DIR, PROJECT_ROOT, QINSI_PRODUCT_IMAGE_DIR, TAG_EVIDENCE_DIR, default_role, ensure_data_directories, get_deepseek_config, is_testing
 from app.db import SessionLocal, engine, get_db
-from app.models import Customer, CustomerAddress, DurableBackgroundJob, DuplicateDetectionLog, EnrichmentAuditLog, FieldPurchaseItem, PlatformProviderState, ProcurementDemand, ProcurementDemandPlan, Product, ProductAlias, ProductEnrichmentCandidate, ProductOffer, ProductWatchConfig, ProductWatchSnapshot, PurchaseBatch, PurchaseBatchItem, QinsiExportJob, QinsiGoodsImportRow, QinsiImportBatch, QinsiPurchaseExportJob, Receipt, ReceiptBatch, ReceiptImage, ReceiptItem, RestockList, RestockListItem, SalesOrder, SalesOrderItem, SalesShipment, Salesperson, ShipmentTrackingEvent, Store, StoreBrand, TagEvidence, ZipPackageItem, ZipPackageJob
+from app.models import Customer, CustomerAddress, DurableBackgroundJob, DuplicateDetectionLog, EnrichmentAuditLog, FieldPurchaseItem, PlatformProviderState, PriceSearchRun, ProcurementDemand, ProcurementDemandPlan, Product, ProductAlias, ProductEnrichmentCandidate, ProductOffer, ProductWatchConfig, ProductWatchSnapshot, PurchaseBatch, PurchaseBatchItem, QinsiExportJob, QinsiGoodsImportRow, QinsiImportBatch, QinsiPurchaseExportJob, Receipt, ReceiptBatch, ReceiptImage, ReceiptItem, RestockList, RestockListItem, SalesOrder, SalesOrderItem, SalesShipment, Salesperson, ShipmentTrackingEvent, Store, StoreBrand, TagEvidence, ZipPackageItem, ZipPackageJob
 from app.analytics_service import analytics_dashboard, procurement_data, resolve_date_range
 from app.product_matching import (
     bind_product,
@@ -36,7 +36,9 @@ from app.product_matching import (
     match_item,
     match_receipt,
     normalize_alias,
+    preview_match_item,
     refresh_resolved_conflicts,
+    sync_pending_item_previews,
     validate_jan,
 )
 from app.product_merge import list_duplicate_jan_groups, merge_all_duplicate_jans, merge_duplicate_jan_group
@@ -59,7 +61,8 @@ from app.price_service import (
 from app.product_enrichment import (
     accept_task, bind_task_to_existing, enrichment_summary_for_receipt, ensure_existing_product_enrichment_task, get_task,
     list_review_tasks, process_enrichment_task, process_price_lookup_enrichment, process_receipt_items_enrichment,
-    refresh_existing_product_main_image, product_needs_jan_completion, safe_trigger_receipt_items, translate_candidate,
+    receipt_enrichment_progress, refresh_existing_product_main_image, product_needs_jan_completion,
+    safe_trigger_receipt_items, translate_candidate,
 )
 from app.field_purchase import (
     assign_field_item_jan, bind_field_item_to_product, bulk_edit_field_items, complete_field_batch, confirm_field_item,
@@ -219,6 +222,13 @@ GPT_JOB_STATUS_CN = {"zip_ready": "ZIP已就绪", "zip_downloaded": "ZIP已下�
 RECEIPT_STATUS_CN = {"pending": "待确认", "confirmed": "已确认", "reviewed": "已审核"}
 ITEM_STATUS_CN = {"pending": "待确认", "reviewed": "已复核", "confirmed": "已确认", "ignored": "已忽略"}
 MATCH_STATUS_CN = {"unmatched": "未匹配", "matched_existing": "已有商品", "new_product": "新商品", "needs_review": "待确认", "conflict": "冲突", "invalid_jan": "JAN无效"}
+MATCH_REASON_CN = {
+    "jan_exact": "JAN精确匹配",
+    "manual": "人工确认",
+    "manual_new": "人工确认",
+    "auto_enrichment": "系统自动匹配",
+    "jan_multiple": "JAN冲突，需要人工确认",
+}
 IMPORT_STATUS_CN = {
     "queued": "等待解析", "parsing": "解析中", "previewed": "待确认导入", "importing": "导入中",
     "completed": "导入完成", "completed_with_issues": "导入完成（有冲突或错误）",
@@ -240,6 +250,35 @@ PRICE_PROVIDER_STATUS_CN = {
     "success": "查询成功", "empty": "未找到结果", "timeout": "查询超时", "error": "查询失败",
     "unconfigured": "未配置", "manual_only": "仅手动核对",
 }
+PRICE_PROVIDER_DISPLAY_CN = {
+    "rakuten": "Rakuten", "yahoo_shopping": "Yahoo", "web_fallback": "Web Fallback",
+    "amazon_creators": "Amazon", "nishimatsuya": "西松屋", "anpanman_store": "阿童木公式店",
+    "local_qinsi": "本地/秦丝", "manual_fallback": "人工核对",
+}
+
+
+def _latest_provider_attempts_summary(db: Session, jan: str) -> str | None:
+    """Sanitized, per-provider status line for the most recent price/enrichment query of a
+    JAN -- e.g. "Rakuten：查询失败（当前网络未获Rakuten授权）；Yahoo：未找到结果". Only the
+    provider's own display message is surfaced (already written for display, never raw
+    exception text, credentials, or IP addresses) so a normal user can see WHICH sources
+    were unavailable instead of one generic "failed" message."""
+    run = db.scalar(
+        select(PriceSearchRun).where(PriceSearchRun.jan == jan)
+        .order_by(PriceSearchRun.started_at.desc(), PriceSearchRun.id.desc())
+        .options(selectinload(PriceSearchRun.provider_attempts))
+    )
+    if run is None or not run.provider_attempts:
+        return None
+    parts = []
+    for attempt in sorted(run.provider_attempts, key=lambda item: item.provider_code):
+        name = PRICE_PROVIDER_DISPLAY_CN.get(attempt.provider_code, attempt.provider_code)
+        status_label = PRICE_PROVIDER_STATUS_CN.get(attempt.status, attempt.status)
+        if attempt.status in {"error", "timeout"} and attempt.message:
+            parts.append(f"{name}：{status_label}（{attempt.message[:80]}）")
+        else:
+            parts.append(f"{name}：{status_label}")
+    return "；".join(parts)
 PRICE_COMPARISON_CN = {
     "store_cheaper": "店内更便宜", "online_cheaper": "线上更便宜", "same": "价格相同",
 }
@@ -1324,6 +1363,38 @@ def gpt_prompt():
     return PROMPT_PATH.read_text(encoding="utf-8")
 
 
+def gpt_job_enrichment_progress(db: Session, job: ZipPackageJob) -> dict[str, object]:
+    """Aggregate receipt_enrichment_progress() across every receipt in this GPT job's
+    batches, so the job detail page can show one overall running/completed/failed state
+    instead of making the user open each batch to check."""
+    total = processed = matched = unmatched = remaining = 0
+    last_updated = None
+    error_summaries: list[str] = []
+    any_failed = any_active = False
+    for batch in gpt_job_batches(db, job):
+        for receipt in batch.receipts:
+            progress = receipt_enrichment_progress(db, receipt.id)
+            total += progress["total"]
+            processed += progress["processed"]
+            matched += progress["matched"]
+            unmatched += progress["unmatched"]
+            remaining += progress["remaining"]
+            if progress["last_updated"] and (last_updated is None or progress["last_updated"] > last_updated):
+                last_updated = progress["last_updated"]
+            if progress["status"] == "failed":
+                any_failed = True
+                if progress["error_summary"]:
+                    error_summaries.append(progress["error_summary"])
+            elif progress["status"] in {"pending", "running"}:
+                any_active = True
+    status = "failed" if any_failed else ("running" if any_active else "completed")
+    return {
+        "status": status, "total": total, "processed": processed, "matched": matched,
+        "unmatched": unmatched, "remaining": remaining, "last_updated": last_updated,
+        "error_summary": "；".join(sorted(set(error_summaries))[:3]) if error_summaries else None,
+    }
+
+
 def _gpt_job_context(db: Session, job: ZipPackageJob, **extra) -> dict:
     included = [item for item in job.items if not item.excluded]
     context = {
@@ -1331,6 +1402,7 @@ def _gpt_job_context(db: Session, job: ZipPackageJob, **extra) -> dict:
         "status_text": GPT_JOB_STATUS_CN.get(job.gpt_status, job.gpt_status),
         "batch_rows": gpt_job_batch_rows(db, job),
         "source_files": [item.recognition_filename for item in included],
+        "enrichment_progress": gpt_job_enrichment_progress(db, job),
         "error": None,
         "error_summaries": [],
         "error_details": [],
@@ -1338,6 +1410,12 @@ def _gpt_job_context(db: Session, job: ZipPackageJob, **extra) -> dict:
     }
     context.update(extra)
     return context
+
+
+@app.get("/api/gpt-jobs/{job_id}/enrichment-progress")
+def api_gpt_job_enrichment_progress(job_id: int, db: Session = Depends(get_db)):
+    job = load_gpt_job(db, job_id)
+    return gpt_job_enrichment_progress(db, job)
 
 
 @app.get("/gpt-jobs", response_class=HTMLResponse)
@@ -1613,6 +1691,7 @@ def review_page(batch_id: int, request: Request, receipt_id: int | None = Query(
     batch = load_batch(db, batch_id)
     for candidate_receipt in batch.receipts:
         refresh_resolved_conflicts(db, candidate_receipt)
+        sync_pending_item_previews(db, candidate_receipt)
     receipt = current_receipt(batch, receipt_id)
     products = list(db.scalars(
         select(Product).where(Product.status == "active").order_by(Product.name_cn, Product.id).limit(500)
@@ -1692,9 +1771,18 @@ def review_page(batch_id: int, request: Request, receipt_id: int | None = Query(
         "jan_suggestions_by_item": jan_suggestions_by_item,
         "execution_candidates_by_item": execution_candidates_by_item, "confidence_labels": CONFIDENCE_LABELS,
         "receipt_status_cn": RECEIPT_STATUS_CN, "item_status_cn": ITEM_STATUS_CN, "match_status_cn": MATCH_STATUS_CN,
+        "match_reason_cn": MATCH_REASON_CN,
         "enrichment_summary": enrichment_summary_for_receipt(db, receipt.id),
+        "enrichment_progress": receipt_enrichment_progress(db, receipt.id),
         "product_display_label": product_display_label,
     })
+
+
+@app.get("/api/receipts/{batch_id}/enrichment-progress")
+def api_receipt_enrichment_progress(batch_id: int, receipt_id: int | None = Query(None), db: Session = Depends(get_db)):
+    batch = load_batch(db, batch_id)
+    receipt = current_receipt(batch, receipt_id)
+    return receipt_enrichment_progress(db, receipt.id)
 
 
 @app.post("/receipts/{batch_id}/review/receipt")
@@ -1765,6 +1853,7 @@ async def save_item(batch_id: int, item_id: int, request: Request, db: Session =
         safe_trigger_receipt_items(db, [item], "confirmed_item_correction")
         return RedirectResponse(_review_url(batch_id, receipt) + f"#receipt-item-{item.id}", status_code=303)
     apply_item_draft(item, data)
+    preview_match_item(db, item)
     db.commit()
     safe_trigger_receipt_items(db, [item], "manual_jan")
     return RedirectResponse(_review_url(batch_id, receipt), status_code=303)
@@ -1784,6 +1873,8 @@ async def add_item(batch_id: int, request: Request, receipt_id: int | None = For
     item = ReceiptItem(receipt=receipt, line_no=line_no, match_status="unmatched")
     apply_item_draft(item, data)
     db.add(item)
+    db.flush()
+    preview_match_item(db, item)
     db.commit()
     safe_trigger_receipt_items(db, [item], "manual_jan")
     return RedirectResponse(_review_url(batch_id, receipt), status_code=303)
@@ -1937,6 +2028,15 @@ def match_one_receipt(batch_id: int, receipt_id: int | None = Form(None), rematc
         db.commit()
     else:
         match_receipt(db, receipt, force=rematch)
+    return RedirectResponse(_review_url(batch_id, receipt), status_code=303)
+
+
+@app.post("/receipts/{batch_id}/review/retry-enrichment")
+def retry_receipt_enrichment(batch_id: int, receipt_id: int | None = Form(None), db: Session = Depends(get_db)):
+    batch = load_batch(db, batch_id)
+    receipt = current_receipt(batch, receipt_id)
+    items = [item for item in receipt.items if item.review_status != "ignored"]
+    safe_trigger_receipt_items(db, items, "manual_retry")
     return RedirectResponse(_review_url(batch_id, receipt), status_code=303)
 
 
@@ -2379,7 +2479,12 @@ def product_enrich_by_jan(
     process_enrichment_task(db, task, force=True)
     db.refresh(product)
     if product.status == "new_pending_completion":
-        return RedirectResponse(f"{target}{separator}error={quote('按JAN补全失败，已保留缺资料商品，可重试')}", status_code=303)
+        summary = _latest_provider_attempts_summary(db, product.jan) if product.jan else None
+        detail = (
+            f"部分查询源当前不可用，未能完整补全商品资料。{summary}" if summary
+            else "按JAN补全失败，已保留缺资料商品，可重试"
+        )
+        return RedirectResponse(f"{target}{separator}error={quote(detail)}", status_code=303)
     return RedirectResponse(f"{target}{separator}message={quote('已按JAN补全商品资料')}", status_code=303)
 
 
