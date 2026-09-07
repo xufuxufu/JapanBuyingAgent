@@ -1174,7 +1174,14 @@ class YahooShoppingPriceProvider(PriceProvider):
             shipping_code = (item.get("shipping") or {}).get("code")
             subscription = bool(SUBSCRIPTION_PATTERN.search(title))
             returned_jan = str(item.get("janCode") or "").strip() or None
-            jan_verified = returned_jan == jan
+            # The search itself already filtered by jan_code=jan server-side (see params
+            # above), so a hit is JAN-exact by construction. Yahoo's response frequently
+            # omits janCode on individual listings even for a jan_code-filtered search --
+            # requiring it to be present and matching wrongly downgraded genuine JAN
+            # matches to "unverified", which then get excluded from the trusted lowest-
+            # price calculation (see online_reference_price_from_offers). Only an
+            # explicit, different janCode is treated as a real mismatch.
+            jan_verified = returned_jan is None or returned_jan == jan
             brand_value = item.get("brand")
             brand = (
                 str(brand_value.get("name") or "").strip()
@@ -1197,7 +1204,7 @@ class YahooShoppingPriceProvider(PriceProvider):
                 item_price=_as_int(item.get("price")),
                 shipping_price=0,
                 shipping_known=shipping_code in {2, "2"},
-                jan=returned_jan,
+                jan=returned_jan or jan,
                 stock_status=stock_status,
                 condition=str(item.get("condition") or "new"),
                 listing_type="subscription" if subscription else "single",

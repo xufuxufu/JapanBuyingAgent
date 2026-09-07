@@ -729,6 +729,127 @@ def test_all_providers_failing_returns_view_with_retry_flag_not_500(db_session):
     assert view.result_offers == ()
 
 
+# ---------------- #14 regression: recall and "current results" wording ----------------
+# Real case: an external multi-platform search app found lower Yahoo-side prices than
+# JBA did, even accounting for Rakuten being IP-blocked. Yahoo's own response frequently
+# omits janCode per-listing even though the search itself already filtered by
+# jan_code=<jan> server-side -- the client-side jan_verified check wrongly treated that as
+# "unverified" and excluded genuinely matching, cheaper offers from the trusted lowest-
+# price calculation.
+
+
+def test_yahoo_offer_with_blank_jancode_is_still_jan_exact_and_trusted():
+    class BlankJanCodeClient:
+        def get(self, url, **kwargs):
+            return httpx.Response(200, json={"hits": [{
+                "name": "kinoka ハンドクリーム 40g サンダルウッドの香り", "url": "https://example.test/item",
+                "price": 1150, "inStock": True,
+                # janCode intentionally absent -- Yahoo's real-world behavior even for a
+                # jan_code-filtered search.
+            }]}, request=httpx.Request("GET", str(url)))
+
+    import os
+    os.environ["JBA_YAHOO_CLIENT_ID"] = "configured"
+    try:
+        response = YahooShoppingPriceProvider(client=BlankJanCodeClient()).search(VALID_JAN, 1)
+    finally:
+        del os.environ["JBA_YAHOO_CLIENT_ID"]
+
+    assert response.status == "success"
+    assert response.offers[0].jan == VALID_JAN
+    assert response.offers[0].jan_verified is True
+    assert response.offers[0].match_type == "EXACT_JAN"
+
+
+def test_yahoo_offer_with_conflicting_jancode_stays_unverified():
+    class ConflictingJanCodeClient:
+        def get(self, url, **kwargs):
+            return httpx.Response(200, json={"hits": [{
+                "name": "无关商品", "url": "https://example.test/other", "price": 500,
+                "inStock": True, "janCode": OTHER_JAN,
+            }]}, request=httpx.Request("GET", str(url)))
+
+    import os
+    os.environ["JBA_YAHOO_CLIENT_ID"] = "configured"
+    try:
+        response = YahooShoppingPriceProvider(client=ConflictingJanCodeClient()).search(VALID_JAN, 1)
+    finally:
+        del os.environ["JBA_YAHOO_CLIENT_ID"]
+
+    assert response.offers[0].jan == OTHER_JAN
+    assert response.offers[0].jan_verified is False
+
+
+def test_rakuten_ip_block_does_not_hide_cheaper_yahoo_offers(db_session):
+    # Mirrors the real report: Yahoo has candidates below what JBA previously surfaced as
+    # "lowest", Rakuten is unavailable (CLIENT_IP_NOT_ALLOWED). The cheapest Yahoo offer
+    # must still become the lowest price, and the failure must be visible.
+    yahoo_offers = tuple(
+        offer(price, jan=VALID_JAN, jan_verified=True)
+        for price in (1150, 1477, 1500, 1546, 2099)
+    )
+    providers = [
+        FakeProvider("rakuten", ProviderResponse(
+            "error", message="Rakuten unavailable: CLIENT_IP_NOT_ALLOWED", error_code="AUTH_FAILED",
+        )),
+        FakeProvider("yahoo_shopping", ProviderResponse("success", yahoo_offers)),
+    ]
+    view = query_prices(db_session, PriceLookupInput(jan=VALID_JAN), providers)
+
+    assert view.providers_partial_failed is True
+    assert view.providers_all_failed is False
+    assert view.online_min_price == 1150
+    assert len(view.trusted_offers) == 5
+
+
+def test_price_check_result_page_uses_qualified_wording_on_partial_failure(client, monkeypatch):
+    import app.price_service as price_service_module
+
+    test_client, _db_session, _ = client
+    yahoo_offers = tuple(
+        offer(price, jan=VALID_JAN, jan_verified=True)
+        for price in (1150, 1477, 1500, 1546, 2099)
+    )
+    providers = [
+        FakeProvider("rakuten", ProviderResponse("error", message="CLIENT_IP_NOT_ALLOWED", error_code="AUTH_FAILED")),
+        FakeProvider("yahoo_shopping", ProviderResponse("success", yahoo_offers)),
+    ]
+    monkeypatch.setattr(price_service_module, "get_default_price_providers", lambda: providers)
+
+    response = test_client.post(
+        "/price-check", data={"jan": VALID_JAN, "force_refresh": "true"}, follow_redirects=False,
+    )
+    result = test_client.get(response.headers["location"])
+    body = result.text
+
+    assert "当前已查结果最低" in body
+    assert "¥1,150" in body
+    assert "部分平台查询失败，结果可能不完整" in body
+    assert "网上最低" not in body
+
+
+def test_price_check_result_page_uses_plain_wording_when_all_providers_succeed(client, monkeypatch):
+    import app.price_service as price_service_module
+
+    test_client, _db_session, _ = client
+    providers = [
+        FakeProvider("rakuten", ProviderResponse("success", (offer(1800, jan=VALID_JAN, jan_verified=True),))),
+        FakeProvider("yahoo_shopping", ProviderResponse("success", (offer(1200, jan=VALID_JAN, jan_verified=True),))),
+    ]
+    monkeypatch.setattr(price_service_module, "get_default_price_providers", lambda: providers)
+
+    response = test_client.post(
+        "/price-check", data={"jan": VALID_JAN, "force_refresh": "true"}, follow_redirects=False,
+    )
+    result = test_client.get(response.headers["location"])
+    body = result.text
+
+    assert "网上最低" in body
+    assert "¥1,200" in body
+    assert "当前已查结果最低" not in body
+    assert "部分平台查询失败" not in body
+
+
 def test_marketplace_lookup_recovers_from_concurrent_insert_race(db_session, monkeypatch):
     provider = FakeProvider("race_provider", ProviderResponse("success", (offer(700),)))
     real_marketplace = price_service._marketplace

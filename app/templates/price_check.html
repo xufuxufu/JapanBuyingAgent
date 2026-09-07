@@ -65,7 +65,7 @@
           <span id="resultStorePriceFeedback" class="store-price-feedback"></span>
         </form>
         <div class="price-compare-online">
-          <small>网上最低</small>
+          <small id="resultOnlineMinLabel">网上最低</small>
           <strong id="resultOnlineMin">暂无可信结果</strong>
         </div>
       </div>
@@ -126,6 +126,7 @@
   const resultStorePriceInput = document.querySelector('#resultStorePriceInput');
   const resultStorePriceFeedback = document.querySelector('#resultStorePriceFeedback');
   const resultOnlineMin = document.querySelector('#resultOnlineMin');
+  const resultOnlineMinLabel = document.querySelector('#resultOnlineMinLabel');
   const resultDiff = document.querySelector('#resultDiff');
   const resultComparisonLabel = document.querySelector('#resultComparisonLabel');
   const resultOffersSection = document.querySelector('#resultOffersSection');
@@ -376,6 +377,7 @@
     resultPriceCompareSection.hidden = false;
     resultOffersSection.hidden = false;
     renderProviderBanner(data.provider_banner, data.providers_all_failed);
+    resultOnlineMinLabel.textContent = (data.providers_all_failed || data.providers_partial_failed) ? '当前已查结果最低' : '网上最低';
     resultStorePriceInput.value = data.current_store_price ?? '';
     resultStorePriceFeedback.textContent = '';
     resultStorePriceFeedback.className = 'store-price-feedback';
