@@ -4,7 +4,7 @@ import re
 from datetime import date, datetime, time, timedelta, timezone
 from difflib import SequenceMatcher
 
-from sqlalchemy import or_, select
+from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.models import Product, ProductAlias, ProductMatchLog, Receipt, ReceiptBatch, ReceiptItem
@@ -34,29 +34,21 @@ def _record(session: Session, item: ReceiptItem, old_product_id: int | None, met
 
 
 def candidate_products_for_jan(session: Session, jan: str | None) -> list[Product]:
-    cleaned = (jan or "").strip()
-    if not validate_jan(cleaned):
-        return []
-    rows = session.scalars(
-        select(Product)
-        .where(or_(Product.jan == cleaned, Product.qinsi_product_code == cleaned))
-        .order_by(Product.id)
-    )
-    products: list[Product] = []
-    seen: set[int] = set()
-    for product in rows:
-        if product.id not in seen:
-            products.append(product)
-            seen.add(product.id)
-    return products
+    """Resolve JAN identity candidates. Delegates to `app.local_product.resolve_local_product_by_jan`
+    -- the same JAN/barcode/alias resolution used by field purchase, price lookup, and procurement --
+    so receipt matching never diverges into a second set of identity rules. This deliberately does
+    NOT compare a receipt JAN candidate against `Product.qinsi_product_code`: QinSi 货号 is a
+    different identity space and never automatically means JAN (see BUSINESS_RULES.md)."""
+    from app.local_product import resolve_local_product_by_jan
+
+    return list(resolve_local_product_by_jan(session, jan).candidate_products)
 
 
-def match_item(session: Session, item: ReceiptItem, force: bool = False) -> ReceiptItem:
-    if item.review_status != "confirmed":
-        return item
-    if item.product_id and item.match_method in {"manual", "manual_new"} and not force:
-        return item
-    old_product_id = item.product_id
+def _compute_identity(session: Session, item: ReceiptItem) -> str:
+    """Pure identity resolution shared by every caller (import-time preview, manual save,
+    and confirmed-item matching): sets match_status/match_method/match_confidence/product_id
+    from item.jan_candidate. Callers decide gating (confirmed-only, force, etc.) and whether
+    to record a ProductMatchLog entry."""
     jan = (item.jan_candidate or "").strip()
     item.product_id = None
     item.match_confidence = None
@@ -85,9 +77,37 @@ def match_item(session: Session, item: ReceiptItem, force: bool = False) -> Rece
             item.match_status, item.match_method = "conflict", "jan_multiple"
             decision = "conflict"
     item.matched_at = datetime.now(timezone.utc)
+    return decision
+
+
+def match_item(session: Session, item: ReceiptItem, force: bool = False, require_confirmed: bool = True) -> ReceiptItem:
+    if require_confirmed and item.review_status != "confirmed":
+        return item
+    if item.product_id and item.match_method in {"manual", "manual_new"} and not force:
+        return item
+    old_product_id = item.product_id
+    decision = _compute_identity(session, item)
     session.flush()
     _record(session, item, old_product_id, item.match_method or "unknown", decision)
     return item
+
+
+def preview_match_item(session: Session, item: ReceiptItem) -> bool:
+    """Run the same identity matcher as `match_item`, but for a row that has not been
+    confirmed yet. This is what keeps the review page from showing a stale "未匹配" for a
+    JAN that already resolves to an existing product before the row has been saved or the
+    receipt confirmed -- the exact discrepancy between the automatic import stage and the
+    manual "保存此行" action. Skips ignored rows and rows already bound manually. Does not
+    write a ProductMatchLog entry: the row is still a draft, not a reviewed decision.
+    Returns True if the preview changed the item's match state."""
+    if item.review_status in {"confirmed", "ignored"}:
+        return False
+    if item.product_id and item.match_method in {"manual", "manual_new"}:
+        return False
+    before = (item.match_status, item.product_id, item.match_method)
+    _compute_identity(session, item)
+    session.flush()
+    return (item.match_status, item.product_id, item.match_method) != before
 
 
 def refresh_resolved_conflicts(session: Session, receipt: Receipt, commit: bool = True) -> int:
@@ -108,6 +128,20 @@ def refresh_resolved_conflicts(session: Session, receipt: Receipt, commit: bool 
         session.commit()
         from app.product_enrichment import safe_trigger_receipt_items
         safe_trigger_receipt_items(session, list(receipt.items), "receipt_conflict_refresh")
+    return changed
+
+
+def sync_pending_item_previews(session: Session, receipt: Receipt, commit: bool = True) -> int:
+    """Keep not-yet-confirmed rows' match previews in sync with the product catalog. Runs
+    on every review-page load (same pattern as `refresh_resolved_conflicts`) so a JAN that
+    now resolves to an existing product -- because it was just imported, a product was
+    created/imported after this row, or the row was edited -- shows correctly without
+    requiring the user to save or confirm first."""
+    changed = sum(preview_match_item(session, item) for item in receipt.items)
+    if changed:
+        _sync_batch_product_status(receipt.batch)
+    if changed and commit:
+        session.commit()
     return changed
 
 

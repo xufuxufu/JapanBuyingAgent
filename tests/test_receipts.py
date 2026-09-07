@@ -6,7 +6,7 @@ from pathlib import Path
 import pytest
 from sqlalchemy import func, select
 
-from app.models import AiRecognitionRun, Receipt, ReceiptBatch, ReceiptImage, ReceiptItem
+from app.models import AiRecognitionRun, Product, ProductBarcode, Receipt, ReceiptBatch, ReceiptImage, ReceiptItem
 
 
 def upload(client, content, name="receipt.jpg"):
@@ -258,3 +258,169 @@ def test_api_recognition_route_survives_enrichment_exception(client, jpeg_bytes,
     assert response.status_code == 200
     db.expire_all()
     assert db.scalar(select(func.count()).select_from(ReceiptItem)) == 3
+
+
+# ---------------- #11 regression: automatic import-time matching must agree with manual save ----------------
+# Previously, receipt-item identity matching only ran once review_status became "confirmed"
+# (at manual save or final confirm), so a freshly imported row whose JAN exactly matched an
+# existing, fully complete product still showed "unmatched" until the user saved the row.
+# preview_match_item()/sync_pending_item_previews() now run the same matcher immediately at
+# import time and on every review-page load, without requiring confirmation first.
+
+
+def test_existing_product_jan_is_matched_immediately_after_import_without_saving(client, jpeg_bytes):
+    import app.services as services
+
+    http, db, _ = client
+    jan = "4901008613369"
+    product = Product(
+        jan=jan, name_cn="现有商品", name_ja="既存商品", status="active",
+        main_image_path="local/existing.jpg", brand="品牌", capacity="100ml", purchase_price=500,
+    )
+    db.add(product)
+    db.commit()
+
+    batch_id = upload(http, jpeg_bytes).json()["id"]
+    batch = db.get(ReceiptBatch, batch_id)
+    payload = multi_item_payload([jan])
+    receipt = services.import_recognition_json(db, batch, json.dumps(payload, ensure_ascii=False))
+
+    db.refresh(receipt)
+    item = receipt.items[0]
+    assert item.review_status == "pending"
+    assert item.match_status == "matched_existing"
+    assert item.product_id == product.id
+    assert item.match_method == "jan_exact"
+
+
+def test_manual_save_agrees_with_automatic_import_preview_for_existing_jan(client, jpeg_bytes):
+    import app.services as services
+
+    http, db, _ = client
+    jan = "4901008613369"
+    product = Product(jan=jan, name_cn="现有商品", status="active")
+    db.add(product)
+    db.commit()
+
+    batch_id = upload(http, jpeg_bytes).json()["id"]
+    batch = db.get(ReceiptBatch, batch_id)
+    payload = multi_item_payload([jan])
+    receipt = services.import_recognition_json(db, batch, json.dumps(payload, ensure_ascii=False))
+    item = receipt.items[0]
+    assert item.match_status == "matched_existing"
+
+    response = http.post(
+        f"/receipts/{batch.id}/review/items/{item.id}",
+        data={
+            "raw_name": item.raw_name, "recognized_name": item.recognized_name or "",
+            "jan_candidate": jan, "quantity": item.quantity, "unit_price": item.unit_price,
+            "discount_amount": item.discount_amount, "tax_rate": item.tax_rate,
+            "line_total": item.line_total, "confidence": item.confidence,
+            "review_status": item.review_status,
+        },
+        follow_redirects=False,
+    )
+    assert response.status_code == 303
+    db.refresh(item)
+    assert item.match_status == "matched_existing"
+    assert item.product_id == product.id
+
+
+def test_import_preview_reports_new_product_and_conflict_without_confirming(client, jpeg_bytes):
+    import app.services as services
+
+    http, db, _ = client
+    shared = "4901234567894"
+    product_a = Product(name_cn="冲突甲")
+    product_b = Product(name_cn="冲突乙")
+    db.add_all([product_a, product_b])
+    db.flush()
+    db.add_all([
+        ProductBarcode(product_id=product_a.id, barcode=shared, source_system="qinsi", is_primary=True),
+        ProductBarcode(product_id=product_b.id, barcode=shared, source_system="qinsi", is_primary=True),
+    ])
+    db.commit()
+
+    not_found_jan = "4570110290418"
+    batch_id = upload(http, jpeg_bytes).json()["id"]
+    batch = db.get(ReceiptBatch, batch_id)
+    payload = multi_item_payload([shared, not_found_jan])
+    receipt = services.import_recognition_json(db, batch, json.dumps(payload, ensure_ascii=False))
+
+    db.refresh(receipt)
+    conflict_item, new_item = receipt.items
+    assert conflict_item.match_status == "conflict"
+    assert conflict_item.product_id is None
+    assert new_item.match_status == "new_product"
+    assert new_item.product_id is None
+
+
+def test_import_preview_never_matches_a_qinsi_product_code_as_jan(client, jpeg_bytes):
+    # Regression: a receipt JAN candidate must never be compared against
+    # Product.qinsi_product_code -- QinSi 货号 is a different identity space
+    # (see BUSINESS_RULES.md) and must never automatically be treated as JAN.
+    import app.services as services
+
+    http, db, _ = client
+    jan_lookalike = "4901008613369"
+    product = Product(name_cn="秦丝货号商品", qinsi_product_code=jan_lookalike)
+    db.add(product)
+    db.commit()
+
+    batch_id = upload(http, jpeg_bytes).json()["id"]
+    batch = db.get(ReceiptBatch, batch_id)
+    payload = multi_item_payload([jan_lookalike])
+    receipt = services.import_recognition_json(db, batch, json.dumps(payload, ensure_ascii=False))
+
+    db.refresh(receipt)
+    item = receipt.items[0]
+    assert item.match_status == "new_product"
+    assert item.product_id is None
+
+
+def test_import_preview_normalizes_whitespace_around_jan(client, jpeg_bytes):
+    import app.services as services
+
+    http, db, _ = client
+    jan = make_valid_jan("049012345678")
+    product = Product(jan=jan, name_cn="前导零商品")
+    db.add(product)
+    db.commit()
+
+    batch_id = upload(http, jpeg_bytes).json()["id"]
+    batch = db.get(ReceiptBatch, batch_id)
+    payload = multi_item_payload([f"  {jan}  "])
+    receipt = services.import_recognition_json(db, batch, json.dumps(payload, ensure_ascii=False))
+
+    db.refresh(receipt)
+    item = receipt.items[0]
+    assert item.jan_candidate.strip() == jan
+    assert item.match_status == "matched_existing"
+    assert item.product_id == product.id
+
+
+def test_review_page_self_heals_a_stale_unmatched_preview(client, jpeg_bytes):
+    # Belt-and-suspenders: even if a row's preview is stale (e.g. the matching product was
+    # imported after this row), loading the review page recomputes it via
+    # sync_pending_item_previews() without requiring a save or confirm.
+    import app.services as services
+
+    http, db, _ = client
+    jan = "4901008613369"
+    batch_id = upload(http, jpeg_bytes).json()["id"]
+    batch = db.get(ReceiptBatch, batch_id)
+    payload = multi_item_payload([jan])
+    receipt = services.import_recognition_json(db, batch, json.dumps(payload, ensure_ascii=False))
+    item = receipt.items[0]
+    assert item.match_status == "new_product"
+
+    product = Product(jan=jan, name_cn="后到的商品", status="active")
+    db.add(product)
+    db.commit()
+
+    response = http.get(f"/receipts/{batch.id}/review?receipt_id={receipt.id}")
+    assert response.status_code == 200
+    db.refresh(item)
+    assert item.match_status == "matched_existing"
+    assert item.product_id == product.id
+    assert "匹配依据：JAN精确匹配" in response.text

@@ -945,8 +945,9 @@ def import_recognition_json(session: Session, batch: ReceiptBatch, raw_text: str
         session.flush()
         from app.store_service import match_receipt_store
         match_receipt_store(session, receipt)
+        from app.product_matching import preview_match_item
         for item, source_image in zip(payload.items, item_sources, strict=True):
-            session.add(ReceiptItem(
+            receipt_item = ReceiptItem(
                 receipt=receipt,
                 line_no=item.line_no,
                 raw_name=item.raw_name,
@@ -961,7 +962,10 @@ def import_recognition_json(session: Session, batch: ReceiptBatch, raw_text: str
                 match_status="unmatched",
                 review_status="pending",
                 source_image_id=source_image.id if source_image else None,
-            ))
+            )
+            session.add(receipt_item)
+            session.flush()
+            preview_match_item(session, receipt_item)
         normalized = payload.model_dump(mode="json")
         session.add(AiRecognitionRun(
             batch=batch,
@@ -1048,8 +1052,9 @@ def import_gpt_job_json(session: Session, job: ZipPackageJob, raw_text: str) -> 
             session.flush()
             from app.store_service import match_receipt_store
             match_receipt_store(session, receipt)
+            from app.product_matching import preview_match_item
             for item in payload.items:
-                session.add(ReceiptItem(
+                receipt_item = ReceiptItem(
                     receipt=receipt,
                     line_no=item.line_no,
                     raw_name=item.raw_name,
@@ -1064,8 +1069,10 @@ def import_gpt_job_json(session: Session, job: ZipPackageJob, raw_text: str) -> 
                     match_status="unmatched",
                     review_status="pending",
                     source_image_id=image.id,
-                ))
-            session.flush()
+                )
+                session.add(receipt_item)
+                session.flush()
+                preview_match_item(session, receipt_item)
             detect_business_duplicate(session, receipt)
             created.append(receipt)
 
