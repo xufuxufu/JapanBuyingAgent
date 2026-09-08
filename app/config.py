@@ -26,6 +26,11 @@ SALES_SUMMARY_PREVIEW_TEMP_DIR = DATA_DIR / "tmp" / "qinsi-sales-summary-preview
 DEFAULT_DB_PATH = DB_DIR / "japan_buying_agent.sqlite3"
 DEFAULT_RAKUTEN_HTTP_REFERER = "https://xufu-cp.taile96adb.ts.net:8020/"
 DEFAULT_RAKUTEN_ALLOWED_PUBLIC_IP = "14.10.7.65"
+# No exact deep-link into the seller's own goods list is hardcoded here -- the
+# top-level portal's own auth guard naturally redirects an unauthenticated
+# visitor to its login page, and once logged in takes them to their normal
+# workspace. Override with JBA_QINSI_PORTAL_URL if this isn't the right URL.
+DEFAULT_QINSI_PORTAL_URL = "https://www.qinsilk.com"
 
 
 def is_testing() -> bool:
@@ -57,6 +62,10 @@ def rakuten_http_referer() -> str:
 
 def rakuten_allowed_public_ip() -> str:
     return clean_env_value(os.getenv("JBA_RAKUTEN_ALLOWED_PUBLIC_IP")) or DEFAULT_RAKUTEN_ALLOWED_PUBLIC_IP
+
+
+def qinsi_portal_url() -> str:
+    return clean_env_value(os.getenv("JBA_QINSI_PORTAL_URL")) or DEFAULT_QINSI_PORTAL_URL
 
 
 def first_env_value(*names: str, default: str = "") -> tuple[str, str | None]:

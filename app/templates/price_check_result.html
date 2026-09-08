@@ -36,24 +36,40 @@
 </section>
 
 <section>
-  <div class="section-head"><div><h2>线上商品结果一览</h2><p class="muted">当前按商品价格排序，未计入配送费。</p></div></div>
+  <div class="section-head"><div><h2>线上商品结果一览</h2><p class="muted">当前按商品价格排序，未计入配送费；人工选择优先于自动算法。</p></div><a class="button secondary compact" href="{{ qinsi_portal_url }}" target="_blank" rel="noopener noreferrer">去秦丝</a></div>
+  {% if view.manual_selection %}
+  <div class="badge state-shipped offer-manual-banner">已人工选择：{{ view.manual_selection.title or view.manual_selection.provider_code }}
+    <form method="post" action="/price-check/offers/clear-selection" class="offer-restore-auto-form">
+      <input type="hidden" name="jan" value="{{ view.history.jan }}">
+      <input type="hidden" name="history_id" value="{{ view.history.id }}">
+      <button type="submit" class="link-button">恢复自动</button>
+    </form>
+  </div>
+  {% endif %}
   {% if view.result_offers %}
   <div class="offer-list">
     {% for offer in view.result_offers %}
-    <a class="offer-result-row" href="{{ offer.url }}" target="_blank" rel="noopener noreferrer">
-      {% if offer.image_url %}<img src="{{ offer.image_url }}" alt="{{ offer.title }}" loading="lazy" referrerpolicy="no-referrer">{% else %}<div class="offer-image-empty">暂无图</div>{% endif %}
-      <div class="offer-result-main">
-        <h3>{{ offer.title }}</h3>
-        <p>{{ offer.platform_display_name }} · {{ offer.seller_display_name }}</p>
-        {% if offer.pack_quantity and offer.pack_quantity > 1 %}
-        <small>{{ offer.pack_quantity }}个装 ¥{{ offer.listing_price_text }}</small>
-        {% endif %}
-      </div>
-      <div class="offer-result-price">
-        <strong>{% if offer.display_price is not none %}¥{{ offer.display_price_text }}{% if offer.normalized_unit_price %}/个{% endif %}{% else %}暂无{% endif %}</strong>
-        <small>{{ offer.stock_label }}</small>
-      </div>
-    </a>
+    <div class="offer-result-row{% if offer.manually_selected %} offer-result-row-selected{% endif %}">
+      <form method="post" action="/price-check/offers/{{ offer.id }}/select" class="offer-select-form">
+        <input type="hidden" name="history_id" value="{{ view.history.id }}">
+        <input type="radio" name="manual_offer" value="{{ offer.id }}" class="offer-select-radio" aria-label="人工选择该结果" {% if offer.manually_selected %}checked{% endif %} onchange="this.form.submit()">
+      </form>
+      <a class="offer-result-link" href="{{ offer.url }}" target="_blank" rel="noopener noreferrer">
+        {% if offer.image_url %}<img src="{{ offer.image_url }}" alt="{{ offer.title }}" loading="lazy" referrerpolicy="no-referrer">{% else %}<div class="offer-image-empty">暂无图</div>{% endif %}
+        <div class="offer-result-main">
+          <h3>{{ offer.title }}</h3>
+          <p>{{ offer.platform_display_name }} · {{ offer.seller_display_name }}</p>
+          {% if offer.pack_quantity and offer.pack_quantity > 1 %}
+          <small>{{ offer.pack_quantity }}个装 ¥{{ offer.listing_price_text }}</small>
+          {% endif %}
+        </div>
+        <div class="offer-result-price">
+          <strong>{% if offer.display_price is not none %}¥{{ offer.display_price_text }}{% if offer.normalized_unit_price %}/个{% endif %}{% else %}暂无{% endif %}</strong>
+          <small>{{ offer.stock_label }}</small>
+        </div>
+      </a>
+      {% if offer.manually_selected %}<span class="badge state-shipped offer-manual-tag">已选</span>{% endif %}
+    </div>
     {% endfor %}
   </div>
   {% else %}<div class="card info">当前没有线上商品结果。</div>{% endif %}

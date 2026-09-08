@@ -9,7 +9,10 @@ import pytest
 from pydantic import ValidationError
 from sqlalchemy import func, select
 
-from app.models import Marketplace, PriceLookupHistory, PriceProviderAttempt, PriceSearchRun, Product, ProductBarcode, ProductOffer, ProductOperationLog
+from app.models import (
+    Marketplace, PriceLookupHistory, PriceProviderAttempt, PriceSearchRun, Product, ProductBarcode,
+    ProductEnrichmentTask, ProductOffer, ProductOfferManualSelection, ProductOperationLog,
+)
 from app.price_providers import (
     LocalQinsiPriceProvider,
     PriceCandidate,
@@ -21,7 +24,10 @@ from app.price_providers import (
     get_default_price_providers,
 )
 import app.price_service as price_service
-from app.price_service import _search_provider_coalesced, build_lookup_view, online_reference_price_from_offers, query_prices, update_store_price
+from app.price_service import (
+    _search_provider_coalesced, build_lookup_view, clear_manual_offer_selection, get_manual_offer_selection,
+    online_reference_price_from_offers, query_prices, set_manual_offer_selection, update_store_price,
+)
 from app.product_identity import format_product_display_name, normalize_product_name
 from app.schemas import PriceLookupInput
 
@@ -850,6 +856,164 @@ def test_price_check_result_page_uses_plain_wording_when_all_providers_succeed(c
     assert "部分平台查询失败" not in body
 
 
+# ---------------- manual online-offer selection ----------------
+
+
+def _multi_offer_view(db_session, *, jan=VALID_JAN, prices=(1500, 1200, 1800)):
+    providers = [FakeProvider("yahoo_shopping", ProviderResponse(
+        "success", tuple(offer(price, jan=jan, jan_verified=True, title=f"商品价格{price}") for price in prices),
+    ))]
+    return query_prices(db_session, PriceLookupInput(jan=jan), providers)
+
+
+def test_no_manual_selection_by_default(db_session):
+    view = _multi_offer_view(db_session)
+    assert view.manual_selection is None
+    assert all(not getattr(item, "manually_selected", False) for item in view.result_offers)
+
+
+def test_without_manual_selection_online_min_uses_default_algorithm(db_session):
+    view = _multi_offer_view(db_session, prices=(1500, 1200, 1800))
+    # Lowest of the three, exactly as the existing (untouched) algorithm picks --
+    # manual selection plays no part when none has been made.
+    assert view.online_min_price == 1200
+
+
+def test_selecting_an_offer_marks_it_and_persists(db_session):
+    view = _multi_offer_view(db_session)
+    target = next(o for o in view.run.offers if o.item_price == 1200)
+    set_manual_offer_selection(db_session, VALID_JAN, target)
+
+    rebuilt = build_lookup_view(db_session, view.history.id)
+    assert rebuilt.manual_selection is not None
+    assert rebuilt.manual_selection.url == target.url
+    selected = [o for o in rebuilt.result_offers if o.manually_selected]
+    assert len(selected) == 1 and selected[0].id == target.id
+
+
+def test_selecting_another_offer_replaces_the_previous_one(db_session):
+    view = _multi_offer_view(db_session)
+    offer_a, offer_b = view.run.offers[0], view.run.offers[1]
+    set_manual_offer_selection(db_session, VALID_JAN, offer_a)
+    set_manual_offer_selection(db_session, VALID_JAN, offer_b)
+
+    assert db_session.scalar(select(func.count()).select_from(ProductOfferManualSelection)) == 1
+    rebuilt = build_lookup_view(db_session, view.history.id)
+    selected = [o for o in rebuilt.result_offers if o.manually_selected]
+    assert len(selected) == 1 and selected[0].id == offer_b.id
+
+
+def test_clearing_manual_selection_restores_default_algorithm(db_session):
+    view = _multi_offer_view(db_session)
+    target = next(o for o in view.run.offers if o.item_price == 1200)
+    set_manual_offer_selection(db_session, VALID_JAN, target)
+    assert get_manual_offer_selection(db_session, VALID_JAN) is not None
+
+    cleared = clear_manual_offer_selection(db_session, VALID_JAN)
+    assert cleared is True
+    assert get_manual_offer_selection(db_session, VALID_JAN) is None
+
+    rebuilt = build_lookup_view(db_session, view.history.id)
+    assert rebuilt.manual_selection is None
+    assert all(not o.manually_selected for o in rebuilt.result_offers)
+    assert rebuilt.online_min_price == 1200  # default algorithm resumed, unaffected by the earlier pick
+
+
+def test_manual_selection_survives_repeated_page_loads(db_session):
+    """Simulates refreshing the results page: build_lookup_view() is called fresh
+    each time (no session/front-end state), and the pick must still be there."""
+    view = _multi_offer_view(db_session)
+    target = next(o for o in view.run.offers if o.item_price == 1800)
+    set_manual_offer_selection(db_session, VALID_JAN, target)
+
+    for _ in range(3):
+        reloaded = build_lookup_view(db_session, view.history.id)
+        selected = [o for o in reloaded.result_offers if o.manually_selected]
+        assert len(selected) == 1 and selected[0].id == target.id
+
+
+def test_manual_selection_does_not_change_trusted_price_sort_order(db_session):
+    view = _multi_offer_view(db_session, prices=(1500, 1200, 1800))
+    # Manually pick the most expensive one -- the trusted/online-min ordering,
+    # which the task explicitly says must stay untouched, still surfaces 1200.
+    expensive = next(o for o in view.run.offers if o.item_price == 1800)
+    set_manual_offer_selection(db_session, VALID_JAN, expensive)
+
+    rebuilt = build_lookup_view(db_session, view.history.id)
+    assert [o.item_price for o in rebuilt.trusted_offers] == [1200, 1500, 1800]
+    assert rebuilt.online_min_price == 1200
+
+
+def test_select_and_clear_routes_persist_and_render_selection(client):
+    http, db, _ = client
+    view = _multi_offer_view(db, prices=(1500, 1200, 1800))
+    target = next(o for o in view.run.offers if o.item_price == 1200)
+
+    select_response = http.post(
+        f"/price-check/offers/{target.id}/select", data={"history_id": view.history.id}, follow_redirects=False,
+    )
+    assert select_response.status_code == 303
+    page = http.get(f"/price-check/results/{view.history.id}")
+    assert "已选" in page.text
+    assert "已人工选择" in page.text
+    assert "恢复自动" in page.text
+    assert f'value="{target.id}"' in page.text and "checked" in page.text
+
+    clear_response = http.post(
+        "/price-check/offers/clear-selection",
+        data={"jan": VALID_JAN, "history_id": view.history.id},
+        follow_redirects=False,
+    )
+    assert clear_response.status_code == 303
+    cleared_page = http.get(f"/price-check/results/{view.history.id}")
+    assert "已人工选择" not in cleared_page.text
+    assert "checked" not in cleared_page.text
+
+
+def test_select_offer_route_via_fetch_returns_updated_json_payload(client):
+    http, db, _ = client
+    view = _multi_offer_view(db, prices=(1500, 1200, 1800))
+    target = next(o for o in view.run.offers if o.item_price == 1200)
+
+    response = http.post(
+        f"/price-check/offers/{target.id}/select",
+        data={"history_id": view.history.id},
+        headers={"X-Requested-With": "fetch"},
+    )
+    assert response.status_code == 200
+    data = response.json()
+    assert data["ok"] is True
+    assert data["manual_selection"]["url"] == target.url
+    selected_payloads = [o for o in data["offers"] if o["manually_selected"]]
+    assert len(selected_payloads) == 1 and selected_payloads[0]["id"] == target.id
+
+
+def test_qinsi_shortcut_button_present_and_opens_new_tab(client):
+    http, db, _ = client
+    view = _multi_offer_view(db)
+    page = http.get(f"/price-check/results/{view.history.id}")
+    assert page.status_code == 200
+    assert "去秦丝" in page.text
+    # Must open in a new tab, never navigate away from the results page.
+    idx = page.text.index("去秦丝")
+    tag_start = page.text.rindex("<a", 0, idx)
+    tag = page.text[tag_start:idx]
+    assert 'target="_blank"' in tag
+    assert 'rel="noopener noreferrer"' in tag
+
+
+def test_offer_list_markup_has_no_fixed_pixel_widths_for_mobile(client):
+    # Proxy check for "no horizontal overflow on mobile": the new radio/link
+    # markup must rely on the existing responsive CSS classes, not inline
+    # fixed-width styles that would force a wide, unscrollable layout.
+    http, db, _ = client
+    view = _multi_offer_view(db)
+    page = http.get(f"/price-check/results/{view.history.id}")
+    assert 'class="offer-result-row' in page.text
+    assert 'class="offer-select-radio"' in page.text
+    assert "style=\"width:" not in page.text
+
+
 def test_marketplace_lookup_recovers_from_concurrent_insert_race(db_session, monkeypatch):
     provider = FakeProvider("race_provider", ProviderResponse("success", (offer(700),)))
     real_marketplace = price_service._marketplace
@@ -1189,7 +1353,7 @@ def test_scan_and_result_pages_and_missing_config_do_not_500(client, monkeypatch
     db_session.expire_all()
     result = test_client.get(response.headers["location"])
     assert result.status_code == 200
-    assert "本地已有商品" in result.text and "当前按商品价格排序，未计入配送费。" in result.text
+    assert "本地已有商品" in result.text and "当前按商品价格排序，未计入配送费" in result.text
     assert test_client.get("/health").status_code == 200
     # One attempt per default provider (Yahoo/Rakuten/Amazon/Nishimatsuya/Anpanman/WebFallback/Manual).
     assert db_session.scalar(select(func.count()).select_from(PriceProviderAttempt)) == len(get_default_price_providers())

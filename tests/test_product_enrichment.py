@@ -221,6 +221,95 @@ def test_receipt_new_jan_uses_online_enrichment_name_not_ocr_name(db_session, mo
     assert task.sources[0].source_type == "receipt_item" and task.sources[0].source_id == item.id
 
 
+# ---------------- manual online-offer selection overrides candidate auto-pick ----------------
+
+
+def test_manual_offer_selection_overrides_default_candidate_pick(db_session, monkeypatch, tmp_path):
+    from app.price_service import query_prices, set_manual_offer_selection
+    from app.schemas import PriceLookupInput
+
+    configure_deepseek(monkeypatch)
+    monkeypatch.setattr(enrichment, "PRODUCT_IMAGE_DIR", tmp_path / "products")
+    item = make_item(db_session, confirmed=True)
+    task = ensure_receipt_item_tasks(db_session, [item], "receipt_confirmation")[0]
+
+    yahoo_offer = offer(
+        "自动算法会选中的商品 500ml", url="https://example.test/yahoo-item",
+        image_url="https://img.test/yahoo.jpg", item_price=2000,
+    )
+    rakuten_offer = offer(
+        "人工选择的商品 500ml", url="https://example.test/rakuten-item",
+        image_url="https://img.test/rakuten.jpg", item_price=1500,
+    )
+    providers = [FakeProvider("yahoo", (yahoo_offer,)), FakeProvider("rakuten", (rakuten_offer,))]
+
+    # Materialize real ProductOffer rows first so there's something concrete to
+    # pin -- matching later happens by (provider_code, url), so this survives
+    # process_enrichment_task's own internal re-query below using a different run.
+    # trigger_enrichment=False matches how the real price-check flow always calls
+    # this (enrichment is scheduled separately) -- leaving it at the default True
+    # would auto-complete the product with the auto-picked offer right here,
+    # before the manual pin below ever gets a chance to apply.
+    preview = query_prices(
+        db_session, PriceLookupInput(jan=VALID_JAN, force_refresh=True), providers=providers, trigger_enrichment=False,
+    )
+    manually_picked = next(o for o in preview.run.offers if o.item_price == 1500)
+    set_manual_offer_selection(db_session, VALID_JAN, manually_picked)
+
+    process_enrichment_task(
+        db_session, task, providers=providers,
+        deepseek_client=DeepSeekClient("人工中文名|人工选择的商品 500ml"),
+        image_client=ImageClient(),
+    )
+
+    product = db_session.scalar(select(Product).where(Product.jan == VALID_JAN))
+    assert product is not None
+    # Every field comes from the SAME (manually picked, rakuten) offer -- never
+    # yahoo's price with rakuten's image or vice versa. Image selection is a
+    # genuinely separate algorithm from candidate/price selection
+    # (download_best_main_image ranks by platform independently of `selected`),
+    # so this is the regression that actually proves the "one offer" rule.
+    assert product.name_ja == "人工选择的商品 500ml"
+    assert product.purchase_price == 1500
+    assert product.main_image_source_url == "https://img.test/rakuten.jpg"
+    assert product.main_image_source_url != "https://img.test/yahoo.jpg"
+
+
+def test_without_a_matching_manual_selection_default_algorithm_still_runs(db_session, monkeypatch, tmp_path):
+    """No manual pin at all -- selection_priority() (untouched) must still decide,
+    exactly as before this feature existed."""
+    configure_deepseek(monkeypatch)
+    monkeypatch.setattr(enrichment, "PRODUCT_IMAGE_DIR", tmp_path / "products")
+    item = make_item(db_session, confirmed=True)
+    task = ensure_receipt_item_tasks(db_session, [item], "receipt_confirmation")[0]
+
+    yahoo_offer = offer(
+        "自动算法商品 500ml", url="https://example.test/yahoo-item-2",
+        image_url="https://img.test/yahoo2.jpg", item_price=2000,
+    )
+    rakuten_offer = offer(
+        "另一件商品 500ml", url="https://example.test/rakuten-item-2",
+        image_url="https://img.test/rakuten2.jpg", item_price=1500,
+    )
+    providers = [FakeProvider("yahoo", (yahoo_offer,)), FakeProvider("rakuten", (rakuten_offer,))]
+
+    process_enrichment_task(
+        db_session, task, providers=providers,
+        deepseek_client=DeepSeekClient("自动中文名|自动算法商品 500ml"),
+        image_client=ImageClient(),
+    )
+
+    product = db_session.scalar(select(Product).where(Product.jan == VALID_JAN))
+    assert product is not None
+    # yahoo outranks rakuten in _candidate_field_rank's "name" ordering --
+    # the untouched default algorithm still picks it for image/name/source.
+    assert product.name_ja == "自动算法商品 500ml"
+    # Reference price is untouched too: still the pre-existing average-of-
+    # trusted-offers algorithm (online_reference_price_from_offers), not tied
+    # to whichever single candidate got selected -- (2000 + 1500) / 2 = 1750.
+    assert product.purchase_price == 1750
+
+
 def test_missing_product_enrich_by_jan_updates_original_product_without_duplicate(db_session, monkeypatch, tmp_path):
     configure_deepseek(monkeypatch)
     monkeypatch.setattr(enrichment, "PRODUCT_IMAGE_DIR", tmp_path / "products")

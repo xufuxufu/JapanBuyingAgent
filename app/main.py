@@ -23,7 +23,7 @@ from sqlalchemy import func, or_, select, text
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.orm import Session, selectinload
 
-from app.config import PREVIEW_DIR, PRODUCT_IMAGE_DIR, PROJECT_ROOT, QINSI_PRODUCT_IMAGE_DIR, TAG_EVIDENCE_DIR, default_role, ensure_data_directories, get_deepseek_config, is_testing
+from app.config import PREVIEW_DIR, PRODUCT_IMAGE_DIR, PROJECT_ROOT, QINSI_PRODUCT_IMAGE_DIR, TAG_EVIDENCE_DIR, default_role, ensure_data_directories, get_deepseek_config, is_testing, qinsi_portal_url
 from app.db import SessionLocal, engine, get_db
 from app.models import Customer, CustomerAddress, DurableBackgroundJob, DuplicateDetectionLog, EnrichmentAuditLog, FieldPurchaseItem, PlatformProviderState, PriceSearchRun, ProcurementDemand, ProcurementDemandPlan, Product, ProductAlias, ProductEnrichmentCandidate, ProductOffer, ProductWatchConfig, ProductWatchSnapshot, PurchaseBatch, PurchaseBatchItem, QinsiExportJob, QinsiGoodsImportRow, QinsiImportBatch, QinsiPurchaseExportJob, Receipt, ReceiptBatch, ReceiptImage, ReceiptItem, RestockList, RestockListItem, SalesOrder, SalesOrderItem, SalesShipment, Salesperson, ShipmentTrackingEvent, Store, StoreBrand, TagEvidence, ZipPackageItem, ZipPackageJob
 from app.analytics_service import analytics_dashboard, procurement_data, resolve_date_range
@@ -55,8 +55,8 @@ from app.product_admin import (
     update_product_master,
 )
 from app.price_service import (
-    PriceLookupView, build_lookup_view, query_prices, recent_price_lookup_histories,
-    refresh_product_online_price_task, update_store_price,
+    PriceLookupView, build_lookup_view, clear_manual_offer_selection, query_prices, recent_price_lookup_histories,
+    refresh_product_online_price_task, set_manual_offer_selection, update_store_price,
 )
 from app.product_enrichment import (
     accept_task, bind_task_to_existing, enrichment_summary_for_receipt, ensure_existing_product_enrichment_task, get_task,
@@ -1137,6 +1137,7 @@ def price_check_page(
     return templates.TemplateResponse(request, "price_check.html", {
         "histories": recent_price_lookup_histories(db, jan=jan.strip() or None),
         "error": None, "jan": jan.strip(), "current_store_price": "",
+        "qinsi_portal_url": qinsi_portal_url(),
     })
 
 
@@ -1157,6 +1158,7 @@ def _run_price_lookup(
 
 def _offer_payload(offer: ProductOffer) -> dict:
     return {
+        "id": offer.id,
         "title": offer.title,
         "url": offer.url,
         "image_url": offer.image_url,
@@ -1168,6 +1170,7 @@ def _offer_payload(offer: ProductOffer) -> dict:
         "display_price_text": offer.display_price_text,
         "normalized_unit_price": offer.normalized_unit_price is not None,
         "stock_label": offer.stock_label,
+        "manually_selected": bool(getattr(offer, "manually_selected", False)),
     }
 
 
@@ -1198,6 +1201,13 @@ def _lookup_view_payload(db: Session, view: PriceLookupView) -> dict:
             "latest_purchase_store_address": view.latest_purchase_store_address,
             "watched": get_watch(db, product.id) is not None,
         }
+    manual_selection_payload = None
+    if view.manual_selection is not None:
+        manual_selection_payload = {
+            "provider_code": view.manual_selection.provider_code,
+            "title": view.manual_selection.title,
+            "url": view.manual_selection.url,
+        }
     return {
         "history_id": view.history.id,
         "jan": view.history.jan,
@@ -1211,6 +1221,7 @@ def _lookup_view_payload(db: Session, view: PriceLookupView) -> dict:
         "providers_all_failed": view.providers_all_failed,
         "providers_partial_failed": view.providers_partial_failed,
         "provider_banner": provider_banner,
+        "manual_selection": manual_selection_payload,
         "offers": [_offer_payload(offer) for offer in view.result_offers],
         "attempts": [
             {
@@ -1239,14 +1250,14 @@ def price_check_submit(
     except ValidationError as exc:
         return templates.TemplateResponse(request, "price_check.html", {
             "histories": recent_price_lookup_histories(db), "error": _validation_message(exc),
-            "jan": jan, "current_store_price": current_store_price,
+            "jan": jan, "current_store_price": current_store_price, "qinsi_portal_url": qinsi_portal_url(),
         }, status_code=422)
     try:
         view = _run_price_lookup(db, background_tasks, lookup)
     except ValueError as exc:
         return templates.TemplateResponse(request, "price_check.html", {
             "histories": recent_price_lookup_histories(db), "error": str(exc),
-            "jan": jan, "current_store_price": current_store_price,
+            "jan": jan, "current_store_price": current_store_price, "qinsi_portal_url": qinsi_portal_url(),
         }, status_code=409)
     except Exception as exc:
         _log_price_check_failure(request, jan=lookup.jan, exc=exc)
@@ -1287,6 +1298,7 @@ def price_check_result(history_id: int, request: Request, db: Session = Depends(
         "provider_status_cn": PRICE_PROVIDER_STATUS_CN, "comparison_cn": PRICE_COMPARISON_CN,
         "price_saved": request.query_params.get("price_saved") == "1",
         "price_error": request.query_params.get("price_error"),
+        "qinsi_portal_url": qinsi_portal_url(),
     })
 
 
@@ -1324,6 +1336,37 @@ def price_check_update_store_price(
     if is_fetch:
         return {"ok": True, **_lookup_view_payload(db, build_lookup_view(db, history_id))}
     return RedirectResponse(f"/price-check/results/{history_id}?price_saved=1", status_code=303)
+
+
+@app.post("/price-check/offers/{offer_id}/select")
+def price_check_select_offer(offer_id: int, request: Request, history_id: int = Form(...), db: Session = Depends(get_db)):
+    is_fetch = request.headers.get("x-requested-with") == "fetch"
+    offer = db.get(ProductOffer, offer_id)
+    if offer is None:
+        if is_fetch:
+            return JSONResponse({"ok": False, "message": "线上结果不存在"}, status_code=404)
+        raise HTTPException(404, "线上结果不存在")
+    jan = offer.search_run.jan if offer.search_run else None
+    if not jan:
+        message = "该结果缺少JAN，无法人工选择"
+        if is_fetch:
+            return JSONResponse({"ok": False, "message": message}, status_code=422)
+        raise HTTPException(422, message)
+    set_manual_offer_selection(db, jan, offer)
+    if is_fetch:
+        return {"ok": True, **_lookup_view_payload(db, build_lookup_view(db, history_id))}
+    return RedirectResponse(f"/price-check/results/{history_id}", status_code=303)
+
+
+@app.post("/price-check/offers/clear-selection")
+def price_check_clear_offer_selection(
+    request: Request, jan: str = Form(...), history_id: int = Form(...), db: Session = Depends(get_db),
+):
+    is_fetch = request.headers.get("x-requested-with") == "fetch"
+    clear_manual_offer_selection(db, jan)
+    if is_fetch:
+        return {"ok": True, **_lookup_view_payload(db, build_lookup_view(db, history_id))}
+    return RedirectResponse(f"/price-check/results/{history_id}", status_code=303)
 
 
 @app.post("/receipts/upload")

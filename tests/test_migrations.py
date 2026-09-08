@@ -9,7 +9,7 @@ from alembic import command
 from alembic.config import Config
 
 
-HEAD_REVISION = "20260908_0049"
+HEAD_REVISION = "20260908_0050"
 
 
 def test_migration_from_empty_and_repeat_safe(tmp_path, monkeypatch):
@@ -248,6 +248,57 @@ def test_0049_sales_order_return_status_upgrade_and_downgrade(tmp_path, monkeypa
     assert revision == (HEAD_REVISION,)
     assert "return_status" in columns_final
     assert row_final == ("none",)
+
+
+def test_0050_product_offer_manual_selection_upgrade_and_downgrade(tmp_path, monkeypatch):
+    db_path = tmp_path / "product-offer-manual-selection.sqlite3"
+    monkeypatch.setenv("JBA_DATABASE_URL", f"sqlite:///{db_path.as_posix()}")
+    config = Config(str(Path(__file__).resolve().parents[1] / "alembic.ini"))
+    command.upgrade(config, "head")
+    command.upgrade(config, "head")
+    with sqlite3.connect(db_path) as connection:
+        tables = {row[0] for row in connection.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+        columns = {row[1] for row in connection.execute("PRAGMA table_info(product_offer_manual_selections)")}
+        connection.execute(
+            "INSERT INTO product_offer_manual_selections "
+            "(jan, provider_code, url, title, image_url, item_price, shipping_price, total_price, currency, "
+            "created_at, updated_at) "
+            "VALUES ('4901234567894', 'yahoo_shopping', 'https://example.test/item', '测试商品', "
+            "'https://img.test/a.jpg', 1000, 0, 1000, 'JPY', datetime('now'), datetime('now'))"
+        )
+        connection.commit()
+        # Uniqueness on jan must be enforced -- a second manual pick for the
+        # same JAN must replace, never duplicate, the row (service layer does
+        # an UPDATE-in-place; this proves the DB itself won't silently allow two).
+        duplicate_blocked = False
+        try:
+            connection.execute(
+                "INSERT INTO product_offer_manual_selections "
+                "(jan, provider_code, url, currency, created_at, updated_at) "
+                "VALUES ('4901234567894', 'rakuten', 'https://example.test/other', 'JPY', datetime('now'), datetime('now'))"
+            )
+            connection.commit()
+        except sqlite3.IntegrityError:
+            duplicate_blocked = True
+        fk_check = connection.execute("PRAGMA foreign_key_check").fetchall()
+    assert "product_offer_manual_selections" in tables
+    assert {"jan", "provider_code", "url", "source_offer_id"} <= columns
+    assert duplicate_blocked is True
+    assert fk_check == []
+
+    command.downgrade(config, "20260908_0049")
+    with sqlite3.connect(db_path) as connection:
+        tables = {row[0] for row in connection.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+        integrity = connection.execute("PRAGMA integrity_check").fetchone()
+    assert "product_offer_manual_selections" not in tables
+    assert integrity == ("ok",)
+
+    command.upgrade(config, "head")
+    with sqlite3.connect(db_path) as connection:
+        revision = connection.execute("SELECT version_num FROM alembic_version").fetchone()
+        tables = {row[0] for row in connection.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+    assert revision == (HEAD_REVISION,)
+    assert "product_offer_manual_selections" in tables
 
 
 def test_0038_sales_order_tables_are_empty_and_repeat_safe(tmp_path, monkeypatch):

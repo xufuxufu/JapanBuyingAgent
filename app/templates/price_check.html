@@ -72,7 +72,8 @@
       <p class="price-compare-diff">差额 <strong id="resultDiff">—</strong><span id="resultComparisonLabel">等待可比较价格</span></p>
     </div>
     <section id="resultOffersSection">
-      <div class="section-head"><div><h2>线上商品结果一览</h2><p class="muted">当前按商品价格排序，未计入配送费。</p></div></div>
+      <div class="section-head"><div><h2>线上商品结果一览</h2><p class="muted">当前按商品价格排序，未计入配送费；人工选择优先于自动算法。</p></div><a class="button secondary compact" href="{{ qinsi_portal_url }}" target="_blank" rel="noopener noreferrer">去秦丝</a></div>
+      <div id="resultManualBanner" class="badge state-shipped offer-manual-banner" hidden></div>
       <div id="resultOffers" class="offer-list"></div>
     </section>
     <section class="card local-product-card" id="resultProductCard" hidden></section>
@@ -131,6 +132,7 @@
   const resultComparisonLabel = document.querySelector('#resultComparisonLabel');
   const resultOffersSection = document.querySelector('#resultOffersSection');
   const resultOffers = document.querySelector('#resultOffers');
+  const resultManualBanner = document.querySelector('#resultManualBanner');
   const resultProductCard = document.querySelector('#resultProductCard');
   const rescanButton = document.querySelector('#rescanButton');
   const requeryButton = document.querySelector('#requeryButton');
@@ -164,6 +166,7 @@
   let uiState = 'scanning'; // 'scanning' | 'querying' | 'showing_result'
   let lastJan = '';
   let currentHistoryId = null;
+  let currentJan = null;
 
   function enterQueryingState(jan) {
     // Pause the decode loop but deliberately do NOT stop the camera --
@@ -204,6 +207,45 @@
     resultProviderBanner.append(div);
   }
 
+  async function selectOffer(offerId) {
+    if (!currentHistoryId) return;
+    try {
+      const response = await fetch(`/price-check/offers/${offerId}/select`, {
+        method: 'POST',
+        headers: {'X-Requested-With': 'fetch', 'Content-Type': 'application/x-www-form-urlencoded'},
+        body: new URLSearchParams({history_id: String(currentHistoryId)}),
+      });
+      const data = await response.json().catch(() => null);
+      if (response.ok && data && data.ok) showResult(data);
+    } catch (_) { /* leave the previous state visible on network failure */ }
+  }
+
+  async function clearOfferSelection() {
+    if (!currentHistoryId || !currentJan) return;
+    try {
+      const response = await fetch('/price-check/offers/clear-selection', {
+        method: 'POST',
+        headers: {'X-Requested-With': 'fetch', 'Content-Type': 'application/x-www-form-urlencoded'},
+        body: new URLSearchParams({jan: currentJan, history_id: String(currentHistoryId)}),
+      });
+      const data = await response.json().catch(() => null);
+      if (response.ok && data && data.ok) showResult(data);
+    } catch (_) { /* leave the previous state visible on network failure */ }
+  }
+
+  function renderManualBanner(manualSelection) {
+    resultManualBanner.replaceChildren();
+    if (!manualSelection) { resultManualBanner.hidden = true; return; }
+    resultManualBanner.hidden = false;
+    resultManualBanner.append(document.createTextNode(`已人工选择：${manualSelection.title || manualSelection.provider_code || ''}`));
+    const restoreButton = document.createElement('button');
+    restoreButton.type = 'button';
+    restoreButton.className = 'link-button';
+    restoreButton.textContent = '恢复自动';
+    restoreButton.addEventListener('click', clearOfferSelection);
+    resultManualBanner.append(restoreButton);
+  }
+
   function renderOffers(offers) {
     resultOffers.replaceChildren();
     if (!offers || !offers.length) {
@@ -214,23 +256,38 @@
       return;
     }
     for (const offer of offers) {
-      const row = document.createElement('a');
-      row.className = 'offer-result-row';
-      row.href = offer.url || '#';
-      row.target = '_blank';
-      row.rel = 'noopener noreferrer';
+      const row = document.createElement('div');
+      row.className = 'offer-result-row' + (offer.manually_selected ? ' offer-result-row-selected' : '');
+
+      const radioForm = document.createElement('span');
+      radioForm.className = 'offer-select-form';
+      const radio = document.createElement('input');
+      radio.type = 'radio';
+      radio.name = 'manual_offer';
+      radio.className = 'offer-select-radio';
+      radio.setAttribute('aria-label', '人工选择该结果');
+      radio.checked = !!offer.manually_selected;
+      radio.addEventListener('change', () => selectOffer(offer.id));
+      radioForm.append(radio);
+      row.append(radioForm);
+
+      const link = document.createElement('a');
+      link.className = 'offer-result-link';
+      link.href = offer.url || '#';
+      link.target = '_blank';
+      link.rel = 'noopener noreferrer';
       if (offer.image_url) {
         const img = document.createElement('img');
         img.src = offer.image_url;
         img.alt = offer.title || '';
         img.loading = 'lazy';
         img.referrerPolicy = 'no-referrer';
-        row.append(img);
+        link.append(img);
       } else {
         const emptyImage = document.createElement('div');
         emptyImage.className = 'offer-image-empty';
         emptyImage.textContent = '暂无图';
-        row.append(emptyImage);
+        link.append(emptyImage);
       }
       const main = document.createElement('div');
       main.className = 'offer-result-main';
@@ -245,7 +302,7 @@
         small.textContent = `${offer.pack_quantity}个装 ¥${offer.listing_price_text}`;
         main.append(small);
       }
-      row.append(main);
+      link.append(main);
       const priceBox = document.createElement('div');
       priceBox.className = 'offer-result-price';
       const strong = document.createElement('strong');
@@ -256,7 +313,15 @@
       const small2 = document.createElement('small');
       small2.textContent = offer.stock_label || '';
       priceBox.append(small2);
-      row.append(priceBox);
+      link.append(priceBox);
+      row.append(link);
+
+      if (offer.manually_selected) {
+        const tag = document.createElement('span');
+        tag.className = 'badge state-shipped offer-manual-tag';
+        tag.textContent = '已选';
+        row.append(tag);
+      }
       resultOffers.append(row);
     }
   }
@@ -368,6 +433,7 @@
   function showResult(data) {
     uiState = 'showing_result';
     currentHistoryId = data.history_id;
+    currentJan = data.jan;
     status.classList.remove('querying-status');
     status.textContent = '查询完成，可以继续扫码。';
     resultBadge.textContent = data.cache_hit ? '使用短时缓存' : '本次查询';
@@ -384,6 +450,7 @@
     resultOnlineMin.textContent = data.online_min_price_text || '暂无可信结果';
     resultDiff.textContent = data.difference_text || '—';
     resultComparisonLabel.textContent = data.comparison_label || '等待可比较价格';
+    renderManualBanner(data.manual_selection);
     renderOffers(data.offers);
     renderProductCard(data.product);
     scanResultCard.hidden = false;
@@ -392,6 +459,7 @@
   function showError(jan, message) {
     uiState = 'showing_result';
     currentHistoryId = null;
+    currentJan = null;
     status.classList.remove('querying-status');
     status.textContent = '查询失败，可以重新查询或继续扫码。';
     resultBadge.textContent = '查询失败';

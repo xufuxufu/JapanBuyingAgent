@@ -1552,6 +1552,32 @@ class PriceLookupHistory(Base):
     product: Mapped[Product | None] = relationship()
 
 
+class ProductOfferManualSelection(Base):
+    """A user's manual override of which online offer (image/price/source, always
+    taken from the SAME offer as a bundle) should win for a JAN, instead of the
+    automatic candidate-selection algorithm in product_enrichment.aggregate_candidates().
+    Keyed by JAN (not by a specific ProductOffer.id / PriceSearchRun) so it survives
+    page refreshes and later re-scans that create entirely new offer rows -- identity
+    is (provider_code, url), matched against whichever run is being displayed.
+    `source_offer_id` is a best-effort debug/audit trail only, not used for matching
+    (it may go stale/null once the originating run's offers are superseded)."""
+    __tablename__ = "product_offer_manual_selections"
+    __table_args__ = (Index("uq_product_offer_manual_selection_jan", "jan", unique=True),)
+    id: Mapped[int] = mapped_column(primary_key=True)
+    jan: Mapped[str] = mapped_column(String(32), nullable=False)
+    provider_code: Mapped[str] = mapped_column(String(50), nullable=False)
+    url: Mapped[str] = mapped_column(Text, nullable=False)
+    title: Mapped[str | None] = mapped_column(Text)
+    image_url: Mapped[str | None] = mapped_column(Text)
+    item_price: Mapped[int | None] = mapped_column(Integer)
+    shipping_price: Mapped[int | None] = mapped_column(Integer)
+    total_price: Mapped[int | None] = mapped_column(Integer)
+    currency: Mapped[str] = mapped_column(String(3), default="JPY", nullable=False)
+    source_offer_id: Mapped[int | None] = mapped_column(ForeignKey("product_offers.id", ondelete="SET NULL"))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow, nullable=False)
+
+
 class ProductWatchConfig(Base):
     __tablename__ = "product_watch_configs"
     __table_args__ = (

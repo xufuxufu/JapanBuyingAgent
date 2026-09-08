@@ -19,7 +19,7 @@ from app.db import build_engine
 from app.local_product import resolve_local_product_by_jan
 from app.models import (
     Marketplace, PlatformLookupResult, PlatformProviderState, PriceLookupHistory, PriceProviderAttempt, PriceSearchRun,
-    Product, ProductOffer, PurchaseBatch, PurchaseBatchItem, Receipt, Store,
+    Product, ProductOffer, ProductOfferManualSelection, PurchaseBatch, PurchaseBatchItem, Receipt, Store,
 )
 from app.price_providers import PriceCandidate, PriceProvider, ProviderResponse, get_default_price_providers
 from app.product_identity import format_product_display_name
@@ -71,6 +71,7 @@ class PriceLookupView:
     comparison_status: str | None
     providers_all_failed: bool
     providers_partial_failed: bool
+    manual_selection: ProductOfferManualSelection | None
 
 
 def _utc(value: datetime | None) -> datetime | None:
@@ -305,7 +306,7 @@ def _stock_label(stock_status: str | None) -> str:
     return "库存未知"
 
 
-def _hydrate_offer_display(offer: ProductOffer) -> ProductOffer:
+def _hydrate_offer_display(offer: ProductOffer, manual_selection: ProductOfferManualSelection | None = None) -> ProductOffer:
     try:
         raw = json.loads(offer.raw_data_json or "{}")
     except json.JSONDecodeError:
@@ -328,7 +329,50 @@ def _hydrate_offer_display(offer: ProductOffer) -> ProductOffer:
     offer.platform_display_name = _platform_display_name(offer)
     offer.stock_label = _stock_label(offer.stock_status)
     offer.seller_display_name = offer.seller or "店铺未提供"
+    offer.manually_selected = bool(
+        manual_selection is not None
+        and offer.marketplace is not None
+        and offer.marketplace.code == manual_selection.provider_code
+        and offer.url == manual_selection.url
+    )
     return offer
+
+
+def get_manual_offer_selection(session: Session, jan: str) -> ProductOfferManualSelection | None:
+    return session.scalar(select(ProductOfferManualSelection).where(ProductOfferManualSelection.jan == jan))
+
+
+def set_manual_offer_selection(session: Session, jan: str, offer: ProductOffer) -> ProductOfferManualSelection:
+    """Pin one offer as the manual choice for `jan`, replacing any previous pick for
+    the same JAN (never duplicating -- unique on jan). Snapshots title/image/price
+    together from this single offer so a later display or enrichment run can never
+    mix fields from two different offers."""
+    provider_code = offer.marketplace.code if offer.marketplace is not None else ""
+    values = dict(
+        provider_code=provider_code, url=offer.url, title=offer.title, image_url=offer.image_url,
+        item_price=offer.item_price, shipping_price=offer.shipping_price, total_price=offer.total_price,
+        currency=offer.currency, source_offer_id=offer.id,
+    )
+    existing = get_manual_offer_selection(session, jan)
+    if existing is not None:
+        for key, value in values.items():
+            setattr(existing, key, value)
+        selection = existing
+    else:
+        selection = ProductOfferManualSelection(jan=jan, **values)
+        session.add(selection)
+    session.commit()
+    session.refresh(selection)
+    return selection
+
+
+def clear_manual_offer_selection(session: Session, jan: str) -> bool:
+    existing = get_manual_offer_selection(session, jan)
+    if existing is None:
+        return False
+    session.delete(existing)
+    session.commit()
+    return True
 
 
 def _offer_sort_price(offer: ProductOffer) -> Decimal:
@@ -852,7 +896,8 @@ def build_lookup_view(session: Session, history_id: int) -> PriceLookupView:
         raise LookupError("查价历史不存在")
     run = history.search_run
     product = run.product
-    offers = tuple(_hydrate_offer_display(offer) for offer in run.offers)
+    manual_selection = get_manual_offer_selection(session, history.jan)
+    offers = tuple(_hydrate_offer_display(offer, manual_selection) for offer in run.offers)
 
     def offer_sort_key(offer: ProductOffer) -> tuple[int, Decimal, int, int]:
         stock_rank = 1 if offer.stock_status == "out_of_stock" else 0
@@ -905,6 +950,7 @@ def build_lookup_view(session: Session, history_id: int) -> PriceLookupView:
         comparison_status=comparison,
         providers_all_failed=providers_all_failed,
         providers_partial_failed=providers_partial_failed,
+        manual_selection=manual_selection,
     )
 
 

@@ -31,7 +31,7 @@ from app.models import (
     ProductEnrichmentSource, ProductEnrichmentTask, ProductMatchLog,
     ProductOffer, ProductOperationLog, ProductTranslationCache, ReceiptItem,
 )
-from app.price_service import MULTIPACK_PATTERN
+from app.price_service import MULTIPACK_PATTERN, get_manual_offer_selection
 from app.product_identity import assert_jan_available, format_product_display_name, normalize_product_name_whitespace
 from app.product_matching import validate_jan
 from app.product_specs import parse_product_specs
@@ -357,6 +357,19 @@ def _field_purchase_price_for_task(session: Session, task: ProductEnrichmentTask
 def _reference_price_for_task(session: Session, task: ProductEnrichmentTask) -> tuple[int | None, dict[str, object] | None]:
     from app.price_service import online_reference_price_from_offers, offer_reference_price
 
+    manual_selection = get_manual_offer_selection(session, task.jan)
+    if manual_selection is not None:
+        manual_price = manual_selection.total_price if manual_selection.total_price is not None else manual_selection.item_price
+        if manual_price is not None and manual_price > 0:
+            # Same rule as the candidate override above: a manual pick always
+            # wins, and its price comes from that ONE offer, never an average
+            # across several -- otherwise "same offer for image+price+source"
+            # would be violated the moment a manual pick existed.
+            return manual_price, {
+                "source": "manual_selection", "computed_at": datetime.now(timezone.utc).isoformat(),
+                "provider_code": manual_selection.provider_code, "url": manual_selection.url,
+            }
+
     source_rows = list(session.scalars(select(ProductEnrichmentSource).where(
         ProductEnrichmentSource.task_id == task.id,
         ProductEnrichmentSource.source_type == "price_lookup",
@@ -590,12 +603,29 @@ def aggregate_candidates(session: Session, task: ProductEnrichmentTask, run: Pri
         session.add(candidate)
     session.flush()
     if candidates:
-        def selection_priority(item: ProductEnrichmentCandidate):
-            source_text = f"{item.name_ja or ''} {item.source_url}".casefold()
-            official = any(marker in source_text for marker in ("公式", "official", (item.brand or "").casefold(), (item.manufacturer or "").casefold()) if marker)
-            repeated_image = bool(item.image_url and image_counts.get(item.image_url, 0) > 1)
-            return -_candidate_field_rank(item, "name"), official, repeated_image, item.score, bool(item.image_url), item.total_price is not None, -item.id
-        selected = max(candidates, key=selection_priority)
+        manual_selection = get_manual_offer_selection(session, task.jan)
+        manual_candidate = None
+        if manual_selection is not None:
+            manual_candidate = next(
+                (
+                    item for item in candidates
+                    if item.platform == manual_selection.provider_code and item.source_url == manual_selection.url
+                ),
+                None,
+            )
+        if manual_candidate is not None:
+            # A user manually pinned this exact offer (see price_check_result.html) --
+            # that always wins over the automatic ranking below. The ranking itself
+            # is untouched and still runs (and still applies) whenever no manual pin
+            # exists or the pinned offer isn't among this run's candidates.
+            selected = manual_candidate
+        else:
+            def selection_priority(item: ProductEnrichmentCandidate):
+                source_text = f"{item.name_ja or ''} {item.source_url}".casefold()
+                official = any(marker in source_text for marker in ("公式", "official", (item.brand or "").casefold(), (item.manufacturer or "").casefold()) if marker)
+                repeated_image = bool(item.image_url and image_counts.get(item.image_url, 0) > 1)
+                return -_candidate_field_rank(item, "name"), official, repeated_image, item.score, bool(item.image_url), item.total_price is not None, -item.id
+            selected = max(candidates, key=selection_priority)
         selected.selected = True
         warnings = _json_list(task.warnings_json)
         for warning in _json_list(selected.warnings_json):
@@ -1053,14 +1083,21 @@ def download_best_main_image(
     candidates: list[ProductEnrichmentCandidate],
     *,
     client: Any | None = None,
+    pinned_candidate: ProductEnrichmentCandidate | None = None,
 ) -> dict[str, Any] | None:
     best: dict[str, Any] | None = None
     best_candidate: ProductEnrichmentCandidate | None = None
     last_status = "missing"
-    ordered = sorted(
-        candidates,
-        key=lambda item: (_candidate_field_rank(item, "image"), -item.score, item.id or 0),
-    )
+    if pinned_candidate is not None:
+        # A manual selection is active for this JAN: the image must come from
+        # that SAME offer or not at all -- never fall back to a different
+        # candidate's (better-ranked) image, which would silently mix sources.
+        ordered = [pinned_candidate]
+    else:
+        ordered = sorted(
+            candidates,
+            key=lambda item: (_candidate_field_rank(item, "image"), -item.score, item.id or 0),
+        )
     for candidate in ordered[:8]:
         image = download_main_image(task, candidate, client=client)
         if task.image_status:
@@ -1541,6 +1578,12 @@ def process_enrichment_task(
             session.commit()
             return task
         selected = next(item for item in candidates if item.selected)
+        manual_selection = get_manual_offer_selection(session, task.jan)
+        manual_pin_active = bool(
+            manual_selection is not None
+            and selected.platform == manual_selection.provider_code
+            and selected.source_url == manual_selection.url
+        )
         for warning in _json_list(selected.warnings_json):
             if warning not in warnings:
                 warnings.append(warning)
@@ -1559,7 +1602,10 @@ def process_enrichment_task(
         image = previous_payload.get("local_image") if task.image_status == "completed" else None
         if settings.image_download_enabled:
             if image is None:
-                image = download_best_main_image(task, candidates, client=image_client)
+                image = download_best_main_image(
+                    task, candidates, client=image_client,
+                    pinned_candidate=selected if manual_pin_active else None,
+                )
             if image is None and selected.image_url:
                 warnings.append("主图下载失败，已保留远程 URL")
         else:
