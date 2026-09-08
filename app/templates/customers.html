@@ -1,7 +1,21 @@
 {% extends "base.html" %}
 {% block title %}客户管理{% endblock %}
 {% block content %}
-<div class="section-head"><h1>客户管理</h1></div>
+<div class="section-head"><h1>客户管理</h1><button type="button" class="compact" id="customerAddToggle">+ 新增客户</button></div>
+<section class="card" id="customerAddForm" hidden>
+  <h2>新增客户</h2>
+  <div class="form-grid">
+    <label>客户姓名（必填）<input id="newCustomerName" maxlength="255"></label>
+    <label>客户电话（可空）<input id="newCustomerPhone" maxlength="50" inputmode="tel"></label>
+    <label>微信名（可空）<input id="newCustomerWechat" maxlength="128"></label>
+    <label class="full">收货地址（可空，可稍后在客户详情中管理）<input id="newCustomerAddress" maxlength="500"></label>
+  </div>
+  <div class="button-row">
+    <button type="button" id="customerAddSave">保存</button>
+    <button type="button" class="secondary" id="customerAddCancel">取消</button>
+  </div>
+  <p id="customerAddError" class="error" hidden></p>
+</section>
 <section class="card so-filter-card"><form class="so-filter" method="get">
   <div class="so-filter-quick-row">
     <input type="search" name="q" value="{{ q }}" placeholder="搜索客户姓名 / 电话 / 微信名" aria-label="搜索客户">
@@ -23,4 +37,35 @@
   </div>
   {% else %}<section class="card empty-state">暂无客户。</section>{% endfor %}
 </section>
+<script>
+(() => {
+  const toggle = document.querySelector('#customerAddToggle');
+  const form = document.querySelector('#customerAddForm');
+  const error = document.querySelector('#customerAddError');
+  toggle.addEventListener('click', () => { form.hidden = !form.hidden; error.hidden = true; });
+  document.querySelector('#customerAddCancel').addEventListener('click', () => { form.hidden = true; error.hidden = true; });
+  document.querySelector('#customerAddSave').addEventListener('click', async () => {
+    const name = document.querySelector('#newCustomerName').value.trim();
+    error.hidden = true;
+    if (!name) { error.textContent = '客户姓名不能为空'; error.hidden = false; return; }
+    const payload = {
+      name,
+      phone: document.querySelector('#newCustomerPhone').value.trim() || null,
+      wechat_name: document.querySelector('#newCustomerWechat').value.trim() || null,
+      address: document.querySelector('#newCustomerAddress').value.trim() || null,
+    };
+    try {
+      const response = await fetch('/api/customers', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload),
+      });
+      const data = await response.json().catch(() => null);
+      if (!response.ok) { error.textContent = (data && data.detail) || '保存失败'; error.hidden = false; return; }
+      window.location.href = `/customers/${data.id}`;
+    } catch (_) {
+      error.textContent = '保存失败，请检查网络后重试';
+      error.hidden = false;
+    }
+  });
+})();
+</script>
 {% endblock %}

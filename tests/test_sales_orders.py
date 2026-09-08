@@ -1061,15 +1061,15 @@ def test_ship_date_filter_matches_any_shipment_in_range(client):
     order_shipped_today = ship_full(db, order_shipped_today)
     order_not_shipped = simple_order(db, name_suffix="ship-date-2")
 
-    # The filter interprets shipped_date_from/to as a Tokyo-local calendar
-    # day (matching the rest of this app's date conventions -- see TOKYO in
+    # The filter interprets date_from/to as a Tokyo-local calendar day
+    # (matching the rest of this app's date conventions -- see TOKYO in
     # sales_order_service.py), not the test runner's own local/UTC date.
     # Tokyo is UTC+9, so date.today() drifts a day behind Tokyo's date for
     # roughly 9 hours out of every UTC day; using it here made this test
     # fail whenever it happened to run during that window.
     today = datetime.now(timezone.utc).astimezone(TOKYO).date()
     filtered = http.get("/sales-orders", params={
-        "shipped_date_from": today.isoformat(), "shipped_date_to": today.isoformat(),
+        "date_type": "shipment_date", "date_from": today.isoformat(), "date_to": today.isoformat(),
     })
     assert filtered.status_code == 200
     assert "状态测试商品ship-date-1" in filtered.text
@@ -1091,12 +1091,12 @@ def test_ship_date_filter_uses_tokyo_calendar_day_not_utc_date(client):
     db.commit()
 
     same_utc_date = http.get("/sales-orders", params={
-        "shipped_date_from": "2026-01-01", "shipped_date_to": "2026-01-01",
+        "date_type": "shipment_date", "date_from": "2026-01-01", "date_to": "2026-01-01",
     })
     assert "状态测试商品ship-date-tz" not in same_utc_date.text
 
     correct_tokyo_date = http.get("/sales-orders", params={
-        "shipped_date_from": "2026-01-02", "shipped_date_to": "2026-01-02",
+        "date_type": "shipment_date", "date_from": "2026-01-02", "date_to": "2026-01-02",
     })
     assert "状态测试商品ship-date-tz" in correct_tokyo_date.text
 
@@ -1106,8 +1106,161 @@ def test_ship_date_filter_excludes_out_of_range_shipments(client):
     order = simple_order(db, name_suffix="ship-date-3")
     order = ship_full(db, order)
     future = (date.today() + timedelta(days=5)).isoformat()
-    filtered = http.get("/sales-orders", params={"shipped_date_from": future})
+    filtered = http.get("/sales-orders", params={"date_type": "shipment_date", "date_from": future})
     assert "状态测试商品ship-date-3" not in filtered.text
+
+
+# ---------------- unified date-type filter ----------------
+
+
+def _order_with_date(db, buyer, name, order_date):
+    salesperson = ensure_default_salesperson(db)
+    return create_sales_order(
+        db, customer_id=buyer.id, salesperson_id=salesperson.id,
+        items=[SalesOrderItemInput(product_id=None, manual_name=name, jan=None, quantity=1, unit_sale_price=Decimal("100"))],
+        shipping_address="日期筛选测试地址", order_date=order_date,
+    )
+
+
+def test_new_order_filter_defaults_to_order_date(client):
+    http, db, _ = client
+    buyer = customer(db, "下单日默认客户")
+    _order_with_date(db, buyer, "范围内下单商品", datetime(2026, 3, 5, 3, 0, tzinfo=timezone.utc))
+    _order_with_date(db, buyer, "范围外下单商品", datetime(2026, 4, 5, 3, 0, tzinfo=timezone.utc))
+
+    response = http.get("/sales-orders", params={
+        "status": "submitted", "date_from": "2026-03-01", "date_to": "2026-03-10",
+    })
+    assert response.status_code == 200
+    assert "范围内下单商品" in response.text
+    assert "范围外下单商品" not in response.text
+    assert '<option value="order_date" selected>' in response.text
+
+
+def test_awaiting_shipment_paid_filter_defaults_to_order_date(client):
+    http, db, _ = client
+    buyer = customer(db, "待发货默认客户")
+    in_range = _order_with_date(db, buyer, "待发货范围内商品", datetime(2026, 3, 5, 3, 0, tzinfo=timezone.utc))
+    out_range = _order_with_date(db, buyer, "待发货范围外商品", datetime(2026, 4, 5, 3, 0, tzinfo=timezone.utc))
+    pay(db, in_range)
+    pay(db, out_range)
+
+    response = http.get("/sales-orders", params={
+        "status": "paid", "date_from": "2026-03-01", "date_to": "2026-03-10",
+    })
+    assert response.status_code == 200
+    assert "待发货范围内商品" in response.text
+    assert "待发货范围外商品" not in response.text
+    assert '<option value="order_date" selected>' in response.text
+
+
+def test_partially_shipped_filter_defaults_to_shipment_date(client):
+    http, db, _ = client
+    order = two_item_paid_order(db)
+    item_a, item_b, item_c = order.items
+    shipment = create_shipment(db, order.id, item_quantities=[(item_a.id, 1)])
+    add_shipping_label(db, shipment.id, content=shipping_label_jpeg_bytes(), original_filename="partial.jpg")
+    mark_shipment_shipped(db, shipment.id)
+    shipment.shipped_at = datetime(2026, 5, 1, 3, 0, tzinfo=timezone.utc)
+    # order_date stays "now" (outside the 2026-05 window below) -- only
+    # shipment_date should be able to find this order, proving the default
+    # for this status is genuinely shipment_date, not a no-op filter.
+    db.commit()
+    assert get_sales_order(db, order.id).status == "partially_shipped"
+
+    response = http.get("/sales-orders", params={
+        "status": "partially_shipped", "date_from": "2026-05-01", "date_to": "2026-05-01",
+    })
+    assert response.status_code == 200
+    assert "商品A" in response.text
+    assert '<option value="shipment_date" selected>' in response.text
+
+
+def test_shipped_filter_defaults_to_shipment_date(client):
+    http, db, _ = client
+    order = simple_order(db, name_suffix="shipdate-default")
+    order = ship_full(db, order)
+    order.shipments[0].shipped_at = datetime(2026, 5, 2, 3, 0, tzinfo=timezone.utc)
+    order.order_date = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    db.commit()
+
+    matching = http.get("/sales-orders", params={
+        "status": "shipped", "date_from": "2026-05-02", "date_to": "2026-05-02",
+    })
+    assert "状态测试商品shipdate-default" in matching.text
+    assert '<option value="shipment_date" selected>' in matching.text
+
+    not_matching_by_order_date = http.get("/sales-orders", params={
+        "status": "shipped", "date_from": "2026-01-01", "date_to": "2026-01-01",
+    })
+    assert "状态测试商品shipdate-default" not in not_matching_by_order_date.text
+
+
+def test_completed_filter_defaults_to_shipment_date(client):
+    http, db, _ = client
+    order = simple_order(db, name_suffix="completed-default")
+    order = ship_full(db, order)
+    order.shipments[0].shipped_at = datetime(2026, 5, 3, 3, 0, tzinfo=timezone.utc)
+    db.commit()
+    update_sales_order_status(db, order.id, "completed")
+
+    response = http.get("/sales-orders", params={
+        "status": "completed", "date_from": "2026-05-03", "date_to": "2026-05-03",
+    })
+    assert response.status_code == 200
+    assert "状态测试商品completed-default" in response.text
+    assert '<option value="shipment_date" selected>' in response.text
+
+
+def test_cancelled_filter_defaults_to_order_date(client):
+    http, db, _ = client
+    buyer = customer(db, "已取消默认客户")
+    order = _order_with_date(db, buyer, "已取消范围内商品", datetime(2026, 3, 5, 3, 0, tzinfo=timezone.utc))
+    update_sales_order_status(db, order.id, "cancelled")
+
+    response = http.get("/sales-orders", params={
+        "status": "cancelled", "date_from": "2026-03-01", "date_to": "2026-03-10",
+    })
+    assert response.status_code == 200
+    assert "已取消范围内商品" in response.text
+    assert '<option value="order_date" selected>' in response.text
+
+
+def test_manual_date_type_override_takes_priority_over_status_default(client):
+    http, db, _ = client
+    order = simple_order(db, name_suffix="manual-override")
+    order = ship_full(db, order)
+    order.order_date = datetime(2026, 6, 1, tzinfo=timezone.utc)
+    order.shipments[0].shipped_at = datetime(2026, 7, 1, tzinfo=timezone.utc)
+    db.commit()
+
+    # status=shipped defaults to shipment_date, but the user explicitly
+    # picks order_date instead -- the explicit choice must win.
+    response = http.get("/sales-orders", params={
+        "status": "shipped", "date_type": "order_date", "date_from": "2026-06-01", "date_to": "2026-06-01",
+    })
+    assert response.status_code == 200
+    assert "状态测试商品manual-override" in response.text
+    assert '<option value="order_date" selected>' in response.text
+
+
+def test_date_filter_query_params_survive_refresh(client):
+    http, _, _ = client
+    response = http.get("/sales-orders", params={
+        "status": "shipped", "date_type": "order_date", "date_from": "2026-06-01", "date_to": "2026-06-10",
+    })
+    assert response.status_code == 200
+    assert 'name="date_from" value="2026-06-01"' in response.text
+    assert 'name="date_to" value="2026-06-10"' in response.text
+    assert '<option value="order_date" selected>' in response.text
+    # Only one date filter block now -- the old dual-block UI is gone.
+    assert response.text.count('class="so-filter-more') == 1
+
+
+def test_new_order_filter_defaults_to_order_date_for_all_tab(client):
+    http, _, _ = client
+    response = http.get("/sales-orders")
+    assert '<option value="order_date" selected>' in response.text
 
 
 def test_new_order_shows_product_image_or_placeholder(client):
@@ -1734,6 +1887,53 @@ def test_customers_list_page_has_add_address_quick_entry(client):
     assert "+ 新增地址" in response.text
     assert f'href="/customers/{row.id}"' in response.text
     assert "管理地址" in response.text
+
+
+def test_sales_orders_page_has_customer_management_entry(client):
+    http, _, _ = client
+    response = http.get("/sales-orders")
+    assert response.status_code == 200
+    assert 'href="/customers">客户管理' in response.text
+
+
+def test_customers_page_has_add_customer_entry_reusing_existing_api(client):
+    http, _, _ = client
+    response = http.get("/customers")
+    assert response.status_code == 200
+    assert "+ 新增客户" in response.text
+    assert 'id="customerAddToggle"' in response.text
+    # Reuses the existing /api/customers creation endpoint -- no parallel
+    # customer-creation route was added for this button.
+    assert "/api/customers" in response.text
+
+
+def test_customer_list_is_sorted_by_name_az_not_created_at(client):
+    http, db, _ = client
+    # Created out of alphabetical order and in reverse-chronological updated_at
+    # order, so a created_at/updated_at sort would produce a different order.
+    customer(db, "赵六", phone="13800000010")
+    customer(db, "Alice", phone="13800000011")
+    customer(db, "钱七", phone="13800000012")
+    customer(db, "bob", phone="13800000013")
+
+    response = http.get("/customers")
+    assert response.status_code == 200
+    names = ["赵六", "Alice", "钱七", "bob"]
+    positions = {name: response.text.index(name) for name in names}
+    ordered = sorted(positions, key=lambda name: positions[name])
+    # Alice/bob (case-insensitive A-Z) before 钱七 (qian) before 赵六 (zhao).
+    assert ordered == ["Alice", "bob", "钱七", "赵六"]
+
+
+def test_customer_sort_key_is_stable_and_case_insensitive(db_session):
+    from app.sales_order_service import customer_name_sort_key
+
+    upper = customer(db_session, "Bob")
+    lower = customer(db_session, "bob")
+    assert customer_name_sort_key(upper)[0] == customer_name_sort_key(lower)[0]
+    ordered = sorted([lower, upper], key=customer_name_sort_key)
+    # Stable sort: equal keys keep their original relative order.
+    assert ordered == [lower, upper]
 
 
 def test_customer_detail_page_loads_with_open_address_form_param(client):

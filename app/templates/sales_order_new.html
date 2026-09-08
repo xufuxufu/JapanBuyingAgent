@@ -43,7 +43,7 @@
   {% endif %}
 
   <section class="card">
-    <h2>客户</h2>
+    <h2>客户资料一览</h2>
     <div id="customerPicked"{% if not order %} hidden{% endif %}><p><strong id="customerPickedName">{{ order.customer.name if order else '' }}</strong> <button type="button" class="link-button" id="customerChange">更换</button></p><p class="muted" id="customerPickedMeta"></p>
       <div id="customerAddressPicker" class="stack"></div>
     </div>

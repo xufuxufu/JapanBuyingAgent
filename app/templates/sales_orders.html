@@ -1,7 +1,7 @@
 {% extends "base.html" %}
 {% block title %}微信订单{% endblock %}
 {% block content %}
-<div class="so-page-header"><h1>微信订单</h1><div class="so-page-header-actions"><a class="button secondary compact" href="/domestic-logistics">国内物流</a><a class="button compact" href="/sales-orders/new">+ 新建订单</a></div></div>
+<div class="so-page-header"><h1>微信订单</h1><div class="so-page-header-actions"><a class="button secondary compact" href="/customers">客户管理</a><a class="button secondary compact" href="/domestic-logistics">国内物流</a><a class="button compact" href="/sales-orders/new">+ 新建订单</a></div></div>
 <p class="muted so-page-sub">记录客户通过微信提出的购买需求；不代表库存、采购或发货已经处理。</p>
 
 <nav class="so-tabs" aria-label="订单状态">
@@ -17,24 +17,18 @@
     <input type="search" name="q" value="{{ q }}" placeholder="搜索客户姓名或订单号" aria-label="客户 / 订单号">
     <button type="submit" class="compact">搜索</button>
   </div>
-  <div class="so-filter-date-group">
-    <details class="so-filter-more"{% if date_from or date_to %} open{% endif %}>
-      <summary>按下单日期筛选{% if date_from or date_to %}（已设置）{% endif %}</summary>
-      <div class="so-filter-dates">
-        <label>下单日期起<input type="date" name="date_from" value="{{ date_from }}"></label>
-        <label>下单日期止<input type="date" name="date_to" value="{{ date_to }}"></label>
-      </div>
-      <button type="submit" class="compact">应用筛选</button>
-    </details>
-    <details class="so-filter-more"{% if shipped_date_from or shipped_date_to %} open{% endif %}>
-      <summary>按发货日筛选{% if shipped_date_from or shipped_date_to %}（已设置）{% endif %}</summary>
-      <div class="so-filter-dates">
-        <label>发货日期起<input type="date" name="shipped_date_from" value="{{ shipped_date_from }}"></label>
-        <label>发货日期止<input type="date" name="shipped_date_to" value="{{ shipped_date_to }}"></label>
-      </div>
-      <button type="submit" class="compact">应用筛选</button>
-    </details>
-  </div>
+  <details class="so-filter-more so-filter-date-single"{% if date_from or date_to %} open{% endif %}>
+    <summary>按{{ '发货日' if date_type == 'shipment_date' else '下单日' }}筛选{% if date_from or date_to %}（已设置）{% endif %}</summary>
+    <div class="so-filter-dates">
+      <label>日期类型<select name="date_type">
+        <option value="order_date"{% if date_type != 'shipment_date' %} selected{% endif %}>下单日</option>
+        <option value="shipment_date"{% if date_type == 'shipment_date' %} selected{% endif %}>发货日</option>
+      </select></label>
+      <label>开始日期<input type="date" name="date_from" value="{{ date_from }}"></label>
+      <label>结束日期<input type="date" name="date_to" value="{{ date_to }}"></label>
+    </div>
+    <button type="submit" class="compact">应用筛选</button>
+  </details>
 </form></section>
 
 <section class="so-list">

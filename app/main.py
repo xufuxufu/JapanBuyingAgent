@@ -151,14 +151,15 @@ from app.restock_service import (
     update_restock_list_status,
 )
 from app.sales_order_service import (
-    ADDRESS_EDITABLE_STATUSES, ALLOWED_TRANSITIONS, ITEM_EDITABLE_STATUSES, ITEM_LOCKED_MESSAGE,
+    ADDRESS_EDITABLE_STATUSES, ALLOWED_TRANSITIONS, DATE_FILTER_TYPES, ITEM_EDITABLE_STATUSES, ITEM_LOCKED_MESSAGE,
     PRIMARY_NEXT_ACTION, SHIPPING_LABEL_DELETABLE_STATUSES, SHIPPING_LABEL_UPLOADABLE_STATUSES,
     STATUS_LABELS as SALES_ORDER_STATUS_CN,
     DuplicateAddressError, SalesOrderItemInput, add_customer_address, add_shipping_label,
-    create_customer, create_shipment,
+    create_customer, create_shipment, default_date_filter_type,
     create_sales_order, delete_customer_address, ensure_default_salesperson, get_sales_order,
     get_shipping_label,
-    last_sale_price_for_product, list_customer_addresses, list_sales_orders,
+    last_sale_price_for_product, list_customer_addresses, list_customers_sorted_by_name, list_sales_orders,
+    customer_name_sort_key,
     list_salespersons, mark_shipment_shipped, remove_shipping_label, search_customers,
     search_products as search_sales_order_products, suggest_order_no,
     status_counts as sales_order_status_counts, update_customer_address, update_sales_order,
@@ -3609,9 +3610,7 @@ def api_delete_customer_address(address_id: int, db: Session = Depends(get_db)):
 
 @app.get("/customers", response_class=HTMLResponse)
 def customers_page(request: Request, q: str = Query(""), db: Session = Depends(get_db)):
-    rows = search_customers(db, q, limit=200) if q else list(db.scalars(
-        select(Customer).order_by(Customer.updated_at.desc(), Customer.id.desc()).limit(200)
-    ))
+    rows = sorted(search_customers(db, q, limit=200), key=customer_name_sort_key) if q else list_customers_sorted_by_name(db, limit=200)
     return templates.TemplateResponse(request, "customers.html", {"rows": rows, "q": q})
 
 
@@ -3630,22 +3629,21 @@ SALES_ORDER_TAB_STATUSES = ("submitted", "paid", "partially_shipped", "shipped",
 @app.get("/sales-orders", response_class=HTMLResponse)
 def sales_orders_page(
     request: Request, status: str = Query(""), q: str = Query(""),
-    date_from: str = Query(""), date_to: str = Query(""),
-    shipped_date_from: str = Query(""), shipped_date_to: str = Query(""), db: Session = Depends(get_db),
+    date_type: str = Query(""), date_from: str = Query(""), date_to: str = Query(""),
+    db: Session = Depends(get_db),
 ):
+    effective_date_type = date_type if date_type in DATE_FILTER_TYPES else default_date_filter_type(status)
     parsed_from = date.fromisoformat(date_from) if date_from else None
     parsed_to = date.fromisoformat(date_to) if date_to else None
-    parsed_shipped_from = date.fromisoformat(shipped_date_from) if shipped_date_from else None
-    parsed_shipped_to = date.fromisoformat(shipped_date_to) if shipped_date_to else None
     rows = list_sales_orders(
-        db, status=status or None, q=q or None, date_from=parsed_from, date_to=parsed_to,
-        shipped_date_from=parsed_shipped_from, shipped_date_to=parsed_shipped_to,
+        db, status=status or None, q=q or None,
+        date_type=effective_date_type, date_from=parsed_from, date_to=parsed_to,
     )
     counts = sales_order_status_counts(db)
     tabs = [(value, SALES_ORDER_STATUS_CN[value], counts.get(value, 0)) for value in SALES_ORDER_TAB_STATUSES]
     return templates.TemplateResponse(request, "sales_orders.html", {
-        "rows": rows, "status": status, "q": q, "date_from": date_from, "date_to": date_to,
-        "shipped_date_from": shipped_date_from, "shipped_date_to": shipped_date_to,
+        "rows": rows, "status": status, "q": q,
+        "date_type": effective_date_type, "date_from": date_from, "date_to": date_to,
         "status_labels": SALES_ORDER_STATUS_CN, "tabs": tabs, "total_count": sum(counts.values()),
         "primary_next_action": PRIMARY_NEXT_ACTION,
     })

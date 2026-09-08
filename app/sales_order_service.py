@@ -112,6 +112,22 @@ def search_customers(session: Session, q: str, *, limit: int = 20) -> list[Custo
     return list(session.scalars(query.order_by(Customer.updated_at.desc(), Customer.id.desc()).limit(limit)))
 
 
+def customer_name_sort_key(customer: Customer) -> tuple[str, str]:
+    """A-Z sort key for the customer management list: Chinese names sort by
+    pinyin, English/ASCII names sort case-insensitively -- both via the same
+    key, since pypinyin passes non-Chinese characters through unchanged.
+    The raw (casefolded) name is a stable tiebreaker for equal pinyin."""
+    from pypinyin import lazy_pinyin
+
+    name = (customer.name or "").strip()
+    return ("".join(lazy_pinyin(name)).casefold(), name.casefold())
+
+
+def list_customers_sorted_by_name(session: Session, *, limit: int = 200) -> list[Customer]:
+    rows = list(session.scalars(select(Customer).limit(limit)))
+    return sorted(rows, key=customer_name_sort_key)
+
+
 def create_customer(
     session: Session, *, name: str, phone: str | None = None, wechat_name: str | None = None,
     note: str | None = None, recipient_name: str | None = None, recipient_phone: str | None = None,
@@ -561,10 +577,25 @@ def get_sales_order(session: Session, order_id: int) -> SalesOrder | None:
     )
 
 
+DATE_FILTER_TYPES = {"order_date", "shipment_date"}
+
+# Which date field a status tab should filter by default when the user hasn't
+# explicitly picked one: new/awaiting-shipment orders are tracked by when they
+# were placed, shipped/completed orders by when they actually went out.
+DATE_FILTER_DEFAULT_BY_STATUS = {
+    "submitted": "order_date", "paid": "order_date",
+    "partially_shipped": "shipment_date", "shipped": "shipment_date", "completed": "shipment_date",
+    "cancelled": "order_date",
+}
+
+
+def default_date_filter_type(status: str | None) -> str:
+    return DATE_FILTER_DEFAULT_BY_STATUS.get(status or "", "order_date")
+
+
 def list_sales_orders(
     session: Session, *, status: str | None = None, q: str | None = None,
-    date_from: date | None = None, date_to: date | None = None,
-    shipped_date_from: date | None = None, shipped_date_to: date | None = None,
+    date_type: str = "order_date", date_from: date | None = None, date_to: date | None = None,
 ) -> list[SalesOrder]:
     query = select(SalesOrder).options(
         selectinload(SalesOrder.customer), selectinload(SalesOrder.salesperson),
@@ -579,25 +610,27 @@ def list_sales_orders(
         query = query.join(Customer, Customer.id == SalesOrder.customer_id).where(
             or_(SalesOrder.order_no.like(like), Customer.name.like(like)),
         )
-    if date_from is not None:
-        query = query.where(SalesOrder.order_date >= datetime.combine(date_from, time.min, timezone.utc))
-    if date_to is not None:
-        query = query.where(SalesOrder.order_date <= datetime.combine(date_to, time.max, timezone.utc))
-    if shipped_date_from is not None or shipped_date_to is not None:
-        # Matches if ANY of the order's shipments has shipped_at in range --
-        # explicitly NOT a stand-in using order created_at/order_date. The
-        # picker's date is a Tokyo-local calendar day (matching how the rest
-        # of the UI displays dates via tokyo_datetime); shipped_at is stored
-        # as naive UTC (SQLite has no real tz-aware column), so the bound is
-        # converted Tokyo -> UTC and stripped of tzinfo before comparing.
-        shipment_filter = SalesShipment.sales_order_id == SalesOrder.id
-        if shipped_date_from is not None:
-            start = datetime.combine(shipped_date_from, time.min, TOKYO).astimezone(timezone.utc).replace(tzinfo=None)
-            shipment_filter = shipment_filter & (SalesShipment.shipped_at >= start)
-        if shipped_date_to is not None:
-            end = datetime.combine(shipped_date_to, time.max, TOKYO).astimezone(timezone.utc).replace(tzinfo=None)
-            shipment_filter = shipment_filter & (SalesShipment.shipped_at <= end)
-        query = query.where(select(SalesShipment.id).where(shipment_filter).exists())
+    if date_type == "shipment_date":
+        if date_from is not None or date_to is not None:
+            # Matches if ANY of the order's shipments has shipped_at in range --
+            # explicitly NOT a stand-in using order created_at/order_date. The
+            # picker's date is a Tokyo-local calendar day (matching how the rest
+            # of the UI displays dates via tokyo_datetime); shipped_at is stored
+            # as naive UTC (SQLite has no real tz-aware column), so the bound is
+            # converted Tokyo -> UTC and stripped of tzinfo before comparing.
+            shipment_filter = SalesShipment.sales_order_id == SalesOrder.id
+            if date_from is not None:
+                start = datetime.combine(date_from, time.min, TOKYO).astimezone(timezone.utc).replace(tzinfo=None)
+                shipment_filter = shipment_filter & (SalesShipment.shipped_at >= start)
+            if date_to is not None:
+                end = datetime.combine(date_to, time.max, TOKYO).astimezone(timezone.utc).replace(tzinfo=None)
+                shipment_filter = shipment_filter & (SalesShipment.shipped_at <= end)
+            query = query.where(select(SalesShipment.id).where(shipment_filter).exists())
+    else:
+        if date_from is not None:
+            query = query.where(SalesOrder.order_date >= datetime.combine(date_from, time.min, timezone.utc))
+        if date_to is not None:
+            query = query.where(SalesOrder.order_date <= datetime.combine(date_to, time.max, timezone.utc))
     return list(session.scalars(query.order_by(SalesOrder.created_at.desc(), SalesOrder.id.desc())))
 
 
