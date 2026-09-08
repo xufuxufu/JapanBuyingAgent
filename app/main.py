@@ -152,8 +152,8 @@ from app.restock_service import (
 )
 from app.sales_order_service import (
     ADDRESS_EDITABLE_STATUSES, ALLOWED_TRANSITIONS, DATE_FILTER_TYPES, ITEM_EDITABLE_STATUSES, ITEM_LOCKED_MESSAGE,
-    PRIMARY_NEXT_ACTION, SHIPPING_LABEL_DELETABLE_STATUSES, SHIPPING_LABEL_UPLOADABLE_STATUSES,
-    STATUS_LABELS as SALES_ORDER_STATUS_CN,
+    PRIMARY_NEXT_ACTION, RETURN_ALLOWED_TRANSITIONS, SHIPPING_LABEL_DELETABLE_STATUSES, SHIPPING_LABEL_UPLOADABLE_STATUSES,
+    STATUS_LABELS as SALES_ORDER_STATUS_CN, RETURN_STATUS_LABELS as SALES_ORDER_RETURN_STATUS_CN,
     DuplicateAddressError, SalesOrderItemInput, add_customer_address, add_shipping_label,
     create_customer, create_shipment, default_date_filter_type,
     create_sales_order, delete_customer_address, ensure_default_salesperson, get_sales_order,
@@ -163,7 +163,7 @@ from app.sales_order_service import (
     list_salespersons, mark_shipment_shipped, remove_shipping_label, search_customers,
     search_products as search_sales_order_products, suggest_order_no,
     status_counts as sales_order_status_counts, update_customer_address, update_sales_order,
-    update_sales_order_address, update_sales_order_status, update_shipment_tracking,
+    update_sales_order_address, update_sales_order_return_status, update_sales_order_status, update_shipment_tracking,
 )
 from app.sales_order_shipping import resolve_shipping_label_path, resolve_sales_order_item_image_path
 from app.kuaidi100_tracking_client import TRACKING_STATUS_LABELS
@@ -3645,7 +3645,7 @@ def sales_orders_page(
         "rows": rows, "status": status, "q": q,
         "date_type": effective_date_type, "date_from": date_from, "date_to": date_to,
         "status_labels": SALES_ORDER_STATUS_CN, "tabs": tabs, "total_count": sum(counts.values()),
-        "primary_next_action": PRIMARY_NEXT_ACTION,
+        "primary_next_action": PRIMARY_NEXT_ACTION, "return_status_labels": SALES_ORDER_RETURN_STATUS_CN,
     })
 
 
@@ -3794,6 +3794,8 @@ def sales_order_detail_page(order_id: int, request: Request, db: Session = Depen
         "shipping_label_uploadable_statuses": SHIPPING_LABEL_UPLOADABLE_STATUSES,
         "shipping_label_deletable_statuses": SHIPPING_LABEL_DELETABLE_STATUSES,
         "customer_addresses": list_customer_addresses(db, order.customer_id),
+        "return_status_labels": SALES_ORDER_RETURN_STATUS_CN,
+        "return_allowed_transitions": RETURN_ALLOWED_TRANSITIONS.get(order.return_status, set()),
         "error": request.query_params.get("error"),
     })
 
@@ -3802,6 +3804,19 @@ def sales_order_detail_page(order_id: int, request: Request, db: Session = Depen
 def sales_order_status_update(order_id: int, status: str = Form(...), db: Session = Depends(get_db)):
     try:
         update_sales_order_status(db, order_id, status)
+    except LookupError as exc:
+        db.rollback()
+        raise HTTPException(404, str(exc)) from exc
+    except ValueError as exc:
+        db.rollback()
+        return RedirectResponse(f"/sales-orders/{order_id}?error={quote(str(exc))}", status_code=303)
+    return RedirectResponse(f"/sales-orders/{order_id}", status_code=303)
+
+
+@app.post("/sales-orders/{order_id}/return-status")
+def sales_order_return_status_update(order_id: int, return_status: str = Form(...), db: Session = Depends(get_db)):
+    try:
+        update_sales_order_return_status(db, order_id, return_status)
     except LookupError as exc:
         db.rollback()
         raise HTTPException(404, str(exc)) from exc

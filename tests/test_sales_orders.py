@@ -15,6 +15,7 @@ from app.models import (
 )
 from app.sales_order_service import (
     ORDER_NO_DAILY_SEQUENCE_MAX,
+    RETURN_STATUS_LABELS,
     STATUS_LABELS,
     TOKYO,
     ADDRESS_EDITABLE_STATUSES, ALLOWED_TRANSITIONS, DEFAULT_SALESPERSON_NAME, ITEM_EDITABLE_STATUSES,
@@ -25,7 +26,7 @@ from app.sales_order_service import (
     get_shipping_label, last_sale_price_for_product, list_customer_addresses, list_sales_orders,
     maybe_complete_order_from_tracking, mark_shipment_shipped, remove_shipping_label, search_products,
     status_counts, update_customer_address, update_sales_order,
-    update_sales_order_address, update_sales_order_status, update_shipment_tracking,
+    update_sales_order_address, update_sales_order_return_status, update_sales_order_status, update_shipment_tracking,
     suggest_order_no,
 )
 from app.sales_order_shipping import resolve_shipping_label_path
@@ -121,6 +122,188 @@ def test_shipped_to_completed_succeeds(db_session):
     order = ship_full(db_session, order)
     updated = update_sales_order_status(db_session, order.id, "completed")
     assert updated.status == "completed"
+
+
+# ---------------- manual "标记已收货" (mark received) ----------------
+
+
+def test_shipped_order_can_be_manually_marked_received(client):
+    http, db, _ = client
+    order = simple_order(db, name_suffix="manual-receipt-1")
+    order = ship_full(db, order)
+    assert order.status == "shipped"
+
+    response = http.post(f"/sales-orders/{order.id}/status", data={"status": "completed"}, follow_redirects=False)
+    assert response.status_code == 303
+
+    reloaded = get_sales_order(db, order.id)
+    assert reloaded.status == "completed"
+
+
+def test_partially_shipped_order_cannot_be_manually_marked_received(client):
+    http, db, _ = client
+    order = two_item_paid_order(db)
+    item_a, item_b, item_c = order.items
+    shipment = create_shipment(db, order.id, item_quantities=[(item_a.id, 1)])
+    add_shipping_label(db, shipment.id, content=shipping_label_jpeg_bytes(), original_filename="partial-receipt.jpg")
+    mark_shipment_shipped(db, shipment.id)
+    reloaded = get_sales_order(db, order.id)
+    assert reloaded.status == "partially_shipped"
+
+    response = http.post(f"/sales-orders/{order.id}/status", data={"status": "completed"}, follow_redirects=False)
+    assert response.status_code == 303
+    assert response.headers["location"] == f"/sales-orders/{order.id}?error=" + urllib.parse.quote(
+        "订单当前状态为「部分发货」，不能直接变更为「已收货」",
+    )
+    assert get_sales_order(db, order.id).status == "partially_shipped"
+
+
+def test_manual_mark_received_does_not_change_shipment_tracking_fields(db_session):
+    order = simple_order(db_session, name_suffix="manual-receipt-tracking")
+    order = ship_full(db_session, order)
+    shipment = order.shipments[0]
+    shipment.tracking_status = "在途"
+    shipment.tracking_terminal = False
+    shipment.tracking_last_event_at = datetime(2026, 5, 1)
+    db_session.commit()
+
+    update_sales_order_status(db_session, order.id, "completed")
+
+    db_session.refresh(shipment)
+    assert shipment.tracking_status == "在途"
+    assert shipment.tracking_terminal is False
+    assert shipment.tracking_last_event_at == datetime(2026, 5, 1)
+    assert shipment.status == "shipped"  # JBA's own dispatch lifecycle, untouched too
+
+
+def test_order_detail_shows_manual_mark_received_with_confirm(client):
+    http, db, _ = client
+    order = simple_order(db, name_suffix="manual-receipt-ui")
+    order = ship_full(db, order)
+
+    response = http.get(f"/sales-orders/{order.id}")
+    assert response.status_code == 200
+    assert "标记已收货" in response.text
+    assert "onsubmit=\"return confirm(" in response.text
+
+
+# ---------------- minimal after-sales return status ----------------
+
+
+def test_completed_order_can_start_return(db_session):
+    order = simple_order(db_session, name_suffix="return-1")
+    order = ship_full(db_session, order)
+    update_sales_order_status(db_session, order.id, "completed")
+
+    updated = update_sales_order_return_status(db_session, order.id, "returning")
+    assert updated.return_status == "returning"
+    assert updated.status == "completed"  # main status untouched
+
+
+def test_non_completed_order_cannot_start_return(db_session):
+    order = simple_order(db_session, name_suffix="return-2")
+    order = ship_full(db_session, order)
+    assert order.status == "shipped"
+
+    with pytest.raises(ValueError, match="只有已收货订单可以开始退货"):
+        update_sales_order_return_status(db_session, order.id, "returning")
+    assert get_sales_order(db_session, order.id).return_status == "none"
+
+
+def test_partially_shipped_order_cannot_start_return(db_session):
+    order = two_item_paid_order(db_session)
+    item_a, item_b, item_c = order.items
+    shipment = create_shipment(db_session, order.id, item_quantities=[(item_a.id, 1)])
+    add_shipping_label(db_session, shipment.id, content=shipping_label_jpeg_bytes(), original_filename="return-partial.jpg")
+    mark_shipment_shipped(db_session, shipment.id)
+    assert get_sales_order(db_session, order.id).status == "partially_shipped"
+
+    with pytest.raises(ValueError, match="只有已收货订单可以开始退货"):
+        update_sales_order_return_status(db_session, order.id, "returning")
+
+
+def test_returning_can_become_returned_and_main_status_stays_completed(db_session):
+    order = simple_order(db_session, name_suffix="return-3")
+    order = ship_full(db_session, order)
+    update_sales_order_status(db_session, order.id, "completed")
+    update_sales_order_return_status(db_session, order.id, "returning")
+
+    updated = update_sales_order_return_status(db_session, order.id, "returned")
+    assert updated.return_status == "returned"
+    assert updated.status == "completed"
+
+
+def test_returned_is_terminal_and_cannot_go_back_to_returning(db_session):
+    order = simple_order(db_session, name_suffix="return-4")
+    order = ship_full(db_session, order)
+    update_sales_order_status(db_session, order.id, "completed")
+    update_sales_order_return_status(db_session, order.id, "returning")
+    update_sales_order_return_status(db_session, order.id, "returned")
+
+    with pytest.raises(ValueError, match="不能直接变更为"):
+        update_sales_order_return_status(db_session, order.id, "returning")
+
+
+def test_returning_can_be_cancelled_back_to_none(db_session):
+    order = simple_order(db_session, name_suffix="return-5")
+    order = ship_full(db_session, order)
+    update_sales_order_status(db_session, order.id, "completed")
+    update_sales_order_return_status(db_session, order.id, "returning")
+
+    updated = update_sales_order_return_status(db_session, order.id, "none")
+    assert updated.return_status == "none"
+    assert updated.status == "completed"
+
+
+def test_return_status_does_not_touch_shipment_or_tracking(db_session):
+    order = simple_order(db_session, name_suffix="return-6")
+    order = ship_full(db_session, order)
+    update_sales_order_status(db_session, order.id, "completed")
+    shipment = order.shipments[0]
+    shipment.tracking_status = "已签收"
+    shipment.tracking_terminal = True
+    db_session.commit()
+
+    update_sales_order_return_status(db_session, order.id, "returning")
+
+    db_session.refresh(shipment)
+    assert shipment.tracking_status == "已签收"
+    assert shipment.tracking_terminal is True
+    assert shipment.status == "shipped"
+
+
+def test_return_status_shown_on_detail_and_list_pages(client):
+    http, db, _ = client
+    order = simple_order(db, name_suffix="return-ui")
+    order = ship_full(db, order)
+    update_sales_order_status(db, order.id, "completed")
+    update_sales_order_return_status(db, order.id, "returning")
+
+    detail = http.get(f"/sales-orders/{order.id}")
+    assert detail.status_code == 200
+    assert "已收货 · 退货中" in detail.text
+    assert "标记已退货" in detail.text
+    assert "取消退货" in detail.text
+
+    listing = http.get("/sales-orders")
+    assert "已收货 · 退货中" in listing.text
+
+    http.post(f"/sales-orders/{order.id}/return-status", data={"return_status": "returned"}, follow_redirects=False)
+    returned_detail = http.get(f"/sales-orders/{order.id}")
+    assert "已收货 · 已退货" in returned_detail.text
+    assert "开始退货" not in returned_detail.text
+    assert "标记已退货" not in returned_detail.text
+
+
+def test_return_status_route_rejects_invalid_transition_with_error(client):
+    http, db, _ = client
+    order = simple_order(db, name_suffix="return-invalid")
+    order = ship_full(db, order)  # still "shipped", not completed
+
+    response = http.post(f"/sales-orders/{order.id}/return-status", data={"return_status": "returning"}, follow_redirects=False)
+    assert response.status_code == 303
+    assert "error=" in response.headers["location"]
+    assert get_sales_order(db, order.id).return_status == "none"
 
 
 def test_submitted_to_cancelled_succeeds(db_session):
@@ -284,7 +467,11 @@ def test_orders_with_available_actions_still_show_actions_card(client):
     update_sales_order_status(db, completed_order.id, "completed")
     completed_detail = http.get(f"/sales-orders/{completed_order.id}")
     assert "<h2>操作</h2>" in completed_detail.text
-    assert "当前状态已是流转终点" in completed_detail.text
+    # A completed order is no longer a dead end now that it can start a
+    # return -- the terminal message only reappears once return_status
+    # reaches "returned" (see test_return_status_shown_on_detail_and_list_pages).
+    assert "开始退货" in completed_detail.text
+    assert "当前状态已是流转终点" not in completed_detail.text
 
     cancelled_order = simple_order(db, name_suffix="actions-cancelled")
     cancel_sales_order(db, cancelled_order.id)

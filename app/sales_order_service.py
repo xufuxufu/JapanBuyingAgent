@@ -63,6 +63,19 @@ PRIMARY_NEXT_ACTION: dict[str, tuple[str, str]] = {
     "shipped": ("completed", "标记已收货"),
 }
 
+# Minimal after-sales status -- orthogonal to `status` (see SalesOrder.return_status).
+# No refund amount, no partial/per-item returns, no inventory/procurement/logistics
+# effects; this only records whether a completed order is in the middle of being
+# returned. "returned" is terminal; "returning" can also fall back to "none" (a
+# started-by-mistake return), which is the only reason "none" appears as a target.
+RETURN_STATUSES = {"none", "returning", "returned"}
+RETURN_STATUS_LABELS: dict[str, str] = {"none": "", "returning": "退货中", "returned": "已退货"}
+RETURN_ALLOWED_TRANSITIONS: dict[str, set[str]] = {
+    "none": {"returning"},
+    "returning": {"returned", "none"},
+    "returned": set(),
+}
+
 # Items (product/quantity/price) and the customer can only change before payment;
 # paid+ orders lock them (see ITEM_LOCKED_MESSAGE / ensure_items_editable below).
 ITEM_EDITABLE_STATUSES = {"submitted"}
@@ -666,6 +679,31 @@ def update_sales_order_status(session: Session, order_id: int, target_status: st
 
 def cancel_sales_order(session: Session, order_id: int) -> SalesOrder:
     return update_sales_order_status(session, order_id, "cancelled")
+
+
+def update_sales_order_return_status(session: Session, order_id: int, target_return_status: str) -> SalesOrder:
+    """Human-triggered after-sales transitions only. Starting a return
+    requires the order to actually be completed (already received) --
+    partially_shipped/shipped/submitted/paid/cancelled orders can never
+    have a return in progress. This never touches `status`,
+    SalesShipment/tracking fields, inventory, or procurement."""
+    if target_return_status not in RETURN_STATUSES:
+        raise ValueError(f"未知售后状态：{target_return_status}")
+    order = session.get(SalesOrder, order_id)
+    if order is None:
+        raise LookupError("订单不存在")
+    if order.return_status == target_return_status:
+        return order
+    if target_return_status == "returning" and order.status != "completed":
+        raise ValueError("只有已收货订单可以开始退货")
+    allowed = RETURN_ALLOWED_TRANSITIONS.get(order.return_status, set())
+    if target_return_status not in allowed:
+        current_label = RETURN_STATUS_LABELS.get(order.return_status) or "未退货"
+        target_label = RETURN_STATUS_LABELS.get(target_return_status) or "未退货"
+        raise ValueError(f"当前售后状态为「{current_label}」，不能直接变更为「{target_label}」")
+    order.return_status = target_return_status
+    session.commit()
+    return order
 
 
 def _generate_shipment_no(session: Session, order: SalesOrder) -> str:

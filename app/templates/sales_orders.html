@@ -37,7 +37,7 @@
     <div class="so-head">
       <h2>{{ order.customer.name }}</h2>
       <p class="muted">{{ order.order_date|tokyo_datetime }} · {{ order.order_no }} · {{ order.salesperson.name }}</p>
-      <span class="badge state-{{ order.status }}">{{ status_labels.get(order.status, order.status) }}</span>
+      <span class="badge state-{{ order.status }}">{{ status_labels.get(order.status, order.status) }}{% if order.return_status != 'none' %} · {{ return_status_labels.get(order.return_status, order.return_status) }}{% endif %}</span>
     </div>
     <div class="so-items">
       {% for item in order.items %}

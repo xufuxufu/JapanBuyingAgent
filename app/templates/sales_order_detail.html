@@ -3,7 +3,7 @@
 {% block body_class %}so-order-detail-body{% endblock %}
 {% block content %}
 <div class="so-detail-page">
-<div class="section-head"><div><h1>{{ order.order_no }}</h1><p class="muted"><span class="badge state-{{ order.status }}">{{ status_labels.get(order.status, order.status) }}</span> · 下单 {{ order.order_date|tokyo_datetime }} · 销售员 {{ order.salesperson.name }}</p></div><a class="button secondary compact" href="/sales-orders">返回列表</a></div>
+<div class="section-head"><div><h1>{{ order.order_no }}</h1><p class="muted"><span class="badge state-{{ order.status }}">{{ status_labels.get(order.status, order.status) }}{% if order.return_status != 'none' %} · {{ return_status_labels.get(order.return_status, order.return_status) }}{% endif %}</span> · 下单 {{ order.order_date|tokyo_datetime }} · 销售员 {{ order.salesperson.name }}</p></div><a class="button secondary compact" href="/sales-orders">返回列表</a></div>
 {% if error %}<div class="warning"><strong>操作失败：</strong>{{ error }}</div>{% endif %}
 {% if not item_editable and order.status not in ('completed', 'cancelled') %}<div class="badge state-paid so-lock-notice">{{ item_locked_message }}</div>{% endif %}
 
@@ -220,13 +220,22 @@
     <a class="button secondary compact" href="/sales-orders/{{ order.id }}/edit">编辑订单</a>
     {% endif %}
     {% if primary_next_action %}
-    <form method="post" action="/sales-orders/{{ order.id }}/status"><input type="hidden" name="status" value="{{ primary_next_action[0] }}"><button type="submit">{{ primary_next_action[1] }}</button></form>
+    <form method="post" action="/sales-orders/{{ order.id }}/status"{% if primary_next_action[0] == 'completed' %} onsubmit="return confirm('确认标记为已收货？此操作不会更改物流信息，适用于无运单号、自提或人工配送等物流接口无法覆盖的情况。');"{% endif %}><input type="hidden" name="status" value="{{ primary_next_action[0] }}"><button type="submit">{{ primary_next_action[1] }}</button></form>
     {% endif %}
     {% if 'cancelled' in allowed_transitions %}
     <form method="post" action="/sales-orders/{{ order.id }}/status" onsubmit="return confirm('确认取消该订单？取消后订单仍会保留，可用于后续核对。');"><input type="hidden" name="status" value="cancelled"><button type="submit" class="secondary">取消订单</button></form>
     {% endif %}
+    {% if 'returning' in return_allowed_transitions %}
+    <form method="post" action="/sales-orders/{{ order.id }}/return-status" onsubmit="return confirm('确认为该订单开始退货？不影响采购、库存或物流信息。');"><input type="hidden" name="return_status" value="returning"><button type="submit" class="secondary">开始退货</button></form>
+    {% endif %}
+    {% if 'returned' in return_allowed_transitions %}
+    <form method="post" action="/sales-orders/{{ order.id }}/return-status" onsubmit="return confirm('确认标记为已退货？');"><input type="hidden" name="return_status" value="returned"><button type="submit" class="secondary">标记已退货</button></form>
+    {% endif %}
+    {% if order.return_status == 'returning' and 'none' in return_allowed_transitions %}
+    <form method="post" action="/sales-orders/{{ order.id }}/return-status" onsubmit="return confirm('确认取消退货，恢复为未退货状态？');"><input type="hidden" name="return_status" value="none"><button type="submit" class="secondary">取消退货</button></form>
+    {% endif %}
   </div>
-  {% if not primary_next_action and order.status in ('completed', 'cancelled') %}<p class="muted">当前状态已是流转终点，无需继续操作。</p>{% endif %}
+  {% if not primary_next_action and (order.status == 'cancelled' or (order.status == 'completed' and order.return_status == 'returned')) %}<p class="muted">当前状态已是流转终点，无需继续操作。</p>{% endif %}
 </section>
 {% endif %}
 

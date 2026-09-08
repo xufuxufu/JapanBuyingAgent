@@ -9,7 +9,7 @@ from alembic import command
 from alembic.config import Config
 
 
-HEAD_REVISION = "20260905_0048"
+HEAD_REVISION = "20260908_0049"
 
 
 def test_migration_from_empty_and_repeat_safe(tmp_path, monkeypatch):
@@ -202,6 +202,52 @@ def test_0048_domestic_logistics_tracking_upgrade_downgrade_reupgrade(tmp_path, 
         tables = {row[0] for row in connection.execute("SELECT name FROM sqlite_master WHERE type='table'")}
     assert revision == (HEAD_REVISION,)
     assert "shipment_tracking_events" in tables
+
+
+def test_0049_sales_order_return_status_upgrade_and_downgrade(tmp_path, monkeypatch):
+    db_path = tmp_path / "sales-order-return-status.sqlite3"
+    monkeypatch.setenv("JBA_DATABASE_URL", f"sqlite:///{db_path.as_posix()}")
+    config = Config(str(Path(__file__).resolve().parents[1] / "alembic.ini"))
+    command.upgrade(config, "head")
+    command.upgrade(config, "head")
+    with sqlite3.connect(db_path) as connection:
+        columns = {row[1] for row in connection.execute("PRAGMA table_info(sales_orders)")}
+        connection.execute("INSERT INTO customers (name, created_at, updated_at) VALUES ('退货迁移客户', datetime('now'), datetime('now'))")
+        customer_id = connection.execute("SELECT id FROM customers").fetchone()[0]
+        connection.execute("INSERT INTO salespersons (name, active, created_at, updated_at) VALUES ('秀', 1, datetime('now'), datetime('now'))")
+        salesperson_id = connection.execute("SELECT id FROM salespersons").fetchone()[0]
+        connection.execute(
+            "INSERT INTO sales_orders (order_no, customer_id, salesperson_id, status, order_date, created_at, updated_at) "
+            "VALUES ('SO-RETURN-0001', ?, ?, 'completed', datetime('now'), datetime('now'), datetime('now'))",
+            (customer_id, salesperson_id),
+        )
+        connection.commit()
+        row = connection.execute("SELECT return_status FROM sales_orders WHERE order_no='SO-RETURN-0001'").fetchone()
+        fk_check = connection.execute("PRAGMA foreign_key_check").fetchall()
+    assert "return_status" in columns
+    assert row == ("none",)
+    assert fk_check == []
+
+    command.downgrade(config, "20260905_0048")
+    with sqlite3.connect(db_path) as connection:
+        columns_after = {row[1] for row in connection.execute("PRAGMA table_info(sales_orders)")}
+        order_row = connection.execute("SELECT order_no, status FROM sales_orders WHERE order_no='SO-RETURN-0001'").fetchone()
+        integrity = connection.execute("PRAGMA integrity_check").fetchone()
+    assert "return_status" not in columns_after
+    assert order_row == ("SO-RETURN-0001", "completed")
+    assert integrity == ("ok",)
+
+    # Re-upgrading must backfill 'none' onto the row that existed BEFORE the
+    # column was re-added -- this is the actual add_column(..., server_default=)
+    # path, not just the always-current live-metadata bootstrap from 0001.
+    command.upgrade(config, "head")
+    with sqlite3.connect(db_path) as connection:
+        revision = connection.execute("SELECT version_num FROM alembic_version").fetchone()
+        columns_final = {row[1] for row in connection.execute("PRAGMA table_info(sales_orders)")}
+        row_final = connection.execute("SELECT return_status FROM sales_orders WHERE order_no='SO-RETURN-0001'").fetchone()
+    assert revision == (HEAD_REVISION,)
+    assert "return_status" in columns_final
+    assert row_final == ("none",)
 
 
 def test_0038_sales_order_tables_are_empty_and_repeat_safe(tmp_path, monkeypatch):

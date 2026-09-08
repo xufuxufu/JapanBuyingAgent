@@ -1777,6 +1777,13 @@ class SalesOrder(Base):
     customer_id: Mapped[int] = mapped_column(ForeignKey("customers.id", ondelete="RESTRICT"), nullable=False, index=True)
     salesperson_id: Mapped[int] = mapped_column(ForeignKey("salespersons.id", ondelete="RESTRICT"), nullable=False, index=True)
     status: Mapped[str] = mapped_column(String(20), default="submitted", nullable=False, index=True)
+    # Minimal after-sales status, orthogonal to `status`: a completed
+    # (already-received) order can independently be "returning"/"returned"
+    # without ever changing `status` itself -- no refund amount, no partial
+    # returns, no inventory/procurement/logistics effects. Validated at the
+    # application layer in sales_order_service.py (RETURN_STATUSES), not a DB
+    # CHECK constraint, matching this field's intentionally minimal scope.
+    return_status: Mapped[str] = mapped_column(String(20), default="none", nullable=False)
     order_date: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     note: Mapped[str | None] = mapped_column(Text)
     # Current/default address for whatever on this order hasn't shipped yet.
